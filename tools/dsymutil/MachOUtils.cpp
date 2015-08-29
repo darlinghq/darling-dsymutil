@@ -33,7 +33,8 @@ std::string getArchName(StringRef Arch) {
 }
 
 static bool runLipo(SmallVectorImpl<const char *> &Args) {
-  auto Path = sys::findProgramByName("lipo");
+  char *Env = getenv("LIPO");
+  auto Path = sys::findProgramByName(Env ? Env : "lipo");
 
   if (!Path) {
     errs() << "error: lipo: " << Path.getError().message() << "\n";

@@ -2566,7 +2566,8 @@ DIE *DwarfLinker::cloneDIE(const DWARFDebugInfoEntryMinimal &InputDIE,
       Unit.addNameAccelerator(Die, AttrInfo.Name, AttrInfo.NameOffset,
                               Tag == dwarf::DW_TAG_inlined_subroutine);
   } else if (isTypeTag(Tag) && !AttrInfo.IsDeclaration &&
-             getDIENames(InputDIE, Unit.getOrigUnit(), AttrInfo)) {
+             getDIENames(InputDIE, Unit.getOrigUnit(), AttrInfo) &&
+             AttrInfo.Name) {
     Unit.addTypeAccelerator(Die, AttrInfo.Name, AttrInfo.NameOffset);
   }
 
