@@ -187,10 +187,21 @@ namespace opts {
   MachODataInCode("macho-data-in-code",
                   cl::desc("Display MachO Data in Code command"));
 
+  // -macho-segment
+  cl::opt<bool>
+  MachOSegment("macho-segment",
+                  cl::desc("Display MachO Segment command"));
+
   // -macho-version-min
   cl::opt<bool>
   MachOVersionMin("macho-version-min",
                   cl::desc("Display MachO version min command"));
+
+  // -macho-dysymtab
+  cl::opt<bool>
+  MachODysymtab("macho-dysymtab",
+                  cl::desc("Display MachO Dysymtab command"));
+
   // -stackmap
   cl::opt<bool>
   PrintStackMap("stackmap",
@@ -322,11 +333,16 @@ static void dumpObject(const ObjectFile *Obj) {
     if (opts::COFFBaseRelocs)
       Dumper->printCOFFBaseReloc();
   }
-  if (Obj->isMachO())
+  if (Obj->isMachO()) {
     if (opts::MachODataInCode)
       Dumper->printMachODataInCode();
+    if (opts::MachOSegment)
+      Dumper->printMachOSegment();
     if (opts::MachOVersionMin)
       Dumper->printMachOVersionMin();
+    if (opts::MachODysymtab)
+      Dumper->printMachODysymtab();
+  }
   if (opts::PrintStackMap)
     Dumper->printStackMap();
 }

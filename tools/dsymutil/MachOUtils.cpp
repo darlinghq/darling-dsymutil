@@ -164,7 +164,8 @@ static bool transferSymbol(NListTy NList, bool IsLittleEndian,
   if (IsLittleEndian != sys::IsLittleEndianHost)
     MachO::swapStruct(NList);
 
-  NewSymtab.append((char *)&NList, (char *)(&NList + 1));
+  NewSymtab.append(reinterpret_cast<char *>(&NList),
+                   reinterpret_cast<char *>(&NList + 1));
   return true;
 }
 
@@ -247,11 +248,13 @@ static void transferSegmentAndSections(
   // The segments are not necessarily sorted by their vmaddr.
   EndAddress =
       std::max<uint64_t>(PrevEndAddress, Segment.vmaddr + Segment.vmsize);
+
+  unsigned nsects = Segment.nsects;
   if (Obj.isLittleEndian() != sys::IsLittleEndianHost)
     MachO::swapStruct(Segment);
   Writer.writeBytes(
       StringRef(reinterpret_cast<char *>(&Segment), sizeof(Segment)));
-  for (unsigned i = 0; i < Segment.nsects; ++i) {
+  for (unsigned i = 0; i < nsects; ++i) {
     auto Sect = getSection(Obj, Segment, LCI, i);
     Sect.offset = Sect.reloff = Sect.nreloc = 0;
     if (Obj.isLittleEndian() != sys::IsLittleEndianHost)
@@ -426,7 +429,8 @@ bool generateDsymCompanion(const DebugMap &DM, MCStreamer &MS,
   if (UUIDCmd.cmd != 0) {
     Writer.write32(UUIDCmd.cmd);
     Writer.write32(UUIDCmd.cmdsize);
-    Writer.writeBytes(StringRef((const char *)UUIDCmd.uuid, 16));
+    Writer.writeBytes(
+        StringRef(reinterpret_cast<const char *>(UUIDCmd.uuid), 16));
     assert(OutFile.tell() == HeaderSize + sizeof(UUIDCmd));
   }
 
