@@ -708,10 +708,6 @@ int ModuleSlotTracker::getLocalSlot(const Value *V) {
   return Machine->getLocalSlot(V);
 }
 
-static SlotTracker *createSlotTracker(const Module *M) {
-  return new SlotTracker(M);
-}
-
 static SlotTracker *createSlotTracker(const Value *V) {
   if (const Argument *FA = dyn_cast<Argument>(V))
     return new SlotTracker(FA->getParent());
@@ -811,6 +807,10 @@ void SlotTracker::processFunction() {
   ST_DEBUG("begin processFunction!\n");
   fNext = 0;
 
+  // Process function metadata if it wasn't hit at the module-level.
+  if (!ShouldInitializeAllMetadata)
+    processFunctionMetadata(*TheFunction);
+
   // Add all the function arguments with no names.
   for(Function::const_arg_iterator AI = TheFunction->arg_begin(),
       AE = TheFunction->arg_end(); AI != AE; ++AI)
@@ -823,8 +823,6 @@ void SlotTracker::processFunction() {
   for (auto &BB : *TheFunction) {
     if (!BB.hasName())
       CreateFunctionSlot(&BB);
-
-    processFunctionMetadata(*TheFunction);
 
     for (auto &I : BB) {
       if (!I.getType()->isVoidTy() && !I.hasName())
@@ -853,11 +851,11 @@ void SlotTracker::processFunction() {
 
 void SlotTracker::processFunctionMetadata(const Function &F) {
   SmallVector<std::pair<unsigned, MDNode *>, 4> MDs;
-  for (auto &BB : F) {
-    F.getAllMetadata(MDs);
-    for (auto &MD : MDs)
-      CreateMetadataSlot(MD.second);
+  F.getAllMetadata(MDs);
+  for (auto &MD : MDs)
+    CreateMetadataSlot(MD.second);
 
+  for (auto &BB : F) {
     for (auto &I : BB)
       processInstructionMetadata(I);
   }
@@ -2017,11 +2015,6 @@ public:
                  AssemblyAnnotationWriter *AAW,
                  bool ShouldPreserveUseListOrder = false);
 
-  /// Construct an AssemblyWriter with an internally allocated SlotTracker
-  AssemblyWriter(formatted_raw_ostream &o, const Module *M,
-                 AssemblyAnnotationWriter *AAW,
-                 bool ShouldPreserveUseListOrder = false);
-
   void printMDNodeBody(const MDNode *MD);
   void printNamedMDNode(const NamedMDNode *NMD);
 
@@ -2052,8 +2045,6 @@ public:
   void printUseLists(const Function *F);
 
 private:
-  void init();
-
   /// \brief Print out metadata attachments.
   void printMetadataAttachments(
       const SmallVectorImpl<std::pair<unsigned, MDNode *>> &MDs,
@@ -2069,7 +2060,11 @@ private:
 };
 } // namespace
 
-void AssemblyWriter::init() {
+AssemblyWriter::AssemblyWriter(formatted_raw_ostream &o, SlotTracker &Mac,
+                               const Module *M, AssemblyAnnotationWriter *AAW,
+                               bool ShouldPreserveUseListOrder)
+    : Out(o), TheModule(M), Machine(Mac), AnnotationWriter(AAW),
+      ShouldPreserveUseListOrder(ShouldPreserveUseListOrder) {
   if (!TheModule)
     return;
   TypePrinter.incorporateTypes(*TheModule);
@@ -2079,23 +2074,6 @@ void AssemblyWriter::init() {
   for (const GlobalVariable &GV : TheModule->globals())
     if (const Comdat *C = GV.getComdat())
       Comdats.insert(C);
-}
-
-AssemblyWriter::AssemblyWriter(formatted_raw_ostream &o, SlotTracker &Mac,
-                               const Module *M, AssemblyAnnotationWriter *AAW,
-                               bool ShouldPreserveUseListOrder)
-    : Out(o), TheModule(M), Machine(Mac), AnnotationWriter(AAW),
-      ShouldPreserveUseListOrder(ShouldPreserveUseListOrder) {
-  init();
-}
-
-AssemblyWriter::AssemblyWriter(formatted_raw_ostream &o, const Module *M,
-                               AssemblyAnnotationWriter *AAW,
-                               bool ShouldPreserveUseListOrder)
-    : Out(o), TheModule(M), SlotTrackerStorage(createSlotTracker(M)),
-      Machine(*SlotTrackerStorage), AnnotationWriter(AAW),
-      ShouldPreserveUseListOrder(ShouldPreserveUseListOrder) {
-  init();
 }
 
 void AssemblyWriter::writeOperand(const Value *Operand, bool PrintType) {
@@ -2430,6 +2408,10 @@ void AssemblyWriter::printAlias(const GlobalAlias *GA) {
     Out << "unnamed_addr ";
 
   Out << "alias ";
+
+  TypePrinter.print(GA->getValueType(), Out);
+
+  Out << ", ";
 
   const Constant *Aliasee = GA->getAliasee();
 
@@ -2865,7 +2847,7 @@ void AssemblyWriter::printInstruction(const Instruction &I) {
         Out << ", ";
       writeOperand(CPI->getArgOperand(Op), /*PrintType=*/true);
     }
-    Out << "] to ";
+    Out << "]\n          to ";
     writeOperand(CPI->getNormalDest(), /*PrintType=*/true);
     Out << " unwind ";
     writeOperand(CPI->getUnwindDest(), /*PrintType=*/true);
@@ -2908,6 +2890,15 @@ void AssemblyWriter::printInstruction(const Instruction &I) {
     else
       Out << "to caller";
   } else if (const auto *CEPI = dyn_cast<CatchEndPadInst>(&I)) {
+    Out << " unwind ";
+    if (CEPI->hasUnwindDest())
+      writeOperand(CEPI->getUnwindDest(), /*PrintType=*/true);
+    else
+      Out << "to caller";
+  } else if (const auto *CEPI = dyn_cast<CleanupEndPadInst>(&I)) {
+    Out << ' ';
+    writeOperand(CEPI->getCleanupPad(), /*PrintType=*/false);
+
     Out << " unwind ";
     if (CEPI->hasUnwindDest())
       writeOperand(CEPI->getUnwindDest(), /*PrintType=*/true);
@@ -3198,13 +3189,6 @@ void AssemblyWriter::printUseLists(const Function *F) {
 //===----------------------------------------------------------------------===//
 //                       External Interface declarations
 //===----------------------------------------------------------------------===//
-
-void Function::print(raw_ostream &ROS, AssemblyAnnotationWriter *AAW) const {
-  SlotTracker SlotTable(this->getParent());
-  formatted_raw_ostream OS(ROS);
-  AssemblyWriter W(OS, SlotTable, this->getParent(), AAW);
-  W.printFunction(this);
-}
 
 void Module::print(raw_ostream &ROS, AssemblyAnnotationWriter *AAW,
                    bool ShouldPreserveUseListOrder) const {
