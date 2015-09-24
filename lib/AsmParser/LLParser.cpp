@@ -706,6 +706,7 @@ bool LLParser::ParseAlias(const std::string &Name, LocTy NameLoc, unsigned L,
   auto *PTy = dyn_cast<PointerType>(AliaseeType);
   if (!PTy)
     return Error(AliaseeLoc, "An alias must have pointer type");
+  unsigned AddrSpace = PTy->getAddressSpace();
 
   if (Ty != PTy->getElementType())
     return Error(
@@ -714,8 +715,8 @@ bool LLParser::ParseAlias(const std::string &Name, LocTy NameLoc, unsigned L,
 
   // Okay, create the alias but do not insert it into the module yet.
   std::unique_ptr<GlobalAlias> GA(
-      GlobalAlias::create(PTy, (GlobalValue::LinkageTypes)Linkage, Name,
-                          Aliasee, /*Parent*/ nullptr));
+      GlobalAlias::create(Ty, AddrSpace, (GlobalValue::LinkageTypes)Linkage,
+                          Name, Aliasee, /*Parent*/ nullptr));
   GA->setThreadLocalMode(TLM);
   GA->setVisibility((GlobalValue::VisibilityTypes)Visibility);
   GA->setDLLStorageClass((GlobalValue::DLLStorageClassTypes)DLLStorageClass);
@@ -729,8 +730,7 @@ bool LLParser::ParseAlias(const std::string &Name, LocTy NameLoc, unsigned L,
   if (GlobalValue *Val = M->getNamedValue(Name)) {
     // See if this was a redefinition.  If so, there is no entry in
     // ForwardRefVals.
-    std::map<std::string, std::pair<GlobalValue*, LocTy> >::iterator
-      I = ForwardRefVals.find(Name);
+    auto I = ForwardRefVals.find(Name);
     if (I == ForwardRefVals.end())
       return Error(NameLoc, "redefinition of global named '@" + Name + "'");
 
@@ -813,8 +813,7 @@ bool LLParser::ParseGlobal(const std::string &Name, LocTy NameLoc,
         return Error(NameLoc, "redefinition of global '@" + Name + "'");
     }
   } else {
-    std::map<unsigned, std::pair<GlobalValue*, LocTy> >::iterator
-      I = ForwardRefValIDs.find(NumberedVals.size());
+    auto I = ForwardRefValIDs.find(NumberedVals.size());
     if (I != ForwardRefValIDs.end()) {
       GVal = I->second.first;
       ForwardRefValIDs.erase(I);
@@ -1080,8 +1079,7 @@ GlobalValue *LLParser::GetGlobalVal(const std::string &Name, Type *Ty,
   // If this is a forward reference for the value, see if we already created a
   // forward ref record.
   if (!Val) {
-    std::map<std::string, std::pair<GlobalValue*, LocTy> >::iterator
-      I = ForwardRefVals.find(Name);
+    auto I = ForwardRefVals.find(Name);
     if (I != ForwardRefVals.end())
       Val = I->second.first;
   }
@@ -1112,8 +1110,7 @@ GlobalValue *LLParser::GetGlobalVal(unsigned ID, Type *Ty, LocTy Loc) {
   // If this is a forward reference for the value, see if we already created a
   // forward ref record.
   if (!Val) {
-    std::map<unsigned, std::pair<GlobalValue*, LocTy> >::iterator
-      I = ForwardRefValIDs.find(ID);
+    auto I = ForwardRefValIDs.find(ID);
     if (I != ForwardRefValIDs.end())
       Val = I->second.first;
   }
@@ -1379,6 +1376,13 @@ bool LLParser::ParseOptionalReturnAttrs(AttrBuilder &B) {
       B.addDereferenceableOrNullAttr(Bytes);
       continue;
     }
+    case lltok::kw_align: {
+      unsigned Alignment;
+      if (ParseOptionalAlignment(Alignment))
+        return true;
+      B.addAlignmentAttr(Alignment);
+      continue;
+    }
     case lltok::kw_inreg:           B.addAttribute(Attribute::InReg); break;
     case lltok::kw_noalias:         B.addAttribute(Attribute::NoAlias); break;
     case lltok::kw_nonnull:         B.addAttribute(Attribute::NonNull); break;
@@ -1386,7 +1390,6 @@ bool LLParser::ParseOptionalReturnAttrs(AttrBuilder &B) {
     case lltok::kw_zeroext:         B.addAttribute(Attribute::ZExt); break;
 
     // Error handling.
-    case lltok::kw_align:
     case lltok::kw_byval:
     case lltok::kw_inalloca:
     case lltok::kw_nest:
@@ -2210,23 +2213,22 @@ LLParser::PerFunctionState::PerFunctionState(LLParser &p, Function &f,
 
 LLParser::PerFunctionState::~PerFunctionState() {
   // If there were any forward referenced non-basicblock values, delete them.
-  for (std::map<std::string, std::pair<Value*, LocTy> >::iterator
-       I = ForwardRefVals.begin(), E = ForwardRefVals.end(); I != E; ++I)
-    if (!isa<BasicBlock>(I->second.first)) {
-      I->second.first->replaceAllUsesWith(
-                           UndefValue::get(I->second.first->getType()));
-      delete I->second.first;
-      I->second.first = nullptr;
-    }
 
-  for (std::map<unsigned, std::pair<Value*, LocTy> >::iterator
-       I = ForwardRefValIDs.begin(), E = ForwardRefValIDs.end(); I != E; ++I)
-    if (!isa<BasicBlock>(I->second.first)) {
-      I->second.first->replaceAllUsesWith(
-                           UndefValue::get(I->second.first->getType()));
-      delete I->second.first;
-      I->second.first = nullptr;
-    }
+  for (const auto &P : ForwardRefVals) {
+    if (isa<BasicBlock>(P.second.first))
+      continue;
+    P.second.first->replaceAllUsesWith(
+        UndefValue::get(P.second.first->getType()));
+    delete P.second.first;
+  }
+
+  for (const auto &P : ForwardRefValIDs) {
+    if (isa<BasicBlock>(P.second.first))
+      continue;
+    P.second.first->replaceAllUsesWith(
+        UndefValue::get(P.second.first->getType()));
+    delete P.second.first;
+  }
 }
 
 bool LLParser::PerFunctionState::FinishFunction() {
@@ -2253,8 +2255,7 @@ Value *LLParser::PerFunctionState::GetVal(const std::string &Name, Type *Ty,
   // If this is a forward reference for the value, see if we already created a
   // forward ref record.
   if (!Val) {
-    std::map<std::string, std::pair<Value*, LocTy> >::iterator
-      I = ForwardRefVals.find(Name);
+    auto I = ForwardRefVals.find(Name);
     if (I != ForwardRefVals.end())
       Val = I->second.first;
   }
@@ -2327,8 +2328,7 @@ Value *LLParser::PerFunctionState::GetVal(unsigned ID, Type *Ty, LocTy Loc,
   // If this is a forward reference for the value, see if we already created a
   // forward ref record.
   if (!Val) {
-    std::map<unsigned, std::pair<Value*, LocTy> >::iterator
-      I = ForwardRefValIDs.find(ID);
+    auto I = ForwardRefValIDs.find(ID);
     if (I != ForwardRefValIDs.end())
       Val = I->second.first;
   }
@@ -2414,8 +2414,7 @@ bool LLParser::PerFunctionState::SetInstName(int NameID,
       return P.Error(NameLoc, "instruction expected to be numbered '%" +
                      Twine(NumberedVals.size()) + "'");
 
-    std::map<unsigned, std::pair<Value*, LocTy> >::iterator FI =
-      ForwardRefValIDs.find(NameID);
+    auto FI = ForwardRefValIDs.find(NameID);
     if (FI != ForwardRefValIDs.end()) {
       Value *Sentinel = FI->second.first;
       if (Sentinel->getType() != Inst->getType())
@@ -2443,8 +2442,7 @@ bool LLParser::PerFunctionState::SetInstName(int NameID,
   }
 
   // Otherwise, the instruction had a name.  Resolve forward refs and set it.
-  std::map<std::string, std::pair<Value*, LocTy> >::iterator
-    FI = ForwardRefVals.find(NameStr);
+  auto FI = ForwardRefVals.find(NameStr);
   if (FI != ForwardRefVals.end()) {
     Value *Sentinel = FI->second.first;
     if (Sentinel->getType() != Inst->getType())
@@ -4432,8 +4430,7 @@ bool LLParser::ParseFunctionHeader(Function *&Fn, bool isDefine) {
   if (!FunctionName.empty()) {
     // If this was a definition of a forward reference, remove the definition
     // from the forward reference table and fill in the forward ref.
-    std::map<std::string, std::pair<GlobalValue*, LocTy> >::iterator FRVI =
-      ForwardRefVals.find(FunctionName);
+    auto FRVI = ForwardRefVals.find(FunctionName);
     if (FRVI != ForwardRefVals.end()) {
       Fn = M->getFunction(FunctionName);
       if (!Fn)
@@ -4455,8 +4452,7 @@ bool LLParser::ParseFunctionHeader(Function *&Fn, bool isDefine) {
   } else {
     // If this is a definition of a forward referenced function, make sure the
     // types agree.
-    std::map<unsigned, std::pair<GlobalValue*, LocTy> >::iterator I
-      = ForwardRefValIDs.find(NumberedVals.size());
+    auto I = ForwardRefValIDs.find(NumberedVals.size());
     if (I != ForwardRefValIDs.end()) {
       Fn = cast<Function>(I->second.first);
       if (Fn->getType() != PFT)
