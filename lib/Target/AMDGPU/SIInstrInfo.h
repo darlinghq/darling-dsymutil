@@ -56,10 +56,19 @@ private:
     unsigned Reg, MachineRegisterInfo &MRI,
     SmallVectorImpl<MachineInstr *> &Worklist) const;
 
+  const TargetRegisterClass *
+  getDestEquivalentVGPRClass(const MachineInstr &Inst) const;
+
   bool checkInstOffsetsDoNotOverlap(MachineInstr *MIa,
                                     MachineInstr *MIb) const;
 
   unsigned findUsedSGPR(const MachineInstr *MI, int OpIndices[3]) const;
+
+protected:
+  MachineInstr *commuteInstructionImpl(MachineInstr *MI,
+                                       bool NewMI,
+                                       unsigned OpIdx0,
+                                       unsigned OpIdx1) const override;
 
 public:
   explicit SIInstrInfo(const AMDGPUSubtarget &st);
@@ -117,8 +126,6 @@ public:
   LLVM_READONLY
   int commuteOpcode(const MachineInstr &MI) const;
 
-  MachineInstr *commuteInstruction(MachineInstr *MI,
-                                   bool NewMI = false) const override;
   bool findCommutedOpIndices(MachineInstr *MI,
                              unsigned &SrcOpIdx1,
                              unsigned &SrcOpIdx2) const override;
@@ -305,7 +312,8 @@ public:
                  unsigned HalfImmOp, unsigned HalfSGPROp,
                  MachineInstr *&Lo, MachineInstr *&Hi) const;
 
-  void moveSMRDToVALU(MachineInstr *MI, MachineRegisterInfo &MRI) const;
+  void moveSMRDToVALU(MachineInstr *MI, MachineRegisterInfo &MRI,
+                      SmallVectorImpl<MachineInstr *> &Worklist) const;
 
   /// \brief Replace this instruction's opcode with the equivalent VALU
   /// opcode.  This function will also move the users of \p MI to the
@@ -338,15 +346,17 @@ public:
 
   /// \brief Returns the operand named \p Op.  If \p MI does not have an
   /// operand named \c Op, this function returns nullptr.
+  LLVM_READONLY
   MachineOperand *getNamedOperand(MachineInstr &MI, unsigned OperandName) const;
 
+  LLVM_READONLY
   const MachineOperand *getNamedOperand(const MachineInstr &MI,
                                         unsigned OpName) const {
     return getNamedOperand(const_cast<MachineInstr &>(MI), OpName);
   }
 
   uint64_t getDefaultRsrcDataFormat() const;
-
+  uint64_t getScratchRsrcWords23() const;
 };
 
 namespace AMDGPU {

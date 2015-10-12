@@ -133,6 +133,7 @@ static cl::opt<bool> NoSymbolicOperands(
 static cl::list<std::string>
     ArchFlags("arch", cl::desc("architecture(s) from a Mach-O file to dump"),
               cl::ZeroOrMore);
+
 bool ArchAll = false;
 
 static std::string ThumbTripleName;
@@ -1666,6 +1667,7 @@ struct DisassembleInfo {
   uint64_t adrp_addr;
   uint32_t adrp_inst;
   BindTable *bindtable;
+  uint32_t depth;
 };
 
 // SymbolizerGetOpInfo() is the operand information call back function.
@@ -2338,6 +2340,8 @@ static const char *get_pointer_64(uint64_t Address, uint32_t &offset,
   for (unsigned SectIdx = 0; SectIdx != info->Sections->size(); SectIdx++) {
     uint64_t SectAddress = ((*(info->Sections))[SectIdx]).getAddress();
     uint64_t SectSize = ((*(info->Sections))[SectIdx]).getSize();
+    if (SectSize == 0)
+      continue;
     if (objc_only) {
       StringRef SectName;
       ((*(info->Sections))[SectIdx]).getName(SectName);
@@ -3235,6 +3239,8 @@ walk_pointer_list_32(const char *listname, const SectionRef S,
 }
 
 static void print_layout_map(const char *layout_map, uint32_t left) {
+  if (layout_map == nullptr)
+    return;
   outs() << "                layout map: ";
   do {
     outs() << format("0x%02" PRIx32, (*layout_map) & 0xff) << " ";
@@ -3298,8 +3304,8 @@ static void print_method_list64_t(uint64_t p, struct DisassembleInfo *info,
       return;
     memset(&m, '\0', sizeof(struct method64_t));
     if (left < sizeof(struct method64_t)) {
-      memcpy(&ml, r, left);
-      outs() << indent << "   (method_t entends past the end of the section)\n";
+      memcpy(&m, r, left);
+      outs() << indent << "   (method_t extends past the end of the section)\n";
     } else
       memcpy(&m, r, sizeof(struct method64_t));
     if (info->O->isLittleEndian() != sys::IsLittleEndianHost)
@@ -4460,9 +4466,13 @@ static void print_class64_t(uint64_t p, struct DisassembleInfo *info) {
   bool is_meta_class;
   print_class_ro64_t((c.data + n_value) & ~0x7, info, is_meta_class);
 
-  if (is_meta_class == false) {
-    outs() << "Meta Class\n";
-    print_class64_t(c.isa + isa_n_value, info);
+  if (!is_meta_class &&
+      c.isa + isa_n_value != p &&
+      c.isa + isa_n_value != 0 &&
+      info->depth < 100) {
+      info->depth++;
+      outs() << "Meta Class\n";
+      print_class64_t(c.isa + isa_n_value, info);
   }
 }
 
@@ -4525,7 +4535,7 @@ static void print_class32_t(uint32_t p, struct DisassembleInfo *info) {
   bool is_meta_class;
   print_class_ro32_t(c.data & ~0x3, info, is_meta_class);
 
-  if (is_meta_class == false) {
+  if (!is_meta_class) {
     outs() << "Meta Class\n";
     print_class32_t(c.isa, info);
   }
@@ -4833,7 +4843,7 @@ static void print_category32_t(uint32_t p, struct DisassembleInfo *info) {
   outs() << "              name " << format("0x%" PRIx32, c.name);
   name = get_symbol_32(offset + offsetof(struct category32_t, name), S, info,
                        c.name);
-  if (name != NULL)
+  if (name)
     outs() << " " << name;
   outs() << "\n";
 
@@ -4974,6 +4984,9 @@ static void print_image_info64(SectionRef S, struct DisassembleInfo *info) {
   struct objc_image_info64 o;
   const char *r;
 
+  if (S == SectionRef())
+    return;
+
   StringRef SectName;
   S.getName(SectName);
   DataRefImpl Ref = S.getRawDataRefImpl();
@@ -5110,6 +5123,7 @@ static void printObjc2_64bit_MetaData(MachOObjectFile *O, bool verbose) {
   info.adrp_addr = 0;
   info.adrp_inst = 0;
 
+  info.depth = 0;
   const SectionRef CL = get_section(O, "__OBJC2", "__class_list");
   if (CL != SectionRef()) {
     info.S = CL;
@@ -5527,7 +5541,7 @@ static void printObjcMetaData(MachOObjectFile *O, bool verbose) {
       // binary for the iOS simulator which is the second Objective-C
       // ABI.  In that case printObjc1_32bit_MetaData() will determine that
       // and return false.
-      if (printObjc1_32bit_MetaData(O, verbose) == false)
+      if (!printObjc1_32bit_MetaData(O, verbose))
         printObjc2_32bit_MetaData(O, verbose);
     }
   }
@@ -8487,6 +8501,7 @@ public:
   StringRef segmentName(uint32_t SegIndex);
   StringRef sectionName(uint32_t SegIndex, uint64_t SegOffset);
   uint64_t address(uint32_t SegIndex, uint64_t SegOffset);
+  bool isValidSegIndexAndOffset(uint32_t SegIndex, uint64_t SegOffset);
 
 private:
   struct SectionInfo {
@@ -8533,6 +8548,20 @@ StringRef SegInfo::segmentName(uint32_t SegIndex) {
       return SI.SegmentName;
   }
   llvm_unreachable("invalid segIndex");
+}
+
+bool SegInfo::isValidSegIndexAndOffset(uint32_t SegIndex,
+                                       uint64_t OffsetInSeg) {
+  for (const SectionInfo &SI : Sections) {
+    if (SI.SegmentIndex != SegIndex)
+      continue;
+    if (SI.OffsetInSegment > OffsetInSeg)
+      continue;
+    if (OffsetInSeg >= (SI.OffsetInSegment + SI.Size))
+      continue;
+    return true;
+  }
+  return false;
 }
 
 const SegInfo::SectionInfo &SegInfo::findSection(uint32_t SegIndex,
@@ -8703,6 +8732,8 @@ static const char *get_dyld_bind_info_symbolname(uint64_t ReferenceValue,
     for (const llvm::object::MachOBindEntry &Entry : info->O->bindTable()) {
       uint32_t SegIndex = Entry.segmentIndex();
       uint64_t OffsetInSeg = Entry.segmentOffset();
+      if (!sectionTable.isValidSegIndexAndOffset(SegIndex, OffsetInSeg))
+        continue;
       uint64_t Address = sectionTable.address(SegIndex, OffsetInSeg);
       const char *SymbolName = nullptr;
       StringRef name = Entry.symbolName();

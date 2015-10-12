@@ -1607,6 +1607,10 @@ X86TargetLowering::X86TargetLowering(const X86TargetMachine &TM,
     setOperationAction(ISD::CONCAT_VECTORS,     MVT::v64i1, Legal);
     setOperationAction(ISD::INSERT_SUBVECTOR,   MVT::v32i1, Custom);
     setOperationAction(ISD::INSERT_SUBVECTOR,   MVT::v64i1, Custom);
+    setOperationAction(ISD::INSERT_SUBVECTOR,   MVT::v32i16, Custom);
+    setOperationAction(ISD::INSERT_SUBVECTOR,   MVT::v64i8, Custom);
+    setOperationAction(ISD::EXTRACT_VECTOR_ELT, MVT::v32i16, Custom);
+    setOperationAction(ISD::EXTRACT_VECTOR_ELT, MVT::v64i8, Custom);
     setOperationAction(ISD::SELECT,             MVT::v32i1, Custom);
     setOperationAction(ISD::SELECT,             MVT::v64i1, Custom);
     setOperationAction(ISD::SIGN_EXTEND,        MVT::v32i8, Custom);
@@ -1618,6 +1622,8 @@ X86TargetLowering::X86TargetLowering(const X86TargetMachine &TM,
     setOperationAction(ISD::ZERO_EXTEND,        MVT::v64i8, Custom);
     setOperationAction(ISD::INSERT_VECTOR_ELT,  MVT::v32i1, Custom);
     setOperationAction(ISD::INSERT_VECTOR_ELT,  MVT::v64i1, Custom);
+    setOperationAction(ISD::INSERT_VECTOR_ELT,  MVT::v32i16, Custom);
+    setOperationAction(ISD::INSERT_VECTOR_ELT,  MVT::v64i8, Custom);
     setOperationAction(ISD::VSELECT,            MVT::v32i16, Legal);
     setOperationAction(ISD::VSELECT,            MVT::v64i8, Legal);
     setOperationAction(ISD::TRUNCATE,           MVT::v32i1, Custom);
@@ -1785,7 +1791,8 @@ X86TargetLowering::X86TargetLowering(const X86TargetMachine &TM,
   MaxStoresPerMemmoveOptSize = 4;
   setPrefLoopAlignment(4); // 2^4 bytes.
 
-  // Predictable cmov don't hurt on atom because it's in-order.
+  // A predictable cmov does not hurt on an in-order CPU.
+  // FIXME: Use a CPU attribute to trigger this, not a CPU model.
   PredictableSelectIsExpensive = !Subtarget->isAtom();
   EnableExtLdPromotion = true;
   setPrefFunctionAlignment(4); // 2^4 bytes.
@@ -2425,7 +2432,7 @@ CreateCopyOfByValArgument(SDValue Src, SDValue Dst, SDValue Chain,
 /// supports tail call optimization.
 static bool IsTailCallConvention(CallingConv::ID CC) {
   return (CC == CallingConv::Fast || CC == CallingConv::GHC ||
-          CC == CallingConv::HiPE);
+          CC == CallingConv::HiPE || CC == CallingConv::HHVM);
 }
 
 /// \brief Return true if the calling convention is a C calling convention.
@@ -3018,7 +3025,7 @@ X86TargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
   CCInfo.AnalyzeCallOperands(Outs, CC_X86);
 
   // Get a count of how many bytes are to be pushed on the stack.
-  unsigned NumBytes = CCInfo.getNextStackOffset();
+  unsigned NumBytes = CCInfo.getAlignedCallFrameSize();
   if (IsSibcall)
     // This is a sibcall. The memory operands are available in caller's
     // own caller's stack.
@@ -3389,9 +3396,9 @@ X86TargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
   const uint32_t *Mask = RegInfo->getCallPreservedMask(MF, CallConv);
   assert(Mask && "Missing call preserved mask for calling convention");
 
-  // If this is an invoke in a 32-bit function using an MSVC personality, assume
-  // the function clobbers all registers. If an exception is thrown, the runtime
-  // will not restore CSRs.
+  // If this is an invoke in a 32-bit function using a funclet-based
+  // personality, assume the function clobbers all registers. If an exception
+  // is thrown, the runtime will not restore CSRs.
   // FIXME: Model this more precisely so that we can register allocate across
   // the normal edge and spill and fill across the exceptional edge.
   if (!Is64Bit && CLI.CS && CLI.CS->isInvoke()) {
@@ -3400,7 +3407,7 @@ X86TargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
         CallerFn->hasPersonalityFn()
             ? classifyEHPersonality(CallerFn->getPersonalityFn())
             : EHPersonality::Unknown;
-    if (isMSVCEHPersonality(Pers))
+    if (isFuncletEHPersonality(Pers))
       Mask = RegInfo->getNoPreservedMask();
   }
 
@@ -3899,6 +3906,10 @@ bool X86::isOffsetSuitableForCodeModel(int64_t Offset, CodeModel::Model M,
 /// Callee pop is necessary to support tail calls.
 bool X86::isCalleePop(CallingConv::ID CallingConv,
                       bool is64Bit, bool IsVarArg, bool TailCallOpt) {
+
+  if (IsTailCallConvention(CallingConv))
+    return IsVarArg ? false : TailCallOpt;
+
   switch (CallingConv) {
   default:
     return false;
@@ -3906,12 +3917,6 @@ bool X86::isCalleePop(CallingConv::ID CallingConv,
   case CallingConv::X86_FastCall:
   case CallingConv::X86_ThisCall:
     return !is64Bit;
-  case CallingConv::Fast:
-  case CallingConv::GHC:
-  case CallingConv::HiPE:
-    if (IsVarArg)
-      return false;
-    return TailCallOpt;
   }
 }
 
@@ -4230,7 +4235,7 @@ unsigned X86::getInsertVINSERT256Immediate(SDNode *N) {
   return getInsertVINSERTImmediate(N, 256);
 }
 
-/// Returns true if Elt is a constant integer zero
+/// Returns true if V is a constant integer zero.
 static bool isZero(SDValue V) {
   ConstantSDNode *C = dyn_cast<ConstantSDNode>(V);
   return C && C->isNullValue();
@@ -7485,13 +7490,15 @@ static SDValue lowerVectorShuffleAsSpecificZeroOrAnyExtend(
                                                   MVT::v16i8, PSHUFBMask)));
   }
 
-  // If we are extending from an (odd)offset, shuffle them by 1 element.
-  if (Offset & 1) {
+  // If we are extending from an offset, ensure we start on a boundary that
+  // we can unpack from.
+  int AlignToUnpack = Offset % (NumElements / Scale);
+  if (AlignToUnpack) {
     SmallVector<int, 8> ShMask((unsigned)NumElements, -1);
-    for (int i = 1; i < NumElements; ++i)
-      ShMask[i - 1] = i;
+    for (int i = AlignToUnpack; i < NumElements; ++i)
+      ShMask[i - AlignToUnpack] = i;
     InputV = DAG.getVectorShuffle(VT, DL, InputV, DAG.getUNDEF(VT), ShMask);
-    Offset--;
+    Offset -= AlignToUnpack;
   }
 
   // Otherwise emit a sequence of unpacks.
@@ -11084,8 +11091,13 @@ static bool BUILD_VECTORtoBlendMask(BuildVectorSDNode *BuildVector,
                                     unsigned &MaskValue) {
   MaskValue = 0;
   unsigned NumElems = BuildVector->getNumOperands();
+  
   // There are 2 lanes if (NumElems > 8), and 1 lane otherwise.
+  // We don't handle the >2 lanes case right now.
   unsigned NumLanes = (NumElems - 1) / 8 + 1;
+  if (NumLanes > 2)
+    return false;
+
   unsigned NumElemsInLane = NumElems / NumLanes;
 
   // Blend for v16i16 should be symmetric for the both lanes.
@@ -11100,16 +11112,21 @@ static bool BUILD_VECTORtoBlendMask(BuildVectorSDNode *BuildVector,
     if (isa<ConstantSDNode>(SndLaneEltCond))
       Lane2Cond = !isZero(SndLaneEltCond);
 
+    unsigned LaneMask = 0;
     if (Lane1Cond == Lane2Cond || Lane2Cond < 0)
       // Lane1Cond != 0, means we want the first argument.
       // Lane1Cond == 0, means we want the second argument.
       // The encoding of this argument is 0 for the first argument, 1
       // for the second. Therefore, invert the condition.
-      MaskValue |= !Lane1Cond << i;
+      LaneMask = !Lane1Cond << i;
     else if (Lane1Cond < 0)
-      MaskValue |= !Lane2Cond << i;
+      LaneMask = !Lane2Cond << i;
     else
       return false;
+
+    MaskValue |= LaneMask;
+    if (NumLanes == 2)
+      MaskValue |= LaneMask << NumElemsInLane;
   }
   return true;
 }
@@ -12466,6 +12483,15 @@ static SDValue lowerUINT_TO_FP_vXi32(SDValue Op, SelectionDAG &DAG,
   //     float4 fhi = (float4) hi - (0x1.0p39f + 0x1.0p23f);
   //     return (float4) lo + fhi;
 
+  // We shouldn't use it when unsafe-fp-math is enabled though: we might later
+  // reassociate the two FADDs, and if we do that, the algorithm fails
+  // spectacularly (PR24512).
+  // FIXME: If we ever have some kind of Machine FMF, this should be marked
+  // as non-fast and always be enabled. Why isn't SDAG FMF enough? Because
+  // there's also the MachineCombiner reassociations happening on Machine IR.
+  if (DAG.getTarget().Options.UnsafeFPMath)
+    return SDValue();
+
   SDLoc DL(Op);
   SDValue V = Op->getOperand(0);
   EVT VecIntVT = V.getValueType();
@@ -12776,7 +12802,7 @@ X86TargetLowering::FP_TO_INTHelper(SDValue Op, SelectionDAG &DAG,
     // for DAG type consistency we have to match the FP operand type.
 
     APFloat Thresh(APFloat::IEEEsingle, APInt(32, 0x5f000000));
-    APFloat::opStatus Status = APFloat::opOK;
+    LLVM_ATTRIBUTE_UNUSED APFloat::opStatus Status = APFloat::opOK;
     bool LosesInfo = false;
     if (TheVT == MVT::f64)
       // The rounding mode is irrelevant as the conversion should be exact.
@@ -15047,29 +15073,12 @@ static SDValue LowerExtendedLoad(SDValue Op, const X86Subtarget *Subtarget,
       return Sext;
     }
 
-    // Otherwise we'll shuffle the small elements in the high bits of the
-    // larger type and perform an arithmetic shift. If the shift is not legal
-    // it's better to scalarize.
-    assert(TLI.isOperationLegalOrCustom(ISD::SRA, RegVT) &&
-           "We can't implement a sext load without an arithmetic right shift!");
+    // Otherwise we'll use SIGN_EXTEND_VECTOR_INREG to sign extend the lowest
+    // lanes.
+    assert(TLI.isOperationLegalOrCustom(ISD::SIGN_EXTEND_VECTOR_INREG, RegVT) &&
+           "We can't implement a sext load without SIGN_EXTEND_VECTOR_INREG!");
 
-    // Redistribute the loaded elements into the different locations.
-    SmallVector<int, 16> ShuffleVec(NumElems * SizeRatio, -1);
-    for (unsigned i = 0; i != NumElems; ++i)
-      ShuffleVec[i * SizeRatio + SizeRatio - 1] = i;
-
-    SDValue Shuff = DAG.getVectorShuffle(
-        WideVecVT, dl, SlicedVec, DAG.getUNDEF(WideVecVT), &ShuffleVec[0]);
-
-    Shuff = DAG.getBitcast(RegVT, Shuff);
-
-    // Build the arithmetic shift.
-    unsigned Amt = RegVT.getVectorElementType().getSizeInBits() -
-                   MemVT.getVectorElementType().getSizeInBits();
-    Shuff =
-        DAG.getNode(ISD::SRA, dl, RegVT, Shuff,
-                    DAG.getConstant(Amt, dl, RegVT));
-
+    SDValue Shuff = DAG.getSignExtendVectorInReg(SlicedVec, dl, RegVT);
     DAG.ReplaceAllUsesOfValueWith(SDValue(Ld, 1), TF);
     return Shuff;
   }
@@ -16010,11 +16019,16 @@ static SDValue LowerINTRINSIC_WO_CHAIN(SDValue Op, const X86Subtarget *Subtarget
                                               RoundingMode, Sae),
                                   Mask, Src0, Subtarget, DAG);
     }
-    case INTR_TYPE_2OP_MASK: {
+    case INTR_TYPE_2OP_MASK:
+    case INTR_TYPE_2OP_IMM8_MASK: {
       SDValue Src1 = Op.getOperand(1);
       SDValue Src2 = Op.getOperand(2);
       SDValue PassThru = Op.getOperand(3);
       SDValue Mask = Op.getOperand(4);
+
+      if (IntrData->Type == INTR_TYPE_2OP_IMM8_MASK)
+        Src2 = DAG.getNode(ISD::TRUNCATE, dl, MVT::i8, Src2);
+
       // We specify 2 possible opcodes for intrinsics with rounding modes.
       // First, we check if the intrinsic may have non-default rounding mode,
       // (IntrData->Opc1 != 0), then we check the rounding mode operand.
@@ -17892,18 +17906,28 @@ static SDValue LowerScalarImmediateShift(SDValue Op, SelectionDAG &DAG,
 
       // i64 SRA needs to be performed as partial shifts.
       if ((VT == MVT::v2i64 || (Subtarget->hasInt256() && VT == MVT::v4i64)) &&
-          Op.getOpcode() == ISD::SRA)
+          Op.getOpcode() == ISD::SRA && !Subtarget->hasXOP())
         return ArithmeticShiftRight64(ShiftAmt);
 
       if (VT == MVT::v16i8 || (Subtarget->hasInt256() && VT == MVT::v32i8)) {
         unsigned NumElts = VT.getVectorNumElements();
         MVT ShiftVT = MVT::getVectorVT(MVT::i16, NumElts / 2);
 
-        if (Op.getOpcode() == ISD::SHL) {
-          // Simple i8 add case
-          if (ShiftAmt == 1)
-            return DAG.getNode(ISD::ADD, dl, VT, R, R);
+        // Simple i8 add case
+        if (Op.getOpcode() == ISD::SHL && ShiftAmt == 1)
+          return DAG.getNode(ISD::ADD, dl, VT, R, R);
 
+        // ashr(R, 7)  === cmp_slt(R, 0)
+        if (Op.getOpcode() == ISD::SRA && ShiftAmt == 7) {
+          SDValue Zeros = getZeroVector(VT, Subtarget, DAG, dl);
+          return DAG.getNode(X86ISD::PCMPGT, dl, VT, Zeros, R);
+        }
+
+        // XOP can shift v16i8 directly instead of as shift v8i16 + mask.
+        if (VT == MVT::v16i8 && Subtarget->hasXOP())
+          return SDValue();
+
+        if (Op.getOpcode() == ISD::SHL) {
           // Make a large shift.
           SDValue SHL = getTargetVShiftByConstNode(X86ISD::VSHLI, dl, ShiftVT,
                                                    R, ShiftAmt, DAG);
@@ -17926,12 +17950,6 @@ static SDValue LowerScalarImmediateShift(SDValue Op, SelectionDAG &DAG,
                              DAG.getNode(ISD::BUILD_VECTOR, dl, VT, V));
         }
         if (Op.getOpcode() == ISD::SRA) {
-          if (ShiftAmt == 7) {
-            // ashr(R, 7)  === cmp_slt(R, 0)
-            SDValue Zeros = getZeroVector(VT, Subtarget, DAG, dl);
-            return DAG.getNode(X86ISD::PCMPGT, dl, VT, Zeros, R);
-          }
-
           // ashr(R, Amt) === sub(xor(lshr(R, Amt), Mask), Mask)
           SDValue Res = DAG.getNode(ISD::SRL, dl, VT, R, Amt);
           SmallVector<SDValue, 32> V(NumElts,
@@ -17948,7 +17966,7 @@ static SDValue LowerScalarImmediateShift(SDValue Op, SelectionDAG &DAG,
   }
 
   // Special case in 32-bit mode, where i64 is expanded into high and low parts.
-  if (!Subtarget->is64Bit() &&
+  if (!Subtarget->is64Bit() && !Subtarget->hasXOP() &&
       (VT == MVT::v2i64 || (Subtarget->hasInt256() && VT == MVT::v4i64))) {
 
     // Peek through any splat that was introduced for i64 shift vectorization.
@@ -18102,10 +18120,25 @@ static SDValue LowerShift(SDValue Op, const X86Subtarget* Subtarget,
     return V;
 
   if (SDValue V = LowerScalarVariableShift(Op, DAG, Subtarget))
-      return V;
+    return V;
 
   if (SupportedVectorVarShift(VT, Subtarget, Op.getOpcode()))
     return Op;
+
+  // XOP has 128-bit variable logical/arithmetic shifts.
+  // +ve/-ve Amt = shift left/right.
+  if (Subtarget->hasXOP() &&
+      (VT == MVT::v2i64 || VT == MVT::v4i32 ||
+       VT == MVT::v8i16 || VT == MVT::v16i8)) {
+    if (Op.getOpcode() == ISD::SRL || Op.getOpcode() == ISD::SRA) {
+      SDValue Zero = getZeroVector(VT, Subtarget, DAG, dl);
+      Amt = DAG.getNode(ISD::SUB, dl, VT, Zero, Amt);
+    }
+    if (Op.getOpcode() == ISD::SHL || Op.getOpcode() == ISD::SRL)
+      return DAG.getNode(X86ISD::VPSHL, dl, VT, R, Amt);
+    if (Op.getOpcode() == ISD::SRA)
+      return DAG.getNode(X86ISD::VPSHA, dl, VT, R, Amt);
+  }
 
   // 2i64 vector logical shifts can efficiently avoid scalarization - do the
   // shifts per-lane and then shuffle the partial results back together.
@@ -18295,7 +18328,8 @@ static SDValue LowerShift(SDValue Op, const X86Subtarget* Subtarget,
     return DAG.getVectorShuffle(VT, dl, R02, R13, {0, 5, 2, 7});
   }
 
-  if (VT == MVT::v16i8 || (VT == MVT::v32i8 && Subtarget->hasInt256())) {
+  if (VT == MVT::v16i8 ||
+      (VT == MVT::v32i8 && Subtarget->hasInt256() && !Subtarget->hasXOP())) {
     MVT ExtVT = MVT::getVectorVT(MVT::i16, VT.getVectorNumElements() / 2);
     unsigned ShiftOpcode = Op->getOpcode();
 
@@ -18415,7 +18449,7 @@ static SDValue LowerShift(SDValue Op, const X86Subtarget* Subtarget,
                        DAG.getNode(Op.getOpcode(), dl, ExtVT, R, Amt));
   }
 
-  if (Subtarget->hasInt256() && VT == MVT::v16i16) {
+  if (Subtarget->hasInt256() && !Subtarget->hasXOP() && VT == MVT::v16i16) {
     MVT ExtVT = MVT::v8i32;
     SDValue Z = getZeroVector(VT, Subtarget, DAG, dl);
     SDValue ALo = DAG.getNode(X86ISD::UNPCKL, dl, VT, Amt, Z);
@@ -19819,6 +19853,8 @@ const char *X86TargetLowering::getTargetNodeName(unsigned Opcode) const {
   case X86ISD::RDSEED:             return "X86ISD::RDSEED";
   case X86ISD::VPMADDUBSW:         return "X86ISD::VPMADDUBSW";
   case X86ISD::VPMADDWD:           return "X86ISD::VPMADDWD";
+  case X86ISD::VPSHA:              return "X86ISD::VPSHA";
+  case X86ISD::VPSHL:              return "X86ISD::VPSHL";
   case X86ISD::FMADD:              return "X86ISD::FMADD";
   case X86ISD::FMSUB:              return "X86ISD::FMSUB";
   case X86ISD::FNMADD:             return "X86ISD::FNMADD";

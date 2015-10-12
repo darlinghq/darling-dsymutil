@@ -32,9 +32,13 @@ std::string getArchName(StringRef Arch) {
   return Arch;
 }
 
-static bool runLipo(SmallVectorImpl<const char *> &Args) {
-  char *Env = getenv("LIPO");
-  auto Path = sys::findProgramByName(Env ? Env : "lipo");
+static bool runLipo(StringRef SDKPath, SmallVectorImpl<const char *> &Args) {
+  const char *Lipo = getenv("LIPO");
+  if (!Lipo)
+    Lipo = "lipo";
+  auto Path = sys::findProgramByName(Lipo, makeArrayRef(SDKPath));
+  if (!Path)
+    Path = sys::findProgramByName(Lipo);
 
   if (!Path) {
     errs() << "error: lipo: " << Path.getError().message() << "\n";
@@ -54,7 +58,7 @@ static bool runLipo(SmallVectorImpl<const char *> &Args) {
 
 bool generateUniversalBinary(SmallVectorImpl<ArchAndFilename> &ArchFiles,
                              StringRef OutputFileName,
-                             const LinkOptions &Options) {
+                             const LinkOptions &Options, StringRef SDKPath) {
   // No need to merge one file into a universal fat binary. First, try
   // to move it (rename) to the final location. If that fails because
   // of cross-device link issues then copy and delete.
@@ -96,7 +100,7 @@ bool generateUniversalBinary(SmallVectorImpl<ArchAndFilename> &ArchFiles,
       outs() << ' ' << ((Arg == nullptr) ? "\n" : Arg);
   }
 
-  return Options.NoOutput ? true : runLipo(Args);
+  return Options.NoOutput ? true : runLipo(SDKPath, Args);
 }
 
 // Return a MachO::segment_command_64 that holds the same values as

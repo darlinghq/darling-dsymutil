@@ -6791,8 +6791,11 @@ SDValue DAGCombiner::visitSIGN_EXTEND_INREG(SDNode *N) {
   unsigned VTBits = VT.getScalarType().getSizeInBits();
   unsigned EVTBits = EVT.getScalarType().getSizeInBits();
 
+  if (N0.isUndef())
+    return DAG.getUNDEF(VT);
+
   // fold (sext_in_reg c1) -> c1
-  if (isa<ConstantSDNode>(N0) || N0.getOpcode() == ISD::UNDEF)
+  if (isConstantIntBuildVectorOrConstantInt(N0))
     return DAG.getNode(ISD::SIGN_EXTEND_INREG, SDLoc(N), VT, N0, N1);
 
   // If the input is already sign extended, just drop the extension.
@@ -6883,29 +6886,6 @@ SDValue DAGCombiner::visitSIGN_EXTEND_INREG(SDNode *N) {
     if (BSwap.getNode())
       return DAG.getNode(ISD::SIGN_EXTEND_INREG, SDLoc(N), VT,
                          BSwap, N1);
-  }
-
-  // Fold a sext_inreg of a build_vector of ConstantSDNodes or undefs
-  // into a build_vector.
-  if (ISD::isBuildVectorOfConstantSDNodes(N0.getNode())) {
-    SmallVector<SDValue, 8> Elts;
-    unsigned NumElts = N0->getNumOperands();
-    unsigned ShAmt = VTBits - EVTBits;
-
-    for (unsigned i = 0; i != NumElts; ++i) {
-      SDValue Op = N0->getOperand(i);
-      if (Op->getOpcode() == ISD::UNDEF) {
-        Elts.push_back(Op);
-        continue;
-      }
-
-      ConstantSDNode *CurrentND = cast<ConstantSDNode>(Op);
-      const APInt &C = APInt(VTBits, CurrentND->getAPIntValue().getZExtValue());
-      Elts.push_back(DAG.getConstant(C.shl(ShAmt).ashr(ShAmt).getZExtValue(),
-                                     SDLoc(Op), Op.getValueType()));
-    }
-
-    return DAG.getNode(ISD::BUILD_VECTOR, SDLoc(N), VT, Elts);
   }
 
   return SDValue();
@@ -8007,8 +7987,8 @@ SDValue DAGCombiner::visitFMULForFMACombine(SDNode *N) {
 SDValue DAGCombiner::visitFADD(SDNode *N) {
   SDValue N0 = N->getOperand(0);
   SDValue N1 = N->getOperand(1);
-  ConstantFPSDNode *N0CFP = dyn_cast<ConstantFPSDNode>(N0);
-  ConstantFPSDNode *N1CFP = dyn_cast<ConstantFPSDNode>(N1);
+  bool N0CFP = isConstantFPBuildVectorOrConstantFP(N0);
+  bool N1CFP = isConstantFPBuildVectorOrConstantFP(N1);
   EVT VT = N->getValueType(0);
   SDLoc DL(N);
   const TargetOptions &Options = DAG.getTarget().Options;
@@ -8046,12 +8026,13 @@ SDValue DAGCombiner::visitFADD(SDNode *N) {
     bool AllowNewConst = (Level < AfterLegalizeDAG);
 
     // fold (fadd A, 0) -> A
-    if (N1CFP && N1CFP->isZero())
-      return N0;
+    if (ConstantFPSDNode *N1C = isConstOrConstSplatFP(N1))
+      if (N1C->isZero())
+        return N0;
 
     // fold (fadd (fadd x, c1), c2) -> (fadd x, (fadd c1, c2))
     if (N1CFP && N0.getOpcode() == ISD::FADD && N0.getNode()->hasOneUse() &&
-        isa<ConstantFPSDNode>(N0.getOperand(1)))
+        isConstantFPBuildVectorOrConstantFP(N0.getOperand(1)))
       return DAG.getNode(ISD::FADD, DL, VT, N0.getOperand(0),
                          DAG.getNode(ISD::FADD, DL, VT, N0.getOperand(1), N1,
                                      Flags),
@@ -8070,12 +8051,12 @@ SDValue DAGCombiner::visitFADD(SDNode *N) {
     // of rounding steps.
     if (TLI.isOperationLegalOrCustom(ISD::FMUL, VT) && !N0CFP && !N1CFP) {
       if (N0.getOpcode() == ISD::FMUL) {
-        ConstantFPSDNode *CFP00 = dyn_cast<ConstantFPSDNode>(N0.getOperand(0));
-        ConstantFPSDNode *CFP01 = dyn_cast<ConstantFPSDNode>(N0.getOperand(1));
+        bool CFP00 = isConstantFPBuildVectorOrConstantFP(N0.getOperand(0));
+        bool CFP01 = isConstantFPBuildVectorOrConstantFP(N0.getOperand(1));
 
         // (fadd (fmul x, c), x) -> (fmul x, c+1)
         if (CFP01 && !CFP00 && N0.getOperand(0) == N1) {
-          SDValue NewCFP = DAG.getNode(ISD::FADD, DL, VT, SDValue(CFP01, 0),
+          SDValue NewCFP = DAG.getNode(ISD::FADD, DL, VT, N0.getOperand(1),
                                        DAG.getConstantFP(1.0, DL, VT), Flags);
           return DAG.getNode(ISD::FMUL, DL, VT, N1, NewCFP, Flags);
         }
@@ -8084,19 +8065,19 @@ SDValue DAGCombiner::visitFADD(SDNode *N) {
         if (CFP01 && !CFP00 && N1.getOpcode() == ISD::FADD &&
             N1.getOperand(0) == N1.getOperand(1) &&
             N0.getOperand(0) == N1.getOperand(0)) {
-          SDValue NewCFP = DAG.getNode(ISD::FADD, DL, VT, SDValue(CFP01, 0),
+          SDValue NewCFP = DAG.getNode(ISD::FADD, DL, VT, N0.getOperand(1),
                                        DAG.getConstantFP(2.0, DL, VT), Flags);
           return DAG.getNode(ISD::FMUL, DL, VT, N0.getOperand(0), NewCFP, Flags);
         }
       }
 
       if (N1.getOpcode() == ISD::FMUL) {
-        ConstantFPSDNode *CFP10 = dyn_cast<ConstantFPSDNode>(N1.getOperand(0));
-        ConstantFPSDNode *CFP11 = dyn_cast<ConstantFPSDNode>(N1.getOperand(1));
+        bool CFP10 = isConstantFPBuildVectorOrConstantFP(N1.getOperand(0));
+        bool CFP11 = isConstantFPBuildVectorOrConstantFP(N1.getOperand(1));
 
         // (fadd x, (fmul x, c)) -> (fmul x, c+1)
         if (CFP11 && !CFP10 && N1.getOperand(0) == N0) {
-          SDValue NewCFP = DAG.getNode(ISD::FADD, DL, VT, SDValue(CFP11, 0),
+          SDValue NewCFP = DAG.getNode(ISD::FADD, DL, VT, N1.getOperand(1),
                                        DAG.getConstantFP(1.0, DL, VT), Flags);
           return DAG.getNode(ISD::FMUL, DL, VT, N0, NewCFP, Flags);
         }
@@ -8105,16 +8086,16 @@ SDValue DAGCombiner::visitFADD(SDNode *N) {
         if (CFP11 && !CFP10 && N0.getOpcode() == ISD::FADD &&
             N0.getOperand(0) == N0.getOperand(1) &&
             N1.getOperand(0) == N0.getOperand(0)) {
-          SDValue NewCFP = DAG.getNode(ISD::FADD, DL, VT, SDValue(CFP11, 0),
+          SDValue NewCFP = DAG.getNode(ISD::FADD, DL, VT, N1.getOperand(1),
                                        DAG.getConstantFP(2.0, DL, VT), Flags);
           return DAG.getNode(ISD::FMUL, DL, VT, N1.getOperand(0), NewCFP, Flags);
         }
       }
 
       if (N0.getOpcode() == ISD::FADD && AllowNewConst) {
-        ConstantFPSDNode *CFP = dyn_cast<ConstantFPSDNode>(N0.getOperand(0));
+        bool CFP00 = isConstantFPBuildVectorOrConstantFP(N0.getOperand(0));
         // (fadd (fadd x, x), x) -> (fmul x, 3.0)
-        if (!CFP && N0.getOperand(0) == N0.getOperand(1) &&
+        if (!CFP00 && N0.getOperand(0) == N0.getOperand(1) &&
             (N0.getOperand(0) == N1)) {
           return DAG.getNode(ISD::FMUL, DL, VT,
                              N1, DAG.getConstantFP(3.0, DL, VT), Flags);
@@ -8122,7 +8103,7 @@ SDValue DAGCombiner::visitFADD(SDNode *N) {
       }
 
       if (N1.getOpcode() == ISD::FADD && AllowNewConst) {
-        ConstantFPSDNode *CFP10 = dyn_cast<ConstantFPSDNode>(N1.getOperand(0));
+        bool CFP10 = isConstantFPBuildVectorOrConstantFP(N1.getOperand(0));
         // (fadd x, (fadd x, x)) -> (fmul x, 3.0)
         if (!CFP10 && N1.getOperand(0) == N1.getOperand(1) &&
             N1.getOperand(0) == N0) {
@@ -10986,6 +10967,8 @@ void DAGCombiner::getStoreMergeAndAliasCandidates(
     SDValue Chain = St->getChain();
     for (auto I = Chain->use_begin(), E = Chain->use_end(); I != E; ++I) {
       if (StoreSDNode *OtherST = dyn_cast<StoreSDNode>(*I)) {
+        if (I.getOperandNo() != 0)
+          continue;
 
         if (OtherST->isVolatile() || OtherST->isIndexed())
           continue;
@@ -11072,8 +11055,7 @@ bool DAGCombiner::MergeConsecutiveStores(StoreSDNode* St) {
   if (ElementSizeBytes * 8 != MemVT.getSizeInBits())
     return false;
 
-  // Don't merge vectors into wider inputs.
-  if (MemVT.isVector() || !MemVT.isSimple())
+  if (!MemVT.isSimple())
     return false;
 
   // Perform an early exit check. Do not bother looking at stored values that
@@ -11082,9 +11064,16 @@ bool DAGCombiner::MergeConsecutiveStores(StoreSDNode* St) {
   bool IsLoadSrc = isa<LoadSDNode>(StoredVal);
   bool IsConstantSrc = isa<ConstantSDNode>(StoredVal) ||
                        isa<ConstantFPSDNode>(StoredVal);
-  bool IsExtractVecEltSrc = (StoredVal.getOpcode() == ISD::EXTRACT_VECTOR_ELT);
+  bool IsExtractVecSrc = (StoredVal.getOpcode() == ISD::EXTRACT_VECTOR_ELT ||
+                          StoredVal.getOpcode() == ISD::EXTRACT_SUBVECTOR);
 
-  if (!IsConstantSrc && !IsLoadSrc && !IsExtractVecEltSrc)
+  if (!IsConstantSrc && !IsLoadSrc && !IsExtractVecSrc)
+    return false;
+
+  // Don't merge vectors into wider vectors if the source data comes from loads.
+  // TODO: This restriction can be lifted by using logic similar to the
+  // ExtractVecSrc case.
+  if (MemVT.isVector() && IsLoadSrc)
     return false;
 
   // Only look at ends of store sequences.
@@ -11217,29 +11206,36 @@ bool DAGCombiner::MergeConsecutiveStores(StoreSDNode* St) {
 
   // When extracting multiple vector elements, try to store them
   // in one vector store rather than a sequence of scalar stores.
-  if (IsExtractVecEltSrc) {
-    unsigned NumElem = 0;
+  if (IsExtractVecSrc) {
+    unsigned NumStoresToMerge = 0;
+    bool IsVec = MemVT.isVector();
     for (unsigned i = 0; i < LastConsecutiveStore + 1; ++i) {
       StoreSDNode *St  = cast<StoreSDNode>(StoreNodes[i].MemNode);
-      SDValue StoredVal = St->getValue();
+      unsigned StoreValOpcode = St->getValue().getOpcode();
       // This restriction could be loosened.
       // Bail out if any stored values are not elements extracted from a vector.
       // It should be possible to handle mixed sources, but load sources need
       // more careful handling (see the block of code below that handles
       // consecutive loads).
-      if (StoredVal.getOpcode() != ISD::EXTRACT_VECTOR_ELT)
+      if (StoreValOpcode != ISD::EXTRACT_VECTOR_ELT &&
+          StoreValOpcode != ISD::EXTRACT_SUBVECTOR)
         return false;
 
       // Find a legal type for the vector store.
-      EVT Ty = EVT::getVectorVT(Context, MemVT, i+1);
+      unsigned Elts = i + 1;
+      if (IsVec) {
+        // When merging vector stores, get the total number of elements.
+        Elts *= MemVT.getVectorNumElements();
+      }
+      EVT Ty = EVT::getVectorVT(*DAG.getContext(), MemVT.getScalarType(), Elts);
       bool IsFast;
       if (TLI.isTypeLegal(Ty) &&
           TLI.allowsMemoryAccess(Context, DL, Ty, FirstStoreAS,
                                  FirstStoreAlign, &IsFast) && IsFast)
-        NumElem = i + 1;
+        NumStoresToMerge = i + 1;
     }
 
-    return MergeStoresOfConstantsOrVecElts(StoreNodes, MemVT, NumElem,
+    return MergeStoresOfConstantsOrVecElts(StoreNodes, MemVT, NumStoresToMerge,
                                            false, true);
   }
 
@@ -14506,14 +14502,14 @@ bool DAGCombiner::findBetterNeighborChains(StoreSDNode* St) {
     if (Index != St && !SDValue(Index, 0)->hasOneUse())
       break;
 
+    if (Index->isVolatile() || Index->isIndexed())
+      break;
+
     // Find the base pointer and offset for this memory node.
     BaseIndexOffset Ptr = BaseIndexOffset::match(Index->getBasePtr());
 
     // Check that the base pointer is the same as the original one.
     if (!Ptr.equalBaseIndex(BasePtr))
-      break;
-
-    if (Index->isVolatile() || Index->isIndexed())
       break;
 
     // Find the next memory operand in the chain. If the next operand in the

@@ -202,6 +202,9 @@ class MipsAsmParser : public MCTargetAsmParser {
   bool expandLoadStoreMultiple(MCInst &Inst, SMLoc IDLoc,
                                SmallVectorImpl<MCInst> &Instructions);
 
+  bool expandAliasImmediate(MCInst &Inst, SMLoc IDLoc,
+                          SmallVectorImpl<MCInst> &Instructions);
+
   bool expandBranchImm(MCInst &Inst, SMLoc IDLoc,
                        SmallVectorImpl<MCInst> &Instructions);
 
@@ -976,6 +979,9 @@ public:
     return isMem() && isConstantMemOff() && isUInt<Bits>(getConstantMemOff())
       && (getConstantMemOff() % 4 == 0) && getMemBase()->isRegIdx()
       && (getMemBase()->getGPR32Reg() == Mips::SP);
+  }
+  bool isUImm5Lsl2() const {
+    return (isImm() && isConstantImm() && isShiftedUInt<5, 2>(getConstantImm()));
   }
   bool isRegList16() const {
     if (!isRegList())
@@ -1883,7 +1889,31 @@ bool MipsAsmParser::needsExpansion(MCInst &Inst) {
   case Mips::DUDivMacro:
   case Mips::Ulhu:
   case Mips::Ulw:
+  case Mips::NORImm:
     return true;
+  case Mips::ADDi:
+  case Mips::ADDiu:
+  case Mips::SLTi:
+  case Mips::SLTiu:
+    if ((Inst.getNumOperands() == 3) &&
+        Inst.getOperand(0).isReg() &&
+        Inst.getOperand(1).isReg() &&
+        Inst.getOperand(2).isImm()) {
+      int64_t ImmValue = Inst.getOperand(2).getImm();
+      return !isInt<16>(ImmValue);
+    }
+    return false;
+  case Mips::ANDi:
+  case Mips::ORi:
+  case Mips::XORi:
+    if ((Inst.getNumOperands() == 3) &&
+        Inst.getOperand(0).isReg() &&
+        Inst.getOperand(1).isReg() &&
+        Inst.getOperand(2).isImm()) {
+      int64_t ImmValue = Inst.getOperand(2).getImm();
+      return !isUInt<16>(ImmValue);
+    }
+    return false;
   default:
     return false;
   }
@@ -1957,6 +1987,15 @@ bool MipsAsmParser::expandInstruction(MCInst &Inst, SMLoc IDLoc,
     return expandUlhu(Inst, IDLoc, Instructions);
   case Mips::Ulw:
     return expandUlw(Inst, IDLoc, Instructions);
+  case Mips::ADDi:
+  case Mips::ADDiu:
+  case Mips::ANDi:
+  case Mips::NORImm:
+  case Mips::ORi:
+  case Mips::SLTi:
+  case Mips::SLTiu:
+  case Mips::XORi:
+    return expandAliasImmediate(Inst, IDLoc, Instructions);
   }
 }
 
@@ -2049,7 +2088,7 @@ bool MipsAsmParser::expandJalWithRegs(MCInst &Inst, SMLoc IDLoc,
       JalrInst.setOpcode(Mips::JALRS16_MM);
       JalrInst.addOperand(FirstRegOp);
     } else if (inMicroMipsMode()) {
-      JalrInst.setOpcode(Mips::JALR16_MM);
+      JalrInst.setOpcode(hasMips32r6() ? Mips::JALRC16_MMR6 : Mips::JALR16_MM);
       JalrInst.addOperand(FirstRegOp);
     } else {
       JalrInst.setOpcode(Mips::JALR);
@@ -2068,9 +2107,12 @@ bool MipsAsmParser::expandJalWithRegs(MCInst &Inst, SMLoc IDLoc,
   }
   Instructions.push_back(JalrInst);
 
-  // If .set reorder is active, emit a NOP after it.
-  if (AssemblerOptions.back()->isReorder())
+  // If .set reorder is active and branch instruction has a delay slot,
+  // emit a NOP after it.
+  const MCInstrDesc &MCID = getInstDesc(JalrInst.getOpcode());
+  if (MCID.hasDelaySlot() && AssemblerOptions.back()->isReorder()) {
     createNop(hasShortDelaySlot(JalrInst.getOpcode()), IDLoc, Instructions);
+  }
 
   return false;
 }
@@ -2305,14 +2347,11 @@ bool MipsAsmParser::loadAndAddSymbolAddress(
     SMLoc IDLoc, SmallVectorImpl<MCInst> &Instructions) {
   warnIfNoMacro(IDLoc);
 
-  // FIXME: The way we're handling symbols right now prevents simple expressions
-  //        like foo+8. We'll be able to fix this once our unary operators (%hi
-  //        and similar) are treated as operators rather than as fixup types.
-  const MCSymbolRefExpr *Symbol = cast<MCSymbolRefExpr>(SymExpr);
-  const MCSymbolRefExpr *HiExpr = MCSymbolRefExpr::create(
-      &Symbol->getSymbol(), MCSymbolRefExpr::VK_Mips_ABS_HI, getContext());
-  const MCSymbolRefExpr *LoExpr = MCSymbolRefExpr::create(
-      &Symbol->getSymbol(), MCSymbolRefExpr::VK_Mips_ABS_LO, getContext());
+  const MCExpr *Symbol = cast<MCExpr>(SymExpr);
+  const MipsMCExpr *HiExpr = MipsMCExpr::create(
+      MCSymbolRefExpr::VK_Mips_ABS_HI, Symbol, getContext());
+  const MipsMCExpr *LoExpr = MipsMCExpr::create(
+      MCSymbolRefExpr::VK_Mips_ABS_LO, Symbol, getContext());
 
   bool UseSrcReg = SrcReg != Mips::NoRegister;
 
@@ -2324,10 +2363,10 @@ bool MipsAsmParser::loadAndAddSymbolAddress(
     if (!ATReg)
       return true;
 
-    const MCSymbolRefExpr *HighestExpr = MCSymbolRefExpr::create(
-        &Symbol->getSymbol(), MCSymbolRefExpr::VK_Mips_HIGHEST, getContext());
-    const MCSymbolRefExpr *HigherExpr = MCSymbolRefExpr::create(
-        &Symbol->getSymbol(), MCSymbolRefExpr::VK_Mips_HIGHER, getContext());
+    const MipsMCExpr *HighestExpr = MipsMCExpr::create(
+        MCSymbolRefExpr::VK_Mips_HIGHEST, Symbol, getContext());
+    const MipsMCExpr *HigherExpr = MipsMCExpr::create(
+        MCSymbolRefExpr::VK_Mips_HIGHER, Symbol, getContext());
 
     if (UseSrcReg && (DstReg == SrcReg)) {
       // If $rs is the same as $rd:
@@ -3123,6 +3162,82 @@ bool MipsAsmParser::expandUlw(MCInst &Inst, SMLoc IDLoc,
   Instructions.push_back(RightLoadInst);
 
   return false;
+}
+
+bool MipsAsmParser::expandAliasImmediate(MCInst &Inst, SMLoc IDLoc,
+                                         SmallVectorImpl<MCInst> &Instructions) {
+
+  assert (Inst.getNumOperands() == 3 && "Invalid operand count");
+  assert (Inst.getOperand(0).isReg() &&
+          Inst.getOperand(1).isReg() &&
+          Inst.getOperand(2).isImm() && "Invalid instruction operand.");
+
+  unsigned ATReg = Mips::NoRegister;
+  unsigned FinalDstReg = Mips::NoRegister;
+  unsigned DstReg = Inst.getOperand(0).getReg();
+  unsigned SrcReg = Inst.getOperand(1).getReg();
+  int64_t ImmValue = Inst.getOperand(2).getImm();
+
+  bool Is32Bit = isInt<32>(ImmValue) || isUInt<32>(ImmValue);
+
+  unsigned FinalOpcode = Inst.getOpcode();
+
+  if (DstReg == SrcReg) {
+    ATReg = getATReg(Inst.getLoc());
+    if (!ATReg)
+      return true;
+    FinalDstReg = DstReg;
+    DstReg = ATReg;
+  }
+
+  if (!loadImmediate(ImmValue, DstReg, Mips::NoRegister, Is32Bit, false, Inst.getLoc(), Instructions)) {
+    switch (FinalOpcode) {
+    default:
+      llvm_unreachable("unimplemented expansion");
+    case (Mips::ADDi):
+      FinalOpcode = Mips::ADD;
+      break;
+    case (Mips::ADDiu):
+      FinalOpcode = Mips::ADDu;
+      break;
+    case (Mips::ANDi):
+      FinalOpcode = Mips::AND;
+      break;
+    case (Mips::NORImm):
+      FinalOpcode = Mips::NOR;
+      break;
+    case (Mips::ORi):
+      FinalOpcode = Mips::OR;
+      break;
+    case (Mips::SLTi):
+      FinalOpcode = Mips::SLT;
+      break;
+    case (Mips::SLTiu):
+      FinalOpcode = Mips::SLTu;
+      break;
+    case (Mips::XORi):
+      FinalOpcode = Mips::XOR;
+      break;
+    }
+
+    MCInst tmpInst;
+
+    tmpInst.clear();
+    tmpInst.setLoc(Inst.getLoc());
+    tmpInst.setOpcode(FinalOpcode);
+    if (FinalDstReg == Mips::NoRegister) {
+      tmpInst.addOperand(MCOperand::createReg(DstReg));
+      tmpInst.addOperand(MCOperand::createReg(DstReg));
+      tmpInst.addOperand(MCOperand::createReg(SrcReg));
+    } else {
+      tmpInst.addOperand(MCOperand::createReg(FinalDstReg));
+      tmpInst.addOperand(MCOperand::createReg(FinalDstReg));
+      tmpInst.addOperand(MCOperand::createReg(DstReg));
+    }
+    Instructions.push_back(tmpInst);
+    return false;
+  }
+  return true;
 }
 
 void MipsAsmParser::createNop(bool hasShortDelaySlot, SMLoc IDLoc,

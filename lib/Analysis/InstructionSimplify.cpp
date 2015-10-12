@@ -2128,6 +2128,54 @@ static Constant *computePointerICmp(const DataLayout &DL,
   return nullptr;
 }
 
+/// Return true if B is known to be implied by A.  A & B must be i1 (boolean)
+/// values or a vector of such values. Note that the truth table for
+/// implication is the same as <=u on i1 values (but not <=s!).  The truth
+/// table for both is: 
+///    | T | F (B)
+///  T | T | F
+///  F | T | T
+/// (A)
+static bool implies(Value *A, Value *B) {
+  assert(A->getType() == B->getType() && "mismatched type");
+  Type *OpTy = A->getType();
+  assert(OpTy->getScalarType()->isIntegerTy(1));
+  
+  // A ==> A by definition
+  if (A == B) return true;
+
+  if (OpTy->isVectorTy())
+    // TODO: extending the code below to handle vectors
+    return false;
+  assert(OpTy->isIntegerTy(1) && "implied by above");
+
+  ICmpInst::Predicate APred, BPred;
+  Value *I;
+  Value *L;
+  ConstantInt *CI;
+  // i +_{nsw} C_{>0} <s L ==> i <s L
+  if (match(A, m_ICmp(APred,
+                      m_NSWAdd(m_Value(I), m_ConstantInt(CI)),
+                      m_Value(L))) &&
+      APred == ICmpInst::ICMP_SLT &&
+      !CI->isNegative() &&
+      match(B, m_ICmp(BPred, m_Specific(I), m_Specific(L))) &&
+      BPred == ICmpInst::ICMP_SLT)
+    return true;
+
+  // i +_{nuw} C_{>0} <u L ==> i <u L
+  if (match(A, m_ICmp(APred,
+                      m_NUWAdd(m_Value(I), m_ConstantInt(CI)),
+                      m_Value(L))) &&
+      APred == ICmpInst::ICMP_ULT &&
+      !CI->isNegative() &&
+      match(B, m_ICmp(BPred, m_Specific(I), m_Specific(L))) &&
+      BPred == ICmpInst::ICMP_ULT)
+    return true;
+
+  return false;
+}
+
 static ConstantRange GetConstantRangeFromMetadata(MDNode *Ranges, uint32_t BitWidth) {
   const unsigned NumRanges = Ranges->getNumOperands() / 2;
   assert(NumRanges >= 1);
@@ -2199,6 +2247,8 @@ static Value *SimplifyICmpInst(unsigned Predicate, Value *LHS, Value *RHS,
       // X >=u 1 -> X
       if (match(RHS, m_One()))
         return LHS;
+      if (implies(RHS, LHS))
+        return getTrue(ITy);
       break;
     case ICmpInst::ICMP_SLT:
       // X <s 0 -> X
@@ -2209,6 +2259,10 @@ static Value *SimplifyICmpInst(unsigned Predicate, Value *LHS, Value *RHS,
       // X <=s -1 -> X
       if (match(RHS, m_One()))
         return LHS;
+      break;
+    case ICmpInst::ICMP_ULE:
+      if (implies(LHS, RHS))
+        return getTrue(ITy);
       break;
     }
   }
@@ -2399,6 +2453,32 @@ static Value *SimplifyICmpInst(unsigned Predicate, Value *LHS, Value *RHS,
       if (RHS_CR.contains(LHS_CR))
         return ConstantInt::getTrue(RHS->getContext());
       if (RHS_CR.inverse().contains(LHS_CR))
+        return ConstantInt::getFalse(RHS->getContext());
+    }
+  }
+
+  // If both operands have range metadata, use the metadata
+  // to simplify the comparison.
+  if (isa<Instruction>(RHS) && isa<Instruction>(LHS)) {
+    auto RHS_Instr = dyn_cast<Instruction>(RHS);
+    auto LHS_Instr = dyn_cast<Instruction>(LHS);
+
+    if (RHS_Instr->getMetadata(LLVMContext::MD_range) &&
+        LHS_Instr->getMetadata(LLVMContext::MD_range)) {
+      uint32_t BitWidth = Q.DL.getTypeSizeInBits(RHS->getType());
+
+      auto RHS_CR = GetConstantRangeFromMetadata(
+          RHS_Instr->getMetadata(LLVMContext::MD_range), BitWidth);
+      auto LHS_CR = GetConstantRangeFromMetadata(
+          LHS_Instr->getMetadata(LLVMContext::MD_range), BitWidth);
+
+      auto Satisfied_CR = ConstantRange::makeSatisfyingICmpRegion(Pred, RHS_CR);
+      if (Satisfied_CR.contains(LHS_CR))
+        return ConstantInt::getTrue(RHS->getContext());
+
+      auto InversedSatisfied_CR = ConstantRange::makeSatisfyingICmpRegion(
+                CmpInst::getInversePredicate(Pred), RHS_CR);
+      if (InversedSatisfied_CR.contains(LHS_CR))
         return ConstantInt::getFalse(RHS->getContext());
     }
   }

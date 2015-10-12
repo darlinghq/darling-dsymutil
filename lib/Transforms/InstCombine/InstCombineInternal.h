@@ -281,6 +281,7 @@ public:
                                 ICmpInst::Predicate Pred);
   Instruction *FoldGEPICmp(GEPOperator *GEPLHS, Value *RHS,
                            ICmpInst::Predicate Cond, Instruction &I);
+  Instruction *FoldAllocaCmp(ICmpInst &ICI, AllocaInst *Alloca, Value *Other);
   Instruction *FoldShiftByConstant(Value *Op0, Constant *Op1,
                                    BinaryOperator &I);
   Instruction *commonCastTransforms(CastInst &CI);
@@ -545,6 +546,7 @@ private:
   Instruction *FoldPHIArgBinOpIntoPHI(PHINode &PN);
   Instruction *FoldPHIArgGEPIntoPHI(PHINode &PN);
   Instruction *FoldPHIArgLoadIntoPHI(PHINode &PN);
+  Instruction *FoldPHIArgZextsIntoPHI(PHINode &PN);
 
   Instruction *OptAndOp(Instruction *Op, ConstantInt *OpRHS,
                         ConstantInt *AndRHS, BinaryOperator &TheAnd);
