@@ -41,13 +41,22 @@ BitVector SIRegisterInfo::getReservedRegs(const MachineFunction &MF) const {
   reserveRegisterTuples(Reserved, AMDGPU::EXEC);
   reserveRegisterTuples(Reserved, AMDGPU::FLAT_SCR);
 
-  // Reserve some VGPRs to use as temp registers in case we have to spill VGPRs
-  reserveRegisterTuples(Reserved, AMDGPU::VGPR254);
-  reserveRegisterTuples(Reserved, AMDGPU::VGPR255);
+  // Reserve the last 2 registers so we will always have at least 2 more that
+  // will physically contain VCC.
+  reserveRegisterTuples(Reserved, AMDGPU::SGPR102_SGPR103);
+
+  const AMDGPUSubtarget &ST = MF.getSubtarget<AMDGPUSubtarget>();
+
+  if (ST.getGeneration() >= AMDGPUSubtarget::VOLCANIC_ISLANDS) {
+    // SI/CI have 104 SGPRs. VI has 102. We need to shift down the reservation
+    // for VCC/FLAT_SCR.
+    reserveRegisterTuples(Reserved, AMDGPU::SGPR98_SGPR99);
+    reserveRegisterTuples(Reserved, AMDGPU::SGPR100_SGPR101);
+  }
 
   // Tonga and Iceland can only allocate a fixed number of SGPRs due
   // to a hw bug.
-  if (MF.getSubtarget<AMDGPUSubtarget>().hasSGPRInitBug()) {
+  if (ST.hasSGPRInitBug()) {
     unsigned NumSGPRs = AMDGPU::SGPR_32RegClass.getNumRegs();
     // Reserve some SGPRs for FLAT_SCRATCH and VCC (4 SGPRs).
     // Assume XNACK_MASK is unused.
@@ -64,26 +73,32 @@ BitVector SIRegisterInfo::getReservedRegs(const MachineFunction &MF) const {
 
 unsigned SIRegisterInfo::getRegPressureSetLimit(const MachineFunction &MF,
                                                 unsigned Idx) const {
-
   const AMDGPUSubtarget &STI = MF.getSubtarget<AMDGPUSubtarget>();
   // FIXME: We should adjust the max number of waves based on LDS size.
   unsigned SGPRLimit = getNumSGPRsAllowed(STI.getGeneration(),
                                           STI.getMaxWavesPerCU());
   unsigned VGPRLimit = getNumVGPRsAllowed(STI.getMaxWavesPerCU());
 
+  unsigned VSLimit = SGPRLimit + VGPRLimit;
+
   for (regclass_iterator I = regclass_begin(), E = regclass_end();
        I != E; ++I) {
+    const TargetRegisterClass *RC = *I;
 
-    unsigned NumSubRegs = std::max((int)(*I)->getSize() / 4, 1);
+    unsigned NumSubRegs = std::max((int)RC->getSize() / 4, 1);
     unsigned Limit;
 
-    if (isSGPRClass(*I)) {
+    if (isPseudoRegClass(RC)) {
+      // FIXME: This is a hack. We should never be considering the pressure of
+      // these since no virtual register should ever have this class.
+      Limit = VSLimit;
+    } else if (isSGPRClass(RC)) {
       Limit = SGPRLimit / NumSubRegs;
     } else {
       Limit = VGPRLimit / NumSubRegs;
     }
 
-    const int *Sets = getRegClassPressureSets(*I);
+    const int *Sets = getRegClassPressureSets(RC);
     assert(Sets);
     for (unsigned i = 0; Sets[i] != -1; ++i) {
       if (Sets[i] == (int)Idx)
@@ -331,7 +346,7 @@ unsigned SIRegisterInfo::getHWRegIndex(unsigned Reg) const {
 const TargetRegisterClass *SIRegisterInfo::getPhysRegClass(unsigned Reg) const {
   assert(!TargetRegisterInfo::isVirtualRegister(Reg));
 
-  static const TargetRegisterClass *BaseClasses[] = {
+  static const TargetRegisterClass *const BaseClasses[] = {
     &AMDGPU::VGPR_32RegClass,
     &AMDGPU::SReg_32RegClass,
     &AMDGPU::VReg_64RegClass,
@@ -495,6 +510,7 @@ bool SIRegisterInfo::opCanUseInlineConstant(unsigned OpType) const {
 unsigned SIRegisterInfo::getPreloadedValue(const MachineFunction &MF,
                                            enum PreloadedValue Value) const {
 
+  const AMDGPUSubtarget &ST = MF.getSubtarget<AMDGPUSubtarget>();
   const SIMachineFunctionInfo *MFI = MF.getInfo<SIMachineFunctionInfo>();
   switch (Value) {
   case SIRegisterInfo::TGID_X:
@@ -510,6 +526,11 @@ unsigned SIRegisterInfo::getPreloadedValue(const MachineFunction &MF,
   case SIRegisterInfo::SCRATCH_PTR:
     return AMDGPU::SGPR2_SGPR3;
   case SIRegisterInfo::INPUT_PTR:
+    if (ST.isAmdHsaOS())
+      return MFI->hasDispatchPtr() ? AMDGPU::SGPR2_SGPR3 : AMDGPU::SGPR0_SGPR1;
+    return AMDGPU::SGPR0_SGPR1;
+  case SIRegisterInfo::DISPATCH_PTR:
+    assert(MFI->hasDispatchPtr());
     return AMDGPU::SGPR0_SGPR1;
   case SIRegisterInfo::TIDIG_X:
     return AMDGPU::VGPR0;

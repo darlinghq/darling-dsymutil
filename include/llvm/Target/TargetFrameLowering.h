@@ -158,6 +158,10 @@ public:
   virtual void emitEpilogue(MachineFunction &MF,
                             MachineBasicBlock &MBB) const = 0;
 
+  /// Replace a StackProbe stub (if any) with the actual probe code inline
+  virtual void inlineStackProbe(MachineFunction &MF,
+                                MachineBasicBlock &PrologueMBB) const {}
+
   /// Adjust the prologue to have the function use segmented stacks. This works
   /// by adding a check even before the "normal" function prologue.
   virtual void adjustForSegmentedStacks(MachineFunction &MF,
@@ -263,6 +267,10 @@ public:
   ///
   virtual void processFunctionBeforeFrameFinalized(MachineFunction &MF,
                                              RegScavenger *RS = nullptr) const {
+  }
+
+  virtual unsigned getWinEHParentFrameOffset(const MachineFunction &MF) const {
+    report_fatal_error("WinEH not implemented for this target");
   }
 
   /// eliminateCallFramePseudoInstr - This method is called during prolog/epilog

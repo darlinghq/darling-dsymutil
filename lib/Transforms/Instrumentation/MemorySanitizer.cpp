@@ -120,16 +120,6 @@ using namespace llvm;
 
 #define DEBUG_TYPE "msan"
 
-// VMA size definition for architecture that support multiple sizes.
-// AArch64 has 3 VMA sizes: 39, 42 and 48.
-#ifndef SANITIZER_AARCH64_VMA
-# define SANITIZER_AARCH64_VMA 39
-#else
-# if SANITIZER_AARCH64_VMA != 39 && SANITIZER_AARCH64_VMA != 42
-#  error "invalid SANITIZER_AARCH64_VMA size"
-# endif
-#endif
-
 static const unsigned kOriginSize = 4;
 static const unsigned kMinOriginAlignment = 4;
 static const unsigned kShadowTLSAlignment = 8;
@@ -263,17 +253,10 @@ static const MemoryMapParams Linux_PowerPC64_MemoryMapParams = {
 
 // aarch64 Linux
 static const MemoryMapParams Linux_AArch64_MemoryMapParams = {
-#if SANITIZER_AARCH64_VMA == 39
-  0x007C00000000,  // AndMask
-  0x000100000000,  // XorMask
-  0x004000000000,  // ShadowBase
-  0x004300000000,  // OriginBase
-#elif SANITIZER_AARCH64_VMA == 42
-  0x03E000000000,  // AndMask
-  0x001000000000,  // XorMask
-  0x010000000000,  // ShadowBase
-  0x012000000000,  // OriginBase
-#endif
+  0,               // AndMask (not used)
+  0x06000000000,   // XorMask
+  0,               // ShadowBase (not used)
+  0x01000000000,   // OriginBase
 };
 
 // i386 FreeBSD
@@ -737,7 +720,7 @@ struct MemorySanitizerVisitor : public InstVisitor<MemorySanitizerVisitor> {
         Value *Cmp = IRB.CreateICmpNE(
             ConvertedShadow, getCleanShadow(ConvertedShadow), "_mscmp");
         Instruction *CheckTerm = SplitBlockAndInsertIfThen(
-            Cmp, IRB.GetInsertPoint(), false, MS.OriginStoreWeights);
+            Cmp, &*IRB.GetInsertPoint(), false, MS.OriginStoreWeights);
         IRBuilder<> IRBNew(CheckTerm);
         paintOrigin(IRBNew, updateOrigin(Origin, IRBNew),
                     getOriginPtr(Addr, IRBNew, Alignment), StoreSize,
@@ -1617,18 +1600,24 @@ struct MemorySanitizerVisitor : public InstVisitor<MemorySanitizerVisitor> {
       Type *EltTy = Ty->getSequentialElementType();
       SmallVector<Constant *, 16> Elements;
       for (unsigned Idx = 0; Idx < NumElements; ++Idx) {
-        ConstantInt *Elt =
-            dyn_cast<ConstantInt>(ConstArg->getAggregateElement(Idx));
-        APInt V = Elt->getValue();
-        APInt V2 = APInt(V.getBitWidth(), 1) << V.countTrailingZeros();
-        Elements.push_back(ConstantInt::get(EltTy, V2));
+        if (ConstantInt *Elt =
+                dyn_cast<ConstantInt>(ConstArg->getAggregateElement(Idx))) {
+          APInt V = Elt->getValue();
+          APInt V2 = APInt(V.getBitWidth(), 1) << V.countTrailingZeros();
+          Elements.push_back(ConstantInt::get(EltTy, V2));
+        } else {
+          Elements.push_back(ConstantInt::get(EltTy, 1));
+        }
       }
       ShadowMul = ConstantVector::get(Elements);
     } else {
-      ConstantInt *Elt = dyn_cast<ConstantInt>(ConstArg);
-      APInt V = Elt->getValue();
-      APInt V2 = APInt(V.getBitWidth(), 1) << V.countTrailingZeros();
-      ShadowMul = ConstantInt::get(Elt->getType(), V2);
+      if (ConstantInt *Elt = dyn_cast<ConstantInt>(ConstArg)) {
+        APInt V = Elt->getValue();
+        APInt V2 = APInt(V.getBitWidth(), 1) << V.countTrailingZeros();
+        ShadowMul = ConstantInt::get(Ty, V2);
+      } else {
+        ShadowMul = ConstantInt::get(Ty, 1);
+      }
     }
 
     IRBuilder<> IRB(&I);
@@ -1912,25 +1901,6 @@ struct MemorySanitizerVisitor : public InstVisitor<MemorySanitizerVisitor> {
     VAHelper->visitVACopyInst(I);
   }
 
-  enum IntrinsicKind {
-    IK_DoesNotAccessMemory,
-    IK_OnlyReadsMemory,
-    IK_WritesMemory
-  };
-
-  static IntrinsicKind getIntrinsicKind(Intrinsic::ID iid) {
-    const int FMRB_DoesNotAccessMemory = IK_DoesNotAccessMemory;
-    const int FMRB_OnlyReadsArgumentPointees = IK_OnlyReadsMemory;
-    const int FMRB_OnlyReadsMemory = IK_OnlyReadsMemory;
-    const int FMRB_OnlyAccessesArgumentPointees = IK_WritesMemory;
-    const int FMRB_UnknownModRefBehavior = IK_WritesMemory;
-#define GET_INTRINSIC_MODREF_BEHAVIOR
-#define FunctionModRefBehavior IntrinsicKind
-#include "llvm/IR/Intrinsics.gen"
-#undef FunctionModRefBehavior
-#undef GET_INTRINSIC_MODREF_BEHAVIOR
-  }
-
   /// \brief Handle vector store-like intrinsics.
   ///
   /// Instrument intrinsics that look like a simple SIMD store: writes memory,
@@ -2030,17 +2000,11 @@ struct MemorySanitizerVisitor : public InstVisitor<MemorySanitizerVisitor> {
     if (NumArgOperands == 0)
       return false;
 
-    Intrinsic::ID iid = I.getIntrinsicID();
-    IntrinsicKind IK = getIntrinsicKind(iid);
-    bool OnlyReadsMemory = IK == IK_OnlyReadsMemory;
-    bool WritesMemory = IK == IK_WritesMemory;
-    assert(!(OnlyReadsMemory && WritesMemory));
-
     if (NumArgOperands == 2 &&
         I.getArgOperand(0)->getType()->isPointerTy() &&
         I.getArgOperand(1)->getType()->isVectorTy() &&
         I.getType()->isVoidTy() &&
-        WritesMemory) {
+        !I.onlyReadsMemory()) {
       // This looks like a vector store.
       return handleVectorStoreIntrinsic(I);
     }
@@ -2048,12 +2012,12 @@ struct MemorySanitizerVisitor : public InstVisitor<MemorySanitizerVisitor> {
     if (NumArgOperands == 1 &&
         I.getArgOperand(0)->getType()->isPointerTy() &&
         I.getType()->isVectorTy() &&
-        OnlyReadsMemory) {
+        I.onlyReadsMemory()) {
       // This looks like a vector load.
       return handleVectorLoadIntrinsic(I);
     }
 
-    if (!OnlyReadsMemory && !WritesMemory)
+    if (I.doesNotAccessMemory())
       if (maybeHandleSimpleNomemIntrinsic(I))
         return true;
 
@@ -2551,9 +2515,10 @@ struct MemorySanitizerVisitor : public InstVisitor<MemorySanitizerVisitor> {
     // Until we have full dynamic coverage, make sure the retval shadow is 0.
     Value *Base = getShadowPtrForRetval(&I, IRBBefore);
     IRBBefore.CreateAlignedStore(getCleanShadow(&I), Base, kShadowTLSAlignment);
-    Instruction *NextInsn = nullptr;
+    BasicBlock::iterator NextInsn;
     if (CS.isCall()) {
-      NextInsn = I.getNextNode();
+      NextInsn = ++I.getIterator();
+      assert(NextInsn != I.getParent()->end());
     } else {
       BasicBlock *NormalDest = cast<InvokeInst>(&I)->getNormalDest();
       if (!NormalDest->getSinglePredecessor()) {
@@ -2565,10 +2530,10 @@ struct MemorySanitizerVisitor : public InstVisitor<MemorySanitizerVisitor> {
         return;
       }
       NextInsn = NormalDest->getFirstInsertionPt();
-      assert(NextInsn &&
+      assert(NextInsn != NormalDest->end() &&
              "Could not find insertion point for retval shadow load");
     }
-    IRBuilder<> IRBAfter(NextInsn);
+    IRBuilder<> IRBAfter(&*NextInsn);
     Value *RetvalShadow =
       IRBAfter.CreateAlignedLoad(getShadowPtrForRetval(&I, IRBAfter),
                                  kShadowTLSAlignment, "_msret");

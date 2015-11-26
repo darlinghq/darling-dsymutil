@@ -231,11 +231,15 @@ void X86Subtarget::initializeEnvironment() {
   X86SSELevel = NoSSE;
   X863DNowLevel = NoThreeDNow;
   HasCMov = false;
-  HasMMX = false;
   HasX86_64 = false;
   HasPOPCNT = false;
   HasSSE4A = false;
   HasAES = false;
+  HasFXSR = false;
+  HasXSAVE = false;
+  HasXSAVEOPT = false;
+  HasXSAVEC = false;
+  HasXSAVES = false;
   HasPCLMUL = false;
   HasFMA = false;
   HasFMA4 = false;

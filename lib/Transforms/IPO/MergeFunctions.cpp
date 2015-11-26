@@ -656,7 +656,9 @@ int FunctionComparator::cmpConstants(const Constant *L, const Constant *R) {
   }
 
   switch (L->getValueID()) {
-  case Value::UndefValueVal: return TypesRes;
+  case Value::UndefValueVal:
+  case Value::ConstantTokenNoneVal:
+    return TypesRes;
   case Value::ConstantIntVal: {
     const APInt &LInt = cast<ConstantInt>(L)->getValue();
     const APInt &RInt = cast<ConstantInt>(R)->getValue();
@@ -1121,7 +1123,7 @@ int FunctionComparator::cmpBasicBlocks(const BasicBlock *BBL,
   BasicBlock::const_iterator InstR = BBR->begin(), InstRE = BBR->end();
 
   do {
-    if (int Res = cmpValues(InstL, InstR))
+    if (int Res = cmpValues(&*InstL, &*InstR))
       return Res;
 
     const GetElementPtrInst *GEPL = dyn_cast<GetElementPtrInst>(InstL);
@@ -1139,7 +1141,7 @@ int FunctionComparator::cmpBasicBlocks(const BasicBlock *BBL,
       if (int Res = cmpGEPs(GEPL, GEPR))
         return Res;
     } else {
-      if (int Res = cmpOperations(InstL, InstR))
+      if (int Res = cmpOperations(&*InstL, &*InstR))
         return Res;
       assert(InstL->getNumOperands() == InstR->getNumOperands());
 
@@ -1207,7 +1209,7 @@ int FunctionComparator::compare() {
                                     ArgRI = FnR->arg_begin(),
                                     ArgLE = FnL->arg_end();
        ArgLI != ArgLE; ++ArgLI, ++ArgRI) {
-    if (cmpValues(ArgLI, ArgRI) != 0)
+    if (cmpValues(&*ArgLI, &*ArgRI) != 0)
       llvm_unreachable("Arguments repeat!");
   }
 
@@ -1247,6 +1249,7 @@ int FunctionComparator::compare() {
   return 0;
 }
 
+namespace {
 // Accumulate the hash of a sequence of 64-bit integers. This is similar to a
 // hash of a sequence of 64bit ints, but the entire input does not need to be
 // available at once. This interface is necessary for functionHash because it
@@ -1265,6 +1268,7 @@ public:
   // No finishing is required, because the entire hash value is used.
   uint64_t getHash() { return Hash; }
 };
+} // end anonymous namespace
 
 // A function hash is calculated by considering only the number of arguments and
 // whether a function is varargs, the order of basic blocks (given by the
@@ -1658,9 +1662,8 @@ void MergeFunctions::writeThunk(Function *F, Function *G) {
   SmallVector<Value *, 16> Args;
   unsigned i = 0;
   FunctionType *FFTy = F->getFunctionType();
-  for (Function::arg_iterator AI = NewG->arg_begin(), AE = NewG->arg_end();
-       AI != AE; ++AI) {
-    Args.push_back(createCast(Builder, (Value*)AI, FFTy->getParamType(i)));
+  for (Argument & AI : NewG->args()) {
+    Args.push_back(createCast(Builder, &AI, FFTy->getParamType(i)));
     ++i;
   }
 

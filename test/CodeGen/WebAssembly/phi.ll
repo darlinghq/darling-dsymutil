@@ -8,11 +8,8 @@ target triple = "wasm32-unknown-unknown"
 ; Basic phi triangle.
 
 ; CHECK-LABEL: test0:
-; CHECK: @0{{$}}
-; CHECK: set_local [[REG:@.*]], pop
-; CHECK: sdiv [[REG]], {{.*}}
-; CHECK: set_local [[REG]], pop
-; CHECK: return [[REG]]
+; CHECK: div_s $[[NUM0:[0-9]+]]=, $0, $pop[[NUM1:[0-9]+]]{{$}}
+; CHECK: return $[[NUM0]]{{$}}
 define i32 @test0(i32 %p) {
 entry:
   %t = icmp slt i32 %p, 0
@@ -29,12 +26,9 @@ done:
 
 ; CHECK-LABEL: test1:
 ; CHECK: BB1_1:
-; CHECK: [[REG1:@.*]]
-; CHECK: set_local [[REG0:@.*]], pop
-; CHECK: [[REG2:@.*]]
-; CHECK: set_local [[REG1]], pop
-; CHECK: [[REG0]]
-; CHECK: set_local [[REG2]], pop
+; CHECK: copy_local $[[NUM0:[0-9]+]]=, $[[NUM1:[0-9]+]]{{$}}
+; CHECK: copy_local $[[NUM1]]=, $[[NUM2:[0-9]+]]{{$}}
+; CHECK: copy_local $[[NUM2]]=, $[[NUM0]]{{$}}
 define i32 @test1(i32 %n) {
 entry:
   br label %loop

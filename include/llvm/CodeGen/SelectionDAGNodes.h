@@ -82,11 +82,6 @@ namespace ISD {
   /// all ConstantFPSDNode or undef.
   bool isBuildVectorOfConstantFPSDNodes(const SDNode *N);
 
-  /// Return true if the specified node is a
-  /// ISD::SCALAR_TO_VECTOR node or a BUILD_VECTOR node where only the low
-  /// element is not an undef.
-  bool isScalarToVector(const SDNode *N);
-
   /// Return true if the node has at least one operand
   /// and all operands of the specified node are ISD::UNDEF.
   bool allOperandsUndef(const SDNode *N);
@@ -140,7 +135,7 @@ public:
     return SDValue(Node, R);
   }
 
-  // Return true if this node is an operand of N.
+  /// Return true if this node is an operand of N.
   bool isOperandOf(const SDNode *N) const;
 
   /// Return the ValueType of the referenced return value.
@@ -431,11 +426,9 @@ private:
   friend struct ilist_traits<SDNode>;
 
 public:
-#ifndef NDEBUG
   /// Unique and persistent id per SDNode in the DAG.
   /// Used for debug printing.
   uint16_t PersistentId;
-#endif
 
   //===--------------------------------------------------------------------===//
   //  Accessors
@@ -674,22 +667,6 @@ public:
       getOperand(getNumOperands()-1).getValueType() == MVT::Glue)
       return getOperand(getNumOperands()-1).getNode();
     return nullptr;
-  }
-
-  // If this is a pseudo op, like copyfromreg, look to see if there is a
-  // real target node glued to it.  If so, return the target node.
-  const SDNode *getGluedMachineNode() const {
-    const SDNode *FoundNode = this;
-
-    // Climb up glue edges until a machine-opcode node is found, or the
-    // end of the chain is reached.
-    while (!FoundNode->isMachineOpcode()) {
-      const SDNode *N = FoundNode->getGluedNode();
-      if (!N) break;
-      FoundNode = N;
-    }
-
-    return FoundNode;
   }
 
   /// If this node has a glue value with a user, return
@@ -1097,6 +1074,9 @@ class HandleSDNode : public SDNode {
 public:
   explicit HandleSDNode(SDValue X)
     : SDNode(ISD::HANDLENODE, 0, DebugLoc(), getSDVTList(MVT::Other)) {
+    // HandleSDNodes are never inserted into the DAG, so they won't be
+    // auto-numbered. Use ID 65535 as a sentinel.
+    PersistentId = 0xffff;
     InitOperands(&Op, X);
   }
   ~HandleSDNode();
@@ -1513,6 +1493,15 @@ public:
            N->getOpcode() == ISD::TargetConstantFP;
   }
 };
+
+/// Returns true if \p V is a constant integer zero.
+bool isNullConstant(SDValue V);
+/// Returns true if \p V is an FP constant with a value of positive zero.
+bool isNullFPConstant(SDValue V);
+/// Returns true if \p V is an integer constant with all bits set.
+bool isAllOnesConstant(SDValue V);
+/// Returns true if \p V is a constant integer one.
+bool isOneConstant(SDValue V);
 
 class GlobalAddressSDNode : public SDNode {
   const GlobalValue *TheGlobal;

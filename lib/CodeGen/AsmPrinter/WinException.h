@@ -18,6 +18,7 @@
 
 namespace llvm {
 class Function;
+class GlobalValue;
 class MachineFunction;
 class MCExpr;
 class Value;
@@ -41,6 +42,10 @@ class LLVM_LIBRARY_VISIBILITY WinException : public EHStreamer {
 
   void emitCSpecificHandlerTable(const MachineFunction *MF);
 
+  void emitSEHActionsForRange(const WinEHFuncInfo &FuncInfo,
+                              const MCSymbol *BeginLabel,
+                              const MCSymbol *EndLabel, int State);
+
   /// Emit the EH table data for 32-bit and 64-bit functions using
   /// the __CxxFrameHandler3 personality.
   void emitCXXFrameHandler3Table(const MachineFunction *MF);
@@ -50,8 +55,10 @@ class LLVM_LIBRARY_VISIBILITY WinException : public EHStreamer {
   /// tables.
   void emitExceptHandlerTable(const MachineFunction *MF);
 
+  void emitCLRExceptionTable(const MachineFunction *MF);
+
   void computeIP2StateTable(
-      const MachineFunction *MF, WinEHFuncInfo &FuncInfo,
+      const MachineFunction *MF, const WinEHFuncInfo &FuncInfo,
       SmallVectorImpl<std::pair<const MCExpr *, int>> &IPToStateTable);
 
   /// Emits the label used with llvm.x86.seh.recoverfp, which is used by
@@ -60,14 +67,17 @@ class LLVM_LIBRARY_VISIBILITY WinException : public EHStreamer {
                                      StringRef FLinkageName);
 
   const MCExpr *create32bitRef(const MCSymbol *Value);
-  const MCExpr *create32bitRef(const Value *V);
-  const MCExpr *getLabelPlusOne(MCSymbol *Label);
+  const MCExpr *create32bitRef(const GlobalValue *GV);
+  const MCExpr *getLabelPlusOne(const MCSymbol *Label);
+  const MCExpr *getOffset(const MCSymbol *OffsetOf, const MCSymbol *OffsetFrom);
+  const MCExpr *getOffsetPlusOne(const MCSymbol *OffsetOf,
+                                 const MCSymbol *OffsetFrom);
 
   /// Gets the offset that we should use in a table for a stack object with the
   /// given index. For targets using CFI (Win64, etc), this is relative to the
   /// established SP at the end of the prologue. For targets without CFI (Win32
   /// only), it is relative to the frame pointer.
-  int getFrameIndexOffset(int FrameIndex);
+  int getFrameIndexOffset(int FrameIndex, const WinEHFuncInfo &FuncInfo);
 
 public:
   //===--------------------------------------------------------------------===//
