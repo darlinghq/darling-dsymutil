@@ -30,6 +30,7 @@
 #include "llvm/Support/SwapByteOrder.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
+#include <unordered_map>
 #include <system_error>
 
 using namespace llvm;
@@ -264,7 +265,7 @@ protected:
   // Relocations to sections already loaded. Indexed by SectionID which is the
   // source of the address. The target where the address will be written is
   // SectionID/Offset in the relocation itself.
-  DenseMap<unsigned, RelocationList> Relocations;
+  std::unordered_map<unsigned, RelocationList> Relocations;
 
   // Relocations to external symbols that are not yet resolved.  Symbols are
   // external when they aren't found in the global symbol table of all loaded
@@ -410,8 +411,10 @@ protected:
 
   // \brief Compute an upper bound of the memory that is required to load all
   // sections
-  void computeTotalAllocSize(const ObjectFile &Obj, uint64_t &CodeSize,
-                             uint64_t &DataSizeRO, uint64_t &DataSizeRW);
+  void computeTotalAllocSize(const ObjectFile &Obj,
+                             uint64_t &CodeSize, uint32_t &CodeAlign,
+                             uint64_t &RODataSize, uint32_t &RODataAlign,
+                             uint64_t &RWDataSize, uint32_t &RWDataAlign);
 
   // \brief Compute the stub buffer size required for a section
   unsigned computeSectionStubBufSize(const ObjectFile &Obj,

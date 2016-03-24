@@ -19,7 +19,7 @@
 #include "llvm/ExecutionEngine/RuntimeDyldChecker.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCContext.h"
-#include "llvm/MC/MCDisassembler.h"
+#include "llvm/MC/MCDisassembler/MCDisassembler.h"
 #include "llvm/MC/MCInstPrinter.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCRegisterInfo.h"
@@ -191,7 +191,7 @@ public:
   }
 
   uint8_t *allocateFromSlab(uintptr_t Size, unsigned Alignment, bool isCode) {
-    Size = RoundUpToAlignment(Size, Alignment);
+    Size = alignTo(Size, Alignment);
     if (CurrentSlabOffset + Size > SlabSize)
       report_fatal_error("Can't allocate enough memory. Tune --preallocate");
 
@@ -330,7 +330,11 @@ static int printLineInfoForInput(bool LoadObjects, bool UseDebugObj) {
     // Use symbol info to iterate functions in the object.
     for (const auto &P : SymAddr) {
       object::SymbolRef Sym = P.first;
-      if (Sym.getType() == object::SymbolRef::ST_Function) {
+      ErrorOr<SymbolRef::Type> TypeOrErr = Sym.getType();
+      if (!TypeOrErr)
+        continue;
+      SymbolRef::Type Type = *TypeOrErr;
+      if (Type == object::SymbolRef::ST_Function) {
         ErrorOr<StringRef> Name = Sym.getName();
         if (!Name)
           continue;
@@ -388,11 +392,6 @@ static int executeInput() {
   doPreallocation(MemMgr);
   RuntimeDyld Dyld(MemMgr, MemMgr);
 
-  // FIXME: Preserve buffers until resolveRelocations time to work around a bug
-  //        in RuntimeDyldELF.
-  // This fixme should be fixed ASAP. This is a very brittle workaround.
-  std::vector<std::unique_ptr<MemoryBuffer>> InputBuffers;
-
   // If we don't have any input files, read from stdin.
   if (!InputFileList.size())
     InputFileList.push_back("-");
@@ -409,7 +408,6 @@ static int executeInput() {
       return Error("unable to create object file: '" + EC.message() + "'");
 
     ObjectFile &Obj = **MaybeObj;
-    InputBuffers.push_back(std::move(*InputBuffer));
 
     // Load the object file
     Dyld.loadObject(Obj);
@@ -656,11 +654,6 @@ static int linkAndVerify() {
   RuntimeDyldChecker Checker(Dyld, Disassembler.get(), InstPrinter.get(),
                              llvm::dbgs());
 
-  // FIXME: Preserve buffers until resolveRelocations time to work around a bug
-  //        in RuntimeDyldELF.
-  // This fixme should be fixed ASAP. This is a very brittle workaround.
-  std::vector<std::unique_ptr<MemoryBuffer>> InputBuffers;
-
   // If we don't have any input files, read from stdin.
   if (!InputFileList.size())
     InputFileList.push_back("-");
@@ -679,7 +672,6 @@ static int linkAndVerify() {
       return Error("unable to create object file: '" + EC.message() + "'");
 
     ObjectFile &Obj = **MaybeObj;
-    InputBuffers.push_back(std::move(*InputBuffer));
 
     // Load the object file
     Dyld.loadObject(Obj);

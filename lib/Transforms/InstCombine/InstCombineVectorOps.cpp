@@ -106,7 +106,8 @@ Instruction *InstCombiner::scalarizePHI(ExtractElementInst &EI, PHINode *PN) {
                                      B0->getOperand(opId)->getName() + ".Elt"),
           *B0);
       Value *newPHIUser = InsertNewInstWith(
-          BinaryOperator::Create(B0->getOpcode(), scalarPHI, Op), *B0);
+          BinaryOperator::CreateWithCopiedFlags(B0->getOpcode(),
+                                                scalarPHI, Op, B0), *B0);
       scalarPHI->addIncoming(newPHIUser, inBB);
     } else {
       // Scalarize PHI input:
@@ -125,19 +126,19 @@ Instruction *InstCombiner::scalarizePHI(ExtractElementInst &EI, PHINode *PN) {
       scalarPHI->addIncoming(newEI, inBB);
     }
   }
-  return ReplaceInstUsesWith(EI, scalarPHI);
+  return replaceInstUsesWith(EI, scalarPHI);
 }
 
 Instruction *InstCombiner::visitExtractElementInst(ExtractElementInst &EI) {
   if (Value *V = SimplifyExtractElementInst(
           EI.getVectorOperand(), EI.getIndexOperand(), DL, TLI, DT, AC))
-    return ReplaceInstUsesWith(EI, V);
+    return replaceInstUsesWith(EI, V);
 
   // If vector val is constant with all elements the same, replace EI with
   // that element.  We handle a known element # below.
   if (Constant *C = dyn_cast<Constant>(EI.getOperand(0)))
     if (cheapToScalarize(C, false))
-      return ReplaceInstUsesWith(EI, C->getAggregateElement(0U));
+      return replaceInstUsesWith(EI, C->getAggregateElement(0U));
 
   // If extracting a specified index from the vector, see if we can recursively
   // find a previously computed scalar that was inserted into the vector.
@@ -162,7 +163,7 @@ Instruction *InstCombiner::visitExtractElementInst(ExtractElementInst &EI) {
       }
     }
 
-    // If the this extractelement is directly using a bitcast from a vector of
+    // If this extractelement is directly using a bitcast from a vector of
     // the same number of elements, see if we can find the source element from
     // it.  In this case, we will end up needing to bitcast the scalars.
     if (BitCastInst *BCI = dyn_cast<BitCastInst>(EI.getOperand(0))) {
@@ -183,7 +184,7 @@ Instruction *InstCombiner::visitExtractElementInst(ExtractElementInst &EI) {
 
   if (Instruction *I = dyn_cast<Instruction>(EI.getOperand(0))) {
     // Push extractelement into predecessor operation if legal and
-    // profitable to do so
+    // profitable to do so.
     if (BinaryOperator *BO = dyn_cast<BinaryOperator>(I)) {
       if (I->hasOneUse() &&
           cheapToScalarize(BO, isa<ConstantInt>(EI.getOperand(1)))) {
@@ -193,12 +194,13 @@ Instruction *InstCombiner::visitExtractElementInst(ExtractElementInst &EI) {
         Value *newEI1 =
           Builder->CreateExtractElement(BO->getOperand(1), EI.getOperand(1),
                                         EI.getName()+".rhs");
-        return BinaryOperator::Create(BO->getOpcode(), newEI0, newEI1);
+        return BinaryOperator::CreateWithCopiedFlags(BO->getOpcode(),
+                                                     newEI0, newEI1, BO);
       }
     } else if (InsertElementInst *IE = dyn_cast<InsertElementInst>(I)) {
       // Extracting the inserted element?
       if (IE->getOperand(2) == EI.getOperand(1))
-        return ReplaceInstUsesWith(EI, IE->getOperand(1));
+        return replaceInstUsesWith(EI, IE->getOperand(1));
       // If the inserted and extracted elements are constants, they must not
       // be the same value, extract from the pre-inserted value instead.
       if (isa<Constant>(IE->getOperand(2)) && isa<Constant>(EI.getOperand(1))) {
@@ -216,7 +218,7 @@ Instruction *InstCombiner::visitExtractElementInst(ExtractElementInst &EI) {
           SVI->getOperand(0)->getType()->getVectorNumElements();
 
         if (SrcIdx < 0)
-          return ReplaceInstUsesWith(EI, UndefValue::get(EI.getType()));
+          return replaceInstUsesWith(EI, UndefValue::get(EI.getType()));
         if (SrcIdx < (int)LHSWidth)
           Src = SVI->getOperand(0);
         else {
@@ -229,8 +231,9 @@ Instruction *InstCombiner::visitExtractElementInst(ExtractElementInst &EI) {
                                                            SrcIdx, false));
       }
     } else if (CastInst *CI = dyn_cast<CastInst>(I)) {
-      // Canonicalize extractelement(cast) -> cast(extractelement)
-      // bitcasts can change the number of vector elements and they cost nothing
+      // Canonicalize extractelement(cast) -> cast(extractelement).
+      // Bitcasts can change the number of vector elements, and they cost
+      // nothing.
       if (CI->hasOneUse() && (CI->getOpcode() != Instruction::BitCast)) {
         Value *EE = Builder->CreateExtractElement(CI->getOperand(0),
                                                   EI.getIndexOperand());
@@ -244,7 +247,8 @@ Instruction *InstCombiner::visitExtractElementInst(ExtractElementInst &EI) {
         // fight the vectorizer.
 
         // If we are extracting an element from a vector select or a select on
-        // vectors, a select on the scalars extracted from the vector arguments.
+        // vectors, create a select on the scalars extracted from the vector
+        // arguments.
         Value *TrueVal = SI->getTrueValue();
         Value *FalseVal = SI->getFalseValue();
 
@@ -350,6 +354,74 @@ static bool collectSingleShuffleElements(Value *V, Value *LHS, Value *RHS,
   return false;
 }
 
+/// If we have insertion into a vector that is wider than the vector that we
+/// are extracting from, try to widen the source vector to allow a single
+/// shufflevector to replace one or more insert/extract pairs.
+static void replaceExtractElements(InsertElementInst *InsElt,
+                                   ExtractElementInst *ExtElt,
+                                   InstCombiner &IC) {
+  VectorType *InsVecType = InsElt->getType();
+  VectorType *ExtVecType = ExtElt->getVectorOperandType();
+  unsigned NumInsElts = InsVecType->getVectorNumElements();
+  unsigned NumExtElts = ExtVecType->getVectorNumElements();
+
+  // The inserted-to vector must be wider than the extracted-from vector.
+  if (InsVecType->getElementType() != ExtVecType->getElementType() ||
+      NumExtElts >= NumInsElts)
+    return;
+
+  // Create a shuffle mask to widen the extended-from vector using undefined
+  // values. The mask selects all of the values of the original vector followed
+  // by as many undefined values as needed to create a vector of the same length
+  // as the inserted-to vector.
+  SmallVector<Constant *, 16> ExtendMask;
+  IntegerType *IntType = Type::getInt32Ty(InsElt->getContext());
+  for (unsigned i = 0; i < NumExtElts; ++i)
+    ExtendMask.push_back(ConstantInt::get(IntType, i));
+  for (unsigned i = NumExtElts; i < NumInsElts; ++i)
+    ExtendMask.push_back(UndefValue::get(IntType));
+
+  Value *ExtVecOp = ExtElt->getVectorOperand();
+  auto *ExtVecOpInst = dyn_cast<Instruction>(ExtVecOp);
+  BasicBlock *InsertionBlock = (ExtVecOpInst && !isa<PHINode>(ExtVecOpInst))
+                                   ? ExtVecOpInst->getParent()
+                                   : ExtElt->getParent();
+
+  // TODO: This restriction matches the basic block check below when creating
+  // new extractelement instructions. If that limitation is removed, this one
+  // could also be removed. But for now, we just bail out to ensure that we
+  // will replace the extractelement instruction that is feeding our
+  // insertelement instruction. This allows the insertelement to then be
+  // replaced by a shufflevector. If the insertelement is not replaced, we can
+  // induce infinite looping because there's an optimization for extractelement
+  // that will delete our widening shuffle. This would trigger another attempt
+  // here to create that shuffle, and we spin forever.
+  if (InsertionBlock != InsElt->getParent())
+    return;
+
+  auto *WideVec = new ShuffleVectorInst(ExtVecOp, UndefValue::get(ExtVecType),
+                                        ConstantVector::get(ExtendMask));
+
+  // Insert the new shuffle after the vector operand of the extract is defined
+  // (as long as it's not a PHI) or at the start of the basic block of the
+  // extract, so any subsequent extracts in the same basic block can use it.
+  // TODO: Insert before the earliest ExtractElementInst that is replaced.
+  if (ExtVecOpInst && !isa<PHINode>(ExtVecOpInst))
+    WideVec->insertAfter(ExtVecOpInst);
+  else
+    IC.InsertNewInstWith(WideVec, *ExtElt->getParent()->getFirstInsertionPt());
+
+  // Replace extracts from the original narrow vector with extracts from the new
+  // wide vector.
+  for (User *U : ExtVecOp->users()) {
+    ExtractElementInst *OldExt = dyn_cast<ExtractElementInst>(U);
+    if (!OldExt || OldExt->getParent() != WideVec->getParent())
+      continue;
+    auto *NewExt = ExtractElementInst::Create(WideVec, OldExt->getOperand(1));
+    NewExt->insertAfter(WideVec);
+    IC.replaceInstUsesWith(*OldExt, NewExt);
+  }
+}
 
 /// We are building a shuffle to create V, which is a sequence of insertelement,
 /// extractelement pairs. If PermittedRHS is set, then we must either use it or
@@ -363,7 +435,8 @@ typedef std::pair<Value *, Value *> ShuffleOps;
 
 static ShuffleOps collectShuffleElements(Value *V,
                                          SmallVectorImpl<Constant *> &Mask,
-                                         Value *PermittedRHS) {
+                                         Value *PermittedRHS,
+                                         InstCombiner &IC) {
   assert(V->getType()->isVectorTy() && "Invalid shuffle!");
   unsigned NumElts = cast<VectorType>(V->getType())->getNumElements();
 
@@ -394,10 +467,14 @@ static ShuffleOps collectShuffleElements(Value *V,
         // otherwise we'd end up with a shuffle of three inputs.
         if (EI->getOperand(0) == PermittedRHS || PermittedRHS == nullptr) {
           Value *RHS = EI->getOperand(0);
-          ShuffleOps LR = collectShuffleElements(VecOp, Mask, RHS);
+          ShuffleOps LR = collectShuffleElements(VecOp, Mask, RHS, IC);
           assert(LR.second == nullptr || LR.second == RHS);
 
           if (LR.first->getType() != RHS->getType()) {
+            // Although we are giving up for now, see if we can create extracts
+            // that match the inserts for another round of combining.
+            replaceExtractElements(IEI, EI, IC);
+
             // We tried our best, but we can't find anything compatible with RHS
             // further up the chain. Return a trivial shuffle.
             for (unsigned i = 0; i < NumElts; ++i)
@@ -434,7 +511,7 @@ static ShuffleOps collectShuffleElements(Value *V,
     }
   }
 
-  // Otherwise, can't do anything fancy.  Return an identity vector.
+  // Otherwise, we can't do anything fancy. Return an identity vector.
   for (unsigned i = 0; i != NumElts; ++i)
     Mask.push_back(ConstantInt::get(Type::getInt32Ty(V->getContext()), i));
   return std::make_pair(V, nullptr);
@@ -471,7 +548,7 @@ Instruction *InstCombiner::visitInsertValueInst(InsertValueInst &I) {
   }
 
   if (IsRedundant)
-    return ReplaceInstUsesWith(I, I.getOperand(0));
+    return replaceInstUsesWith(I, I.getOperand(0));
   return nullptr;
 }
 
@@ -482,7 +559,7 @@ Instruction *InstCombiner::visitInsertElementInst(InsertElementInst &IE) {
 
   // Inserting an undef or into an undefined place, remove this.
   if (isa<UndefValue>(ScalarOp) || isa<UndefValue>(IdxOp))
-    ReplaceInstUsesWith(IE, VecOp);
+    replaceInstUsesWith(IE, VecOp);
 
   // If the inserted element was extracted from some other vector, and if the
   // indexes are constant, try to turn this into a shufflevector operation.
@@ -496,21 +573,21 @@ Instruction *InstCombiner::visitInsertElementInst(InsertElementInst &IE) {
       unsigned InsertedIdx = cast<ConstantInt>(IdxOp)->getZExtValue();
 
       if (ExtractedIdx >= NumExtractVectorElts) // Out of range extract.
-        return ReplaceInstUsesWith(IE, VecOp);
+        return replaceInstUsesWith(IE, VecOp);
 
       if (InsertedIdx >= NumInsertVectorElts)  // Out of range insert.
-        return ReplaceInstUsesWith(IE, UndefValue::get(IE.getType()));
+        return replaceInstUsesWith(IE, UndefValue::get(IE.getType()));
 
       // If we are extracting a value from a vector, then inserting it right
       // back into the same place, just use the input vector.
       if (EI->getOperand(0) == VecOp && ExtractedIdx == InsertedIdx)
-        return ReplaceInstUsesWith(IE, VecOp);
+        return replaceInstUsesWith(IE, VecOp);
 
       // If this insertelement isn't used by some other insertelement, turn it
       // (and any insertelements it points to), into one big shuffle.
       if (!IE.hasOneUse() || !isa<InsertElementInst>(IE.user_back())) {
         SmallVector<Constant*, 16> Mask;
-        ShuffleOps LR = collectShuffleElements(&IE, Mask, nullptr);
+        ShuffleOps LR = collectShuffleElements(&IE, Mask, nullptr, *this);
 
         // The proposed shuffle may be trivial, in which case we shouldn't
         // perform the combine.
@@ -530,7 +607,7 @@ Instruction *InstCombiner::visitInsertElementInst(InsertElementInst &IE) {
   APInt AllOnesEltMask(APInt::getAllOnesValue(VWidth));
   if (Value *V = SimplifyDemandedVectorElts(&IE, AllOnesEltMask, UndefElts)) {
     if (V != &IE)
-      return ReplaceInstUsesWith(IE, V);
+      return replaceInstUsesWith(IE, V);
     return &IE;
   }
 
@@ -835,7 +912,7 @@ Instruction *InstCombiner::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
 
   // Undefined shuffle mask -> undefined value.
   if (isa<UndefValue>(SVI.getOperand(2)))
-    return ReplaceInstUsesWith(SVI, UndefValue::get(SVI.getType()));
+    return replaceInstUsesWith(SVI, UndefValue::get(SVI.getType()));
 
   unsigned VWidth = cast<VectorType>(SVI.getType())->getNumElements();
 
@@ -843,7 +920,7 @@ Instruction *InstCombiner::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
   APInt AllOnesEltMask(APInt::getAllOnesValue(VWidth));
   if (Value *V = SimplifyDemandedVectorElts(&SVI, AllOnesEltMask, UndefElts)) {
     if (V != &SVI)
-      return ReplaceInstUsesWith(SVI, V);
+      return replaceInstUsesWith(SVI, V);
     LHS = SVI.getOperand(0);
     RHS = SVI.getOperand(1);
     MadeChange = true;
@@ -858,7 +935,7 @@ Instruction *InstCombiner::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
       // shuffle(undef,undef,mask) -> undef.
       Value *Result = (VWidth == LHSWidth)
                       ? LHS : UndefValue::get(SVI.getType());
-      return ReplaceInstUsesWith(SVI, Result);
+      return replaceInstUsesWith(SVI, Result);
     }
 
     // Remap any references to RHS to use LHS.
@@ -892,13 +969,13 @@ Instruction *InstCombiner::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
     recognizeIdentityMask(Mask, isLHSID, isRHSID);
 
     // Eliminate identity shuffles.
-    if (isLHSID) return ReplaceInstUsesWith(SVI, LHS);
-    if (isRHSID) return ReplaceInstUsesWith(SVI, RHS);
+    if (isLHSID) return replaceInstUsesWith(SVI, LHS);
+    if (isRHSID) return replaceInstUsesWith(SVI, RHS);
   }
 
   if (isa<UndefValue>(RHS) && CanEvaluateShuffled(LHS, Mask)) {
     Value *V = EvaluateInDifferentElementOrder(LHS, Mask);
-    return ReplaceInstUsesWith(SVI, V);
+    return replaceInstUsesWith(SVI, V);
   }
 
   // SROA generates shuffle+bitcast when the extracted sub-vector is bitcast to
@@ -985,7 +1062,7 @@ Instruction *InstCombiner::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
           NewBC, ConstantInt::get(Int32Ty, BegIdx), SVI.getName() + ".extract");
       // The shufflevector isn't being replaced: the bitcast that used it
       // is. InstCombine will visit the newly-created instructions.
-      ReplaceInstUsesWith(*BC, Ext);
+      replaceInstUsesWith(*BC, Ext);
       MadeChange = true;
     }
   }
@@ -1176,8 +1253,8 @@ Instruction *InstCombiner::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
   // corresponding argument.
   bool isLHSID, isRHSID;
   recognizeIdentityMask(newMask, isLHSID, isRHSID);
-  if (isLHSID && VWidth == LHSOp0Width) return ReplaceInstUsesWith(SVI, newLHS);
-  if (isRHSID && VWidth == RHSOp0Width) return ReplaceInstUsesWith(SVI, newRHS);
+  if (isLHSID && VWidth == LHSOp0Width) return replaceInstUsesWith(SVI, newLHS);
+  if (isRHSID && VWidth == RHSOp0Width) return replaceInstUsesWith(SVI, newRHS);
 
   return MadeChange ? &SVI : nullptr;
 }

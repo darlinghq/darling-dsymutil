@@ -285,17 +285,17 @@ struct AArch64NamedImmMapper {
     // Zero value of FeatureBitSet means the mapping is always available
     FeatureBitset FeatureBitSet;
 
-    bool isNameEqual(std::string Other, 
+    bool isNameEqual(std::string Other,
                      const FeatureBitset& FeatureBits) const {
-      if (FeatureBitSet.any() && 
+      if (FeatureBitSet.any() &&
           (FeatureBitSet & FeatureBits).none())
         return false;
       return Name == Other;
     }
 
-    bool isValueEqual(uint32_t Other, 
+    bool isValueEqual(uint32_t Other,
                       const FeatureBitset& FeatureBits) const {
-      if (FeatureBitSet.any() && 
+      if (FeatureBitSet.any() &&
           (FeatureBitSet & FeatureBits).none())
         return false;
       return Value == Other;
@@ -310,7 +310,7 @@ struct AArch64NamedImmMapper {
   StringRef toString(uint32_t Value, const FeatureBitset& FeatureBits,
                      bool &Valid) const;
   // Maps string to value, depending on availability for FeatureBits given
-  uint32_t fromString(StringRef Name, const FeatureBitset& FeatureBits, 
+  uint32_t fromString(StringRef Name, const FeatureBitset& FeatureBits,
                      bool &Valid) const;
 
   /// Many of the instructions allow an alternative assembly form consisting of
@@ -474,6 +474,21 @@ namespace AArch64PState {
     const static Mapping PStateMappings[];
 
     PStateMapper();
+  };
+
+}
+
+namespace AArch64PSBHint {
+  enum PSBHintValues {
+    Invalid = -1,
+    // v8.2a "Statistical Profiling" extension-specific PSB operands
+    CSync = 0x11,  // psb csync = hint #0x11
+  };
+
+  struct PSBHintMapper : AArch64NamedImmMapper {
+    const static Mapping PSBHintMappings[];
+
+    PSBHintMapper();
   };
 
 }
@@ -1199,6 +1214,21 @@ namespace AArch64SysReg {
     // v8.2a registers
     UAO               = 0xc214, // 11  000  0100  0010  100
 
+    // v8.2a "Statistical Profiling extension" registers
+    PMBLIMITR_EL1     = 0xc4d0, // 11  000  1001  1010  000
+    PMBPTR_EL1        = 0xc4d1, // 11  000  1001  1010  001
+    PMBSR_EL1         = 0xc4d3, // 11  000  1001  1010  011
+    PMBIDR_EL1        = 0xc4d7, // 11  000  1001  1010  111
+    PMSCR_EL2         = 0xe4c8, // 11  100  1001  1001  000
+    PMSCR_EL12        = 0xecc8, // 11  101  1001  1001  000
+    PMSCR_EL1         = 0xc4c8, // 11  000  1001  1001  000
+    PMSICR_EL1        = 0xc4ca, // 11  000  1001  1001  010
+    PMSIRR_EL1        = 0xc4cb, // 11  000  1001  1001  011
+    PMSFCR_EL1        = 0xc4cc, // 11  000  1001  1001  100
+    PMSEVFR_EL1       = 0xc4cd, // 11  000  1001  1001  101
+    PMSLATFR_EL1      = 0xc4ce, // 11  000  1001  1001  110
+    PMSIDR_EL1        = 0xc4cf, // 11  000  1001  1001  111
+
     // Cyclone specific system registers
     CPM_IOACC_CTL_EL3 = 0xff90,
   };
@@ -1292,7 +1322,7 @@ namespace AArch64TLBI {
       return true;
     }
   }
-} 
+}
 
 namespace AArch64II {
   /// Target Operand Flag enum.

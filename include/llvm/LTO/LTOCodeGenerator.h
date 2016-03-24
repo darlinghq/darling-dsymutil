@@ -39,7 +39,8 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
-#include "llvm/Linker/Linker.h"
+#include "llvm/IR/GlobalValue.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
 #include <string>
@@ -48,7 +49,7 @@
 namespace llvm {
   class LLVMContext;
   class DiagnosticInfo;
-  class GlobalValue;
+  class Linker;
   class Mangler;
   class MemoryBuffer;
   class TargetLibraryInfo;
@@ -62,8 +63,7 @@ namespace llvm {
 struct LTOCodeGenerator {
   static const char *getVersionString();
 
-  LTOCodeGenerator();
-  LTOCodeGenerator(std::unique_ptr<LLVMContext> Context);
+  LTOCodeGenerator(LLVMContext &Context);
   ~LTOCodeGenerator();
 
   /// Merge given module.  Return true on success.
@@ -86,6 +86,22 @@ struct LTOCodeGenerator {
 
   void setShouldInternalize(bool Value) { ShouldInternalize = Value; }
   void setShouldEmbedUselists(bool Value) { ShouldEmbedUselists = Value; }
+
+  /// Restore linkage of globals
+  ///
+  /// When set, the linkage of globals will be restored prior to code
+  /// generation. That is, a global symbol that had external linkage prior to
+  /// LTO will be emitted with external linkage again; and a local will remain
+  /// local. Note that this option only affects the end result - globals may
+  /// still be internalized in the process of LTO and may be modified and/or
+  /// deleted where legal.
+  ///
+  /// The default behavior will internalize globals (unless on the preserve
+  /// list) and, if parallel code generation is enabled, will externalize
+  /// all locals.
+  void setShouldRestoreGlobalsLinkage(bool Value) {
+    ShouldRestoreGlobalsLinkage = Value;
+  }
 
   void addMustPreserveSymbol(StringRef Sym) { MustPreserveSymbols[Sym] = 1; }
 
@@ -149,10 +165,13 @@ struct LTOCodeGenerator {
 
   LLVMContext &getContext() { return Context; }
 
+  void resetMergedModule() { MergedModule.reset(); }
+
 private:
   void initializeLTOPasses();
 
   bool compileOptimizedToFile(const char **Name);
+  void restoreLinkageForExternals();
   void applyScopeRestrictions();
   void applyRestriction(GlobalValue &GV, ArrayRef<StringRef> Libcalls,
                         std::vector<const char *> &MustPreserveList,
@@ -168,16 +187,16 @@ private:
 
   typedef StringMap<uint8_t> StringSet;
 
-  std::unique_ptr<LLVMContext> OwnedContext;
   LLVMContext &Context;
   std::unique_ptr<Module> MergedModule;
-  Linker IRLinker;
+  std::unique_ptr<Linker> TheLinker;
   std::unique_ptr<TargetMachine> TargetMach;
   bool EmitDwarfDebugInfo = false;
   bool ScopeRestrictionsDone = false;
   Reloc::Model RelocModel = Reloc::Default;
   StringSet MustPreserveSymbols;
   StringSet AsmUndefinedRefs;
+  StringMap<GlobalValue::LinkageTypes> ExternalSymbols;
   std::vector<std::string> CodegenOptions;
   std::string FeatureStr;
   std::string MCpu;
@@ -190,6 +209,7 @@ private:
   void *DiagContext = nullptr;
   bool ShouldInternalize = true;
   bool ShouldEmbedUselists = false;
+  bool ShouldRestoreGlobalsLinkage = false;
   TargetMachine::CodeGenFileType FileType = TargetMachine::CGFT_ObjectFile;
 };
 }

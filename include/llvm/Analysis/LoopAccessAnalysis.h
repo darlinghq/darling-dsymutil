@@ -193,11 +193,10 @@ public:
                const SmallVectorImpl<Instruction *> &Instrs) const;
   };
 
-  MemoryDepChecker(ScalarEvolution *Se, const Loop *L,
-                   SCEVUnionPredicate &Preds)
-      : SE(Se), InnermostLoop(L), AccessIdx(0),
+  MemoryDepChecker(PredicatedScalarEvolution &PSE, const Loop *L)
+      : PSE(PSE), InnermostLoop(L), AccessIdx(0),
         ShouldRetryWithRuntimeCheck(false), SafeForVectorization(true),
-        RecordDependences(true), Preds(Preds) {}
+        RecordDependences(true) {}
 
   /// \brief Register the location (instructions are given increasing numbers)
   /// of a write access.
@@ -266,7 +265,13 @@ public:
                                                          bool isWrite) const;
 
 private:
-  ScalarEvolution *SE;
+  /// A wrapper around ScalarEvolution, used to add runtime SCEV checks, and
+  /// applies dynamic knowledge to simplify SCEV expressions and convert them
+  /// to a more usable form. We need this in case assumptions about SCEV
+  /// expressions need to be made in order to avoid unknown dependences. For
+  /// example we might assume a unit stride for a pointer in order to prove
+  /// that a memory access is strided and doesn't wrap.
+  PredicatedScalarEvolution &PSE;
   const Loop *InnermostLoop;
 
   /// \brief Maps access locations (ptr, read/write) to program order.
@@ -317,15 +322,6 @@ private:
   /// \brief Check whether the data dependence could prevent store-load
   /// forwarding.
   bool couldPreventStoreLoadForward(unsigned Distance, unsigned TypeByteSize);
-
-  /// The SCEV predicate containing all the SCEV-related assumptions.
-  /// The dependence checker needs this in order to convert SCEVs of pointers
-  /// to more accurate expressions in the context of existing assumptions.
-  /// We also need this in case assumptions about SCEV expressions need to
-  /// be made in order to avoid unknown dependences. For example we might
-  /// assume a unit stride for a pointer in order to prove that a memory access
-  /// is strided and doesn't wrap.
-  SCEVUnionPredicate &Preds;
 };
 
 /// \brief Holds information about the memory runtime legality checks to verify
@@ -367,13 +363,13 @@ public:
   }
 
   /// Insert a pointer and calculate the start and end SCEVs.
-  /// \p We need Preds in order to compute the SCEV expression of the pointer
+  /// We need \p PSE in order to compute the SCEV expression of the pointer
   /// according to the assumptions that we've made during the analysis.
   /// The method might also version the pointer stride according to \p Strides,
-  /// and change \p Preds.
+  /// and add new predicates to \p PSE.
   void insert(Loop *Lp, Value *Ptr, bool WritePtr, unsigned DepSetId,
               unsigned ASId, const ValueToValueMap &Strides,
-              SCEVUnionPredicate &Preds);
+              PredicatedScalarEvolution &PSE);
 
   /// \brief No run-time memory checking is necessary.
   bool empty() const { return Pointers.empty(); }
@@ -508,8 +504,8 @@ private:
 /// ScalarEvolution, we will generate run-time checks by emitting a
 /// SCEVUnionPredicate.
 ///
-/// Checks for both memory dependences and SCEV predicates must be emitted in
-/// order for the results of this analysis to be valid.
+/// Checks for both memory dependences and the SCEV predicates contained in the
+/// PSE must be emitted in order for the results of this analysis to be valid.
 class LoopAccessInfo {
 public:
   LoopAccessInfo(Loop *L, ScalarEvolution *SE, const DataLayout &DL,
@@ -591,14 +587,12 @@ public:
     return StoreToLoopInvariantAddress;
   }
 
-  /// The SCEV predicate contains all the SCEV-related assumptions.
-  /// The is used to keep track of the minimal set of assumptions on SCEV
-  /// expressions that the analysis needs to make in order to return a
-  /// meaningful result. All SCEV expressions during the analysis should be
-  /// re-written (and therefore simplified) according to Preds.
+  /// Used to add runtime SCEV checks. Simplifies SCEV expressions and converts
+  /// them to a more usable form.  All SCEV expressions during the analysis
+  /// should be re-written (and therefore simplified) according to PSE.
   /// A user of LoopAccessAnalysis will need to emit the runtime checks
   /// associated with this predicate.
-  SCEVUnionPredicate Preds;
+  PredicatedScalarEvolution PSE;
 
 private:
   /// \brief Analyze the loop.  Substitute symbolic strides using Strides.
@@ -619,7 +613,6 @@ private:
   MemoryDepChecker DepChecker;
 
   Loop *TheLoop;
-  ScalarEvolution *SE;
   const DataLayout &DL;
   const TargetLibraryInfo *TLI;
   AliasAnalysis *AA;
@@ -645,27 +638,38 @@ private:
 
 Value *stripIntegerCast(Value *V);
 
-///\brief Return the SCEV corresponding to a pointer with the symbolic stride
-/// replaced with constant one, assuming \p Preds is true.
+/// \brief Return the SCEV corresponding to a pointer with the symbolic stride
+/// replaced with constant one, assuming the SCEV predicate associated with
+/// \p PSE is true.
 ///
 /// If necessary this method will version the stride of the pointer according
-/// to \p PtrToStride and therefore add a new predicate to \p Preds.
+/// to \p PtrToStride and therefore add further predicates to \p PSE.
 ///
 /// If \p OrigPtr is not null, use it to look up the stride value instead of \p
 /// Ptr.  \p PtrToStride provides the mapping between the pointer value and its
 /// stride as collected by LoopVectorizationLegality::collectStridedAccess.
-const SCEV *replaceSymbolicStrideSCEV(ScalarEvolution *SE,
+const SCEV *replaceSymbolicStrideSCEV(PredicatedScalarEvolution &PSE,
                                       const ValueToValueMap &PtrToStride,
-                                      SCEVUnionPredicate &Preds, Value *Ptr,
-                                      Value *OrigPtr = nullptr);
+                                      Value *Ptr, Value *OrigPtr = nullptr);
 
-/// \brief Check the stride of the pointer and ensure that it does not wrap in
-/// the address space, assuming \p Preds is true.
+/// \brief If the pointer has a constant stride return it in units of its
+/// element size.  Otherwise return zero.
+///
+/// Ensure that it does not wrap in the address space, assuming the predicate
+/// associated with \p PSE is true.
 ///
 /// If necessary this method will version the stride of the pointer according
-/// to \p PtrToStride and therefore add a new predicate to \p Preds.
-int isStridedPtr(ScalarEvolution *SE, Value *Ptr, const Loop *Lp,
-                 const ValueToValueMap &StridesMap, SCEVUnionPredicate &Preds);
+/// to \p PtrToStride and therefore add further predicates to \p PSE.
+/// The \p Assume parameter indicates if we are allowed to make additional
+/// run-time assumptions.
+int isStridedPtr(PredicatedScalarEvolution &PSE, Value *Ptr, const Loop *Lp,
+                 const ValueToValueMap &StridesMap = ValueToValueMap(),
+                 bool Assume = false);
+
+/// \brief Returns true if the memory operations \p A and \p B are consecutive.
+/// This is a simple API that does not depend on the analysis pass. 
+bool isConsecutiveAccess(Value *A, Value *B, const DataLayout &DL,
+                         ScalarEvolution &SE, bool CheckType = true);
 
 /// \brief This analysis provides dependence information for the memory accesses
 /// of a loop.

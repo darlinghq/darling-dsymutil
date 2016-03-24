@@ -44,8 +44,10 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorOr.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/IPO.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include <cctype>
 
@@ -71,10 +73,20 @@ static cl::opt<unsigned> SampleProfileSampleCoverage(
     "sample-profile-check-sample-coverage", cl::init(0), cl::value_desc("N"),
     cl::desc("Emit a warning if less than N% of samples in the input profile "
              "are matched to the IR."));
-static cl::opt<unsigned> SampleProfileHotThreshold(
-    "sample-profile-inline-hot-threshold", cl::init(5), cl::value_desc("N"),
+static cl::opt<double> SampleProfileHotThreshold(
+    "sample-profile-inline-hot-threshold", cl::init(0.1), cl::value_desc("N"),
     cl::desc("Inlined functions that account for more than N% of all samples "
              "collected in the parent function, will be inlined again."));
+static cl::opt<double> SampleProfileGlobalHotThreshold(
+    "sample-profile-global-hot-threshold", cl::init(30), cl::value_desc("N"),
+    cl::desc("Top-level functions that account for more than N% of all samples "
+             "collected in the profile, will be marked as hot for the inliner "
+             "to consider."));
+static cl::opt<double> SampleProfileGlobalColdThreshold(
+    "sample-profile-global-cold-threshold", cl::init(0.5), cl::value_desc("N"),
+    cl::desc("Top-level functions that account for less than N% of all samples "
+             "collected in the profile, will be marked as cold for the inliner "
+             "to consider."));
 
 namespace {
 typedef DenseMap<const BasicBlock *, uint64_t> BlockWeightMap;
@@ -96,7 +108,8 @@ public:
 
   SampleProfileLoader(StringRef Name = SampleProfileFile)
       : ModulePass(ID), DT(nullptr), PDT(nullptr), LI(nullptr), Reader(),
-        Samples(nullptr), Filename(Name), ProfileIsValid(false) {
+        Samples(nullptr), Filename(Name), ProfileIsValid(false),
+        TotalCollectedSamples(0) {
     initializeSampleProfileLoaderPass(*PassRegistry::getPassRegistry());
   }
 
@@ -109,7 +122,7 @@ public:
   bool runOnModule(Module &M) override;
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
-    AU.setPreservesCFG();
+    AU.addRequired<InstructionCombiningPass>();
   }
 
 protected:
@@ -121,13 +134,13 @@ protected:
   const FunctionSamples *findCalleeFunctionSamples(const CallInst &I) const;
   const FunctionSamples *findFunctionSamples(const Instruction &I) const;
   bool inlineHotFunctions(Function &F);
+  bool emitInlineHints(Function &F);
   void printEdgeWeight(raw_ostream &OS, Edge E);
   void printBlockWeight(raw_ostream &OS, const BasicBlock *BB) const;
   void printBlockEquivalence(raw_ostream &OS, const BasicBlock *BB);
   bool computeBlockWeights(Function &F);
   void findEquivalenceClasses(Function &F);
-  void findEquivalencesFor(BasicBlock *BB1,
-                           SmallVector<BasicBlock *, 8> Descendants,
+  void findEquivalencesFor(BasicBlock *BB1, ArrayRef<BasicBlock *> Descendants,
                            DominatorTreeBase<BasicBlock> *DomTree);
   void propagateWeights(Function &F);
   uint64_t visitEdge(Edge E, unsigned *NumUnknownEdges, Edge *UnknownEdge);
@@ -150,10 +163,10 @@ protected:
   EdgeWeightMap EdgeWeights;
 
   /// \brief Set of visited blocks during propagation.
-  SmallPtrSet<const BasicBlock *, 128> VisitedBlocks;
+  SmallPtrSet<const BasicBlock *, 32> VisitedBlocks;
 
   /// \brief Set of visited edges during propagation.
-  SmallSet<Edge, 128> VisitedEdges;
+  SmallSet<Edge, 32> VisitedEdges;
 
   /// \brief Equivalence classes for block weights.
   ///
@@ -185,6 +198,12 @@ protected:
 
   /// \brief Flag indicating whether the profile input loaded successfully.
   bool ProfileIsValid;
+
+  /// \brief Total number of samples collected in this profile.
+  ///
+  /// This is the sum of all the samples collected in all the functions executed
+  /// at runtime.
+  uint64_t TotalCollectedSamples;
 };
 
 class SampleCoverageTracker {
@@ -204,7 +223,7 @@ public:
   }
 
 private:
-  typedef DenseMap<LineLocation, unsigned> BodySampleCoverageMap;
+  typedef std::map<LineLocation, unsigned> BodySampleCoverageMap;
   typedef DenseMap<const FunctionSamples *, BodySampleCoverageMap>
       FunctionSamplesCoverageMap;
 
@@ -262,10 +281,10 @@ bool callsiteIsHot(const FunctionSamples *CallerFS,
   if (CallsiteTotalSamples == 0)
     return false; // Callsite is trivially cold.
 
-  uint64_t PercentSamples = CallsiteTotalSamples * 100 / ParentTotalSamples;
+  double PercentSamples =
+      (double)CallsiteTotalSamples / (double)ParentTotalSamples * 100.0;
   return PercentSamples >= SampleProfileHotThreshold;
 }
-
 }
 
 /// Mark as used the sample record for the given function samples at
@@ -529,19 +548,12 @@ SampleProfileLoader::findCalleeFunctionSamples(const CallInst &Inst) const {
   if (!SP)
     return nullptr;
 
-  Function *CalleeFunc = Inst.getCalledFunction();
-  if (!CalleeFunc) {
-    return nullptr;
-  }
-
-  StringRef CalleeName = CalleeFunc->getName();
   const FunctionSamples *FS = findFunctionSamples(Inst);
   if (FS == nullptr)
     return nullptr;
 
-  return FS->findFunctionSamplesAt(
-      CallsiteLocation(getOffset(DIL->getLine(), SP->getLine()),
-                       DIL->getDiscriminator(), CalleeName));
+  return FS->findFunctionSamplesAt(LineLocation(
+      getOffset(DIL->getLine(), SP->getLine()), DIL->getDiscriminator()));
 }
 
 /// \brief Get the FunctionSamples for an instruction.
@@ -555,7 +567,7 @@ SampleProfileLoader::findCalleeFunctionSamples(const CallInst &Inst) const {
 /// \returns the FunctionSamples pointer to the inlined instance.
 const FunctionSamples *
 SampleProfileLoader::findFunctionSamples(const Instruction &Inst) const {
-  SmallVector<CallsiteLocation, 10> S;
+  SmallVector<LineLocation, 10> S;
   const DILocation *DIL = Inst.getDebugLoc();
   if (!DIL) {
     return Samples;
@@ -567,8 +579,8 @@ SampleProfileLoader::findFunctionSamples(const Instruction &Inst) const {
     if (!SP)
       return nullptr;
     if (!CalleeName.empty()) {
-      S.push_back(CallsiteLocation(getOffset(DIL->getLine(), SP->getLine()),
-                                   DIL->getDiscriminator(), CalleeName));
+      S.push_back(LineLocation(getOffset(DIL->getLine(), SP->getLine()),
+                               DIL->getDiscriminator()));
     }
     CalleeName = SP->getLinkageName();
   }
@@ -579,6 +591,64 @@ SampleProfileLoader::findFunctionSamples(const Instruction &Inst) const {
     FS = FS->findFunctionSamplesAt(S[i]);
   }
   return FS;
+}
+
+/// \brief Emit an inline hint if \p F is globally hot or cold.
+///
+/// If \p F consumes a significant fraction of samples (indicated by
+/// SampleProfileGlobalHotThreshold), apply the InlineHint attribute for the
+/// inliner to consider the function hot.
+///
+/// If \p F consumes a small fraction of samples (indicated by
+/// SampleProfileGlobalColdThreshold), apply the Cold attribute for the inliner
+/// to consider the function cold.
+///
+/// FIXME - This setting of inline hints is sub-optimal. Instead of marking a
+/// function globally hot or cold, we should be annotating individual callsites.
+/// This is not currently possible, but work on the inliner will eventually
+/// provide this ability. See http://reviews.llvm.org/D15003 for details and
+/// discussion.
+///
+/// \returns True if either attribute was applied to \p F.
+bool SampleProfileLoader::emitInlineHints(Function &F) {
+  if (TotalCollectedSamples == 0)
+    return false;
+
+  uint64_t FunctionSamples = Samples->getTotalSamples();
+  double SamplesPercent =
+      (double)FunctionSamples / (double)TotalCollectedSamples * 100.0;
+
+  // If the function collected more samples than the hot threshold, mark
+  // it globally hot.
+  if (SamplesPercent >= SampleProfileGlobalHotThreshold) {
+    F.addFnAttr(llvm::Attribute::InlineHint);
+    std::string Msg;
+    raw_string_ostream S(Msg);
+    S << "Applied inline hint to globally hot function '" << F.getName()
+      << "' with " << format("%.2f", SamplesPercent)
+      << "% of samples (threshold: "
+      << format("%.2f", SampleProfileGlobalHotThreshold.getValue()) << "%)";
+    S.flush();
+    emitOptimizationRemark(F.getContext(), DEBUG_TYPE, F, DebugLoc(), Msg);
+    return true;
+  }
+
+  // If the function collected fewer samples than the cold threshold, mark
+  // it globally cold.
+  if (SamplesPercent <= SampleProfileGlobalColdThreshold) {
+    F.addFnAttr(llvm::Attribute::Cold);
+    std::string Msg;
+    raw_string_ostream S(Msg);
+    S << "Applied cold hint to globally cold function '" << F.getName()
+      << "' with " << format("%.2f", SamplesPercent)
+      << "% of samples (threshold: "
+      << format("%.2f", SampleProfileGlobalColdThreshold.getValue()) << "%)";
+    S.flush();
+    emitOptimizationRemark(F.getContext(), DEBUG_TYPE, F, DebugLoc(), Msg);
+    return true;
+  }
+
+  return false;
 }
 
 /// \brief Iteratively inline hot callsites of a function.
@@ -653,7 +723,7 @@ bool SampleProfileLoader::inlineHotFunctions(Function &F) {
 ///                 with blocks from \p BB1's dominator tree, then
 ///                 this is the post-dominator tree, and vice versa.
 void SampleProfileLoader::findEquivalencesFor(
-    BasicBlock *BB1, SmallVector<BasicBlock *, 8> Descendants,
+    BasicBlock *BB1, ArrayRef<BasicBlock *> Descendants,
     DominatorTreeBase<BasicBlock> *DomTree) {
   const BasicBlock *EC = EquivalenceClass[BB1];
   uint64_t Weight = BlockWeights[EC];
@@ -1006,7 +1076,7 @@ void SampleProfileLoader::propagateWeights(Function &F) {
 /// \returns the line number where \p F is defined. If it returns 0,
 ///          it means that there is no debug information available for \p F.
 unsigned SampleProfileLoader::getFunctionLoc(Function &F) {
-  if (DISubprogram *S = getDISubprogram(&F))
+  if (DISubprogram *S = F.getSubprogram())
     return S->getLine();
 
   // If the start of \p F is missing, emit a diagnostic to inform the user
@@ -1087,6 +1157,8 @@ bool SampleProfileLoader::emitAnnotations(Function &F) {
   DEBUG(dbgs() << "Line number for the first instruction in " << F.getName()
                << ": " << getFunctionLoc(F) << "\n");
 
+  Changed |= emitInlineHints(F);
+
   Changed |= inlineHotFunctions(F);
 
   // Compute basic block weights.
@@ -1110,7 +1182,7 @@ bool SampleProfileLoader::emitAnnotations(Function &F) {
     unsigned Coverage = CoverageTracker.computeCoverage(Used, Total);
     if (Coverage < SampleProfileRecordCoverage) {
       F.getContext().diagnose(DiagnosticInfoSampleProfile(
-          getDISubprogram(&F)->getFilename(), getFunctionLoc(F),
+          F.getSubprogram()->getFilename(), getFunctionLoc(F),
           Twine(Used) + " of " + Twine(Total) + " available profile records (" +
               Twine(Coverage) + "%) were applied",
           DS_Warning));
@@ -1123,7 +1195,7 @@ bool SampleProfileLoader::emitAnnotations(Function &F) {
     unsigned Coverage = CoverageTracker.computeCoverage(Used, Total);
     if (Coverage < SampleProfileSampleCoverage) {
       F.getContext().diagnose(DiagnosticInfoSampleProfile(
-          getDISubprogram(&F)->getFilename(), getFunctionLoc(F),
+          F.getSubprogram()->getFilename(), getFunctionLoc(F),
           Twine(Used) + " of " + Twine(Total) + " available profile samples (" +
               Twine(Coverage) + "%) were applied",
           DS_Warning));
@@ -1136,6 +1208,7 @@ char SampleProfileLoader::ID = 0;
 INITIALIZE_PASS_BEGIN(SampleProfileLoader, "sample-profile",
                       "Sample Profile loader", false, false)
 INITIALIZE_PASS_DEPENDENCY(AddDiscriminators)
+INITIALIZE_PASS_DEPENDENCY(InstructionCombiningPass)
 INITIALIZE_PASS_END(SampleProfileLoader, "sample-profile",
                     "Sample Profile loader", false, false)
 
@@ -1164,6 +1237,10 @@ bool SampleProfileLoader::runOnModule(Module &M) {
   if (!ProfileIsValid)
     return false;
 
+  // Compute the total number of samples collected in this profile.
+  for (const auto &I : Reader->getProfiles())
+    TotalCollectedSamples += I.second.getTotalSamples();
+
   bool retval = false;
   for (auto &F : M)
     if (!F.isDeclaration()) {
@@ -1174,6 +1251,8 @@ bool SampleProfileLoader::runOnModule(Module &M) {
 }
 
 bool SampleProfileLoader::runOnFunction(Function &F) {
+  F.setEntryCount(0);
+  getAnalysis<InstructionCombiningPass>(F);
   Samples = Reader->getSamplesFor(F);
   if (!Samples->empty())
     return emitAnnotations(F);

@@ -20,6 +20,24 @@ using namespace llvm;
 
 #define DEBUG_TYPE "aarch64tti"
 
+static cl::opt<unsigned> CyclonePrefetchDistance(
+    "cyclone-prefetch-distance",
+    cl::desc("Number of instructions to prefetch ahead for Cyclone"),
+    cl::init(280), cl::Hidden);
+
+// The HW prefetcher handles accesses with strides up to 2KB.
+static cl::opt<unsigned> CycloneMinPrefetchStride(
+    "cyclone-min-prefetch-stride",
+    cl::desc("Min stride to add prefetches for Cyclone"),
+    cl::init(2048), cl::Hidden);
+
+// Be conservative for now and don't prefetch ahead too much since the loop
+// may terminate early.
+static cl::opt<unsigned> CycloneMaxPrefetchIterationsAhead(
+    "cyclone-max-prefetch-iters-ahead",
+    cl::desc("Max number of iterations to prefetch ahead on Cyclone"),
+    cl::init(3), cl::Hidden);
+
 /// \brief Calculate the cost of materializing a 64-bit value. This helper
 /// method might only calculate a fraction of a larger immediate. Therefore it
 /// is valid to return a cost of ZERO.
@@ -313,6 +331,8 @@ int AArch64TTIImpl::getVectorInstrCost(unsigned Opcode, Type *Val,
   }
 
   // All other insert/extracts cost this much.
+  if (ST->isKryo())
+    return 2;
   return 3;
 }
 
@@ -448,7 +468,7 @@ int AArch64TTIImpl::getInterleavedMemoryOpCost(unsigned Opcode, Type *VecTy,
   if (Factor <= TLI->getMaxSupportedInterleaveFactor()) {
     unsigned NumElts = VecTy->getVectorNumElements();
     Type *SubVecTy = VectorType::get(VecTy->getScalarType(), NumElts / Factor);
-    unsigned SubVecSize = DL.getTypeAllocSizeInBits(SubVecTy);
+    unsigned SubVecSize = DL.getTypeSizeInBits(SubVecTy);
 
     // ldN/stN only support legal vector types of size 64 or 128 in bits.
     if (NumElts % Factor == 0 && (SubVecSize == 64 || SubVecSize == 128))
@@ -472,7 +492,7 @@ int AArch64TTIImpl::getCostOfKeepingLiveOverCall(ArrayRef<Type *> Tys) {
 }
 
 unsigned AArch64TTIImpl::getMaxInterleaveFactor(unsigned VF) {
-  if (ST->isCortexA57())
+  if (ST->isCortexA57() || ST->isKryo())
     return 4;
   return 2;
 }
@@ -538,7 +558,7 @@ bool AArch64TTIImpl::getTgtMemIntrinsic(IntrinsicInst *Inst,
   case Intrinsic::aarch64_neon_ld4:
     Info.ReadMem = true;
     Info.WriteMem = false;
-    Info.Vol = false;
+    Info.IsSimple = true;
     Info.NumMemRefs = 1;
     Info.PtrVal = Inst->getArgOperand(0);
     break;
@@ -547,7 +567,7 @@ bool AArch64TTIImpl::getTgtMemIntrinsic(IntrinsicInst *Inst,
   case Intrinsic::aarch64_neon_st4:
     Info.ReadMem = false;
     Info.WriteMem = true;
-    Info.Vol = false;
+    Info.IsSimple = true;
     Info.NumMemRefs = 1;
     Info.PtrVal = Inst->getArgOperand(Inst->getNumArgOperands() - 1);
     break;
@@ -570,4 +590,28 @@ bool AArch64TTIImpl::getTgtMemIntrinsic(IntrinsicInst *Inst,
     break;
   }
   return true;
+}
+
+unsigned AArch64TTIImpl::getCacheLineSize() {
+  if (ST->isCyclone())
+    return 64;
+  return BaseT::getCacheLineSize();
+}
+
+unsigned AArch64TTIImpl::getPrefetchDistance() {
+  if (ST->isCyclone())
+    return CyclonePrefetchDistance;
+  return BaseT::getPrefetchDistance();
+}
+
+unsigned AArch64TTIImpl::getMinPrefetchStride() {
+  if (ST->isCyclone())
+    return CycloneMinPrefetchStride;
+  return BaseT::getMinPrefetchStride();
+}
+
+unsigned AArch64TTIImpl::getMaxPrefetchIterationsAhead() {
+  if (ST->isCyclone())
+    return CycloneMaxPrefetchIterationsAhead;
+  return BaseT::getMaxPrefetchIterationsAhead();
 }

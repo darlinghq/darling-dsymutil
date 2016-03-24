@@ -79,6 +79,11 @@ namespace llvm {
       /// compute an allocation on the stack.
       DYNALLOC,
 
+      /// This instruction is lowered in PPCRegisterInfo::eliminateFrameIndex to
+      /// compute an offset from native SP to the address  of the most recent
+      /// dynamic alloca.
+      DYNAREAOFFSET,
+
       /// GlobalBaseReg - On Darwin, this node represents the result of the mflr
       /// at function entry, used for PIC code.
       GlobalBaseReg,
@@ -423,6 +428,8 @@ namespace llvm {
     /// DAG node.
     const char *getTargetNodeName(unsigned Opcode) const override;
 
+    bool useSoftFloat() const override;
+
     MVT getScalarShiftAmountTy(const DataLayout &, EVT) const override {
       return MVT::i32;
     }
@@ -500,6 +507,10 @@ namespace llvm {
                                        unsigned Depth = 0) const override;
 
     unsigned getPrefLoopAlignment(MachineLoop *ML) const override;
+
+    bool shouldInsertFencesForAtomic(const Instruction *I) const override {
+      return true;
+    }
 
     Instruction* emitLeadingFence(IRBuilder<> &Builder, AtomicOrdering Ord,
                                   bool IsStore, bool IsLoad) const override;
@@ -728,6 +739,8 @@ namespace llvm {
                         const PPCSubtarget &Subtarget) const;
     SDValue LowerSTACKRESTORE(SDValue Op, SelectionDAG &DAG,
                                 const PPCSubtarget &Subtarget) const;
+    SDValue LowerGET_DYNAMIC_AREA_OFFSET(SDValue Op, SelectionDAG &DAG,
+                                         const PPCSubtarget &Subtarget) const;
     SDValue LowerDYNAMIC_STACKALLOC(SDValue Op, SelectionDAG &DAG,
                                       const PPCSubtarget &Subtarget) const;
     SDValue LowerLOAD(SDValue Op, SelectionDAG &DAG) const;

@@ -132,11 +132,17 @@ void DiagnosticInfoSampleProfile::print(DiagnosticPrinter &DP) const {
   DP << getMsg();
 }
 
-bool DiagnosticInfoOptimizationBase::isLocationAvailable() const {
+void DiagnosticInfoPGOProfile::print(DiagnosticPrinter &DP) const {
+  if (getFileName())
+    DP << getFileName() << ": ";
+  DP << getMsg();
+}
+
+bool DiagnosticInfoWithDebugLocBase::isLocationAvailable() const {
   return getDebugLoc();
 }
 
-void DiagnosticInfoOptimizationBase::getLocation(StringRef *Filename,
+void DiagnosticInfoWithDebugLocBase::getLocation(StringRef *Filename,
                                                  unsigned *Line,
                                                  unsigned *Column) const {
   DILocation *L = getDebugLoc();
@@ -146,7 +152,7 @@ void DiagnosticInfoOptimizationBase::getLocation(StringRef *Filename,
   *Column = L->getColumn();
 }
 
-const std::string DiagnosticInfoOptimizationBase::getLocationStr() const {
+const std::string DiagnosticInfoWithDebugLocBase::getLocationStr() const {
   StringRef Filename("<unknown>");
   unsigned Line = 0;
   unsigned Column = 0;
@@ -222,6 +228,16 @@ void llvm::emitOptimizationRemarkAnalysisAliasing(LLVMContext &Ctx,
 bool DiagnosticInfoOptimizationFailure::isEnabled() const {
   // Only print warnings.
   return getSeverity() == DS_Warning;
+}
+
+void DiagnosticInfoUnsupported::print(DiagnosticPrinter &DP) const {
+  std::string Str;
+  raw_string_ostream OS(Str);
+
+  OS << getLocationStr() << ": in function " << getFunction().getName() << ' '
+     << *getFunction().getFunctionType() << ": " << Msg << '\n';
+  OS.flush();
+  DP << Str;
 }
 
 void llvm::emitLoopVectorizeWarning(LLVMContext &Ctx, const Function &Fn,

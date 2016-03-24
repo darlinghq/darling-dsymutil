@@ -15,12 +15,16 @@
 #include "llvm-c/lto.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/CodeGen/CommandFlags.h"
+#include "llvm/IR/DiagnosticInfo.h"
+#include "llvm/IR/DiagnosticPrinter.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/LTO/LTOCodeGenerator.h"
 #include "llvm/LTO/LTOModule.h"
+#include "llvm/LTO/ThinLTOCodeGenerator.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/raw_ostream.h"
 
 // extra command-line flags needed for LTOCodeGenerator
 static cl::opt<char>
@@ -64,6 +68,23 @@ static bool initialized = false;
 // Holds the command-line option parsing state of the LTO module.
 static bool parsedOptions = false;
 
+static LLVMContext *LTOContext = nullptr;
+
+static void diagnosticHandler(const DiagnosticInfo &DI, void *Context) {
+  if (DI.getSeverity() != DS_Error) {
+    DiagnosticPrinterRawOStream DP(errs());
+    DI.print(DP);
+    errs() << '\n';
+    return;
+  }
+  sLastErrorString = "";
+  {
+    raw_string_ostream Stream(sLastErrorString);
+    DiagnosticPrinterRawOStream DP(Stream);
+    DI.print(DP);
+  }
+}
+
 // Initialize the configured targets if they have not been initialized.
 static void lto_initialize() {
   if (!initialized) {
@@ -79,6 +100,9 @@ static void lto_initialize() {
     InitializeAllAsmParsers();
     InitializeAllAsmPrinters();
     InitializeAllDisassemblers();
+
+    LTOContext = &getGlobalContext();
+    LTOContext->setDiagnosticHandler(diagnosticHandler, nullptr, true);
     initialized = true;
   }
 }
@@ -88,25 +112,30 @@ namespace {
 static void handleLibLTODiagnostic(lto_codegen_diagnostic_severity_t Severity,
                                    const char *Msg, void *) {
   sLastErrorString = Msg;
-  sLastErrorString += "\n";
 }
 
 // This derived class owns the native object file. This helps implement the
 // libLTO API semantics, which require that the code generator owns the object
 // file.
 struct LibLTOCodeGenerator : LTOCodeGenerator {
-  LibLTOCodeGenerator() {
+  LibLTOCodeGenerator() : LTOCodeGenerator(*LTOContext) {
     setDiagnosticHandler(handleLibLTODiagnostic, nullptr); }
   LibLTOCodeGenerator(std::unique_ptr<LLVMContext> Context)
-      : LTOCodeGenerator(std::move(Context)) {
+      : LTOCodeGenerator(*Context), OwnedContext(std::move(Context)) {
     setDiagnosticHandler(handleLibLTODiagnostic, nullptr); }
 
+  // Reset the module first in case MergedModule is created in OwnedContext.
+  // Module must be destructed before its context gets destructed.
+  ~LibLTOCodeGenerator() { resetMergedModule(); }
+
   std::unique_ptr<MemoryBuffer> NativeObjectFile;
+  std::unique_ptr<LLVMContext> OwnedContext;
 };
 
 }
 
 DEFINE_SIMPLE_CONVERSION_FUNCTIONS(LibLTOCodeGenerator, lto_code_gen_t)
+DEFINE_SIMPLE_CONVERSION_FUNCTIONS(ThinLTOCodeGenerator, thinlto_code_gen_t)
 DEFINE_SIMPLE_CONVERSION_FUNCTIONS(LTOModule, lto_module_t)
 
 // Convert the subtarget features into a string to pass to LTOCodeGenerator.
@@ -165,14 +194,21 @@ lto_module_is_object_file_in_memory_for_target(const void* mem,
 lto_module_t lto_module_create(const char* path) {
   lto_initialize();
   llvm::TargetOptions Options = InitTargetOptionsFromCodeGenFlags();
-  return wrap(LTOModule::createFromFile(path, Options, sLastErrorString));
+  ErrorOr<std::unique_ptr<LTOModule>> M =
+      LTOModule::createFromFile(*LTOContext, path, Options);
+  if (!M)
+    return nullptr;
+  return wrap(M->release());
 }
 
 lto_module_t lto_module_create_from_fd(int fd, const char *path, size_t size) {
   lto_initialize();
   llvm::TargetOptions Options = InitTargetOptionsFromCodeGenFlags();
-  return wrap(
-      LTOModule::createFromOpenFile(fd, path, size, Options, sLastErrorString));
+  ErrorOr<std::unique_ptr<LTOModule>> M =
+      LTOModule::createFromOpenFile(*LTOContext, fd, path, size, Options);
+  if (!M)
+    return nullptr;
+  return wrap(M->release());
 }
 
 lto_module_t lto_module_create_from_fd_at_offset(int fd, const char *path,
@@ -181,14 +217,21 @@ lto_module_t lto_module_create_from_fd_at_offset(int fd, const char *path,
                                                  off_t offset) {
   lto_initialize();
   llvm::TargetOptions Options = InitTargetOptionsFromCodeGenFlags();
-  return wrap(LTOModule::createFromOpenFileSlice(fd, path, map_size, offset,
-                                                 Options, sLastErrorString));
+  ErrorOr<std::unique_ptr<LTOModule>> M = LTOModule::createFromOpenFileSlice(
+      *LTOContext, fd, path, map_size, offset, Options);
+  if (!M)
+    return nullptr;
+  return wrap(M->release());
 }
 
 lto_module_t lto_module_create_from_memory(const void* mem, size_t length) {
   lto_initialize();
   llvm::TargetOptions Options = InitTargetOptionsFromCodeGenFlags();
-  return wrap(LTOModule::createFromBuffer(mem, length, Options, sLastErrorString));
+  ErrorOr<std::unique_ptr<LTOModule>> M =
+      LTOModule::createFromBuffer(*LTOContext, mem, length, Options);
+  if (!M)
+    return nullptr;
+  return wrap(M->release());
 }
 
 lto_module_t lto_module_create_from_memory_with_path(const void* mem,
@@ -196,16 +239,28 @@ lto_module_t lto_module_create_from_memory_with_path(const void* mem,
                                                      const char *path) {
   lto_initialize();
   llvm::TargetOptions Options = InitTargetOptionsFromCodeGenFlags();
-  return wrap(
-      LTOModule::createFromBuffer(mem, length, Options, sLastErrorString, path));
+  ErrorOr<std::unique_ptr<LTOModule>> M =
+      LTOModule::createFromBuffer(*LTOContext, mem, length, Options, path);
+  if (!M)
+    return nullptr;
+  return wrap(M->release());
 }
 
 lto_module_t lto_module_create_in_local_context(const void *mem, size_t length,
                                                 const char *path) {
   lto_initialize();
   llvm::TargetOptions Options = InitTargetOptionsFromCodeGenFlags();
-  return wrap(LTOModule::createInLocalContext(mem, length, Options,
-                                              sLastErrorString, path));
+
+  // Create a local context. Ownership will be transfered to LTOModule.
+  std::unique_ptr<LLVMContext> Context = llvm::make_unique<LLVMContext>();
+  Context->setDiagnosticHandler(diagnosticHandler, nullptr, true);
+
+  ErrorOr<std::unique_ptr<LTOModule>> M =
+      LTOModule::createInLocalContext(std::move(Context), mem, length, Options,
+                                      path);
+  if (!M)
+    return nullptr;
+  return wrap(M->release());
 }
 
 lto_module_t lto_module_create_in_codegen_context(const void *mem,
@@ -214,8 +269,9 @@ lto_module_t lto_module_create_in_codegen_context(const void *mem,
                                                   lto_code_gen_t cg) {
   lto_initialize();
   llvm::TargetOptions Options = InitTargetOptionsFromCodeGenFlags();
-  return wrap(LTOModule::createInContext(mem, length, Options, sLastErrorString,
-                                         path, &unwrap(cg)->getContext()));
+  ErrorOr<std::unique_ptr<LTOModule>> M = LTOModule::createFromBuffer(
+      unwrap(cg)->getContext(), mem, length, Options, path);
+  return wrap(M->release());
 }
 
 void lto_module_dispose(lto_module_t mod) { delete unwrap(mod); }
@@ -385,4 +441,107 @@ void lto_codegen_set_should_internalize(lto_code_gen_t cg,
 void lto_codegen_set_should_embed_uselists(lto_code_gen_t cg,
                                            lto_bool_t ShouldEmbedUselists) {
   unwrap(cg)->setShouldEmbedUselists(ShouldEmbedUselists);
+}
+
+// ThinLTO API below
+
+thinlto_code_gen_t thinlto_create_codegen(void) {
+  lto_initialize();
+  ThinLTOCodeGenerator *CodeGen = new ThinLTOCodeGenerator();
+  CodeGen->setTargetOptions(InitTargetOptionsFromCodeGenFlags());
+
+  return wrap(CodeGen);
+}
+
+void thinlto_codegen_dispose(thinlto_code_gen_t cg) { delete unwrap(cg); }
+
+void thinlto_codegen_add_module(thinlto_code_gen_t cg, const char *Identifier,
+                                const char *Data, int Length) {
+  unwrap(cg)->addModule(Identifier, StringRef(Data, Length));
+}
+
+void thinlto_codegen_process(thinlto_code_gen_t cg) { unwrap(cg)->run(); }
+
+unsigned int thinlto_module_get_num_objects(thinlto_code_gen_t cg) {
+  return unwrap(cg)->getProducedBinaries().size();
+}
+LTOObjectBuffer thinlto_module_get_object(thinlto_code_gen_t cg,
+                                          unsigned int index) {
+  assert(index < unwrap(cg)->getProducedBinaries().size() && "Index overflow");
+  auto &MemBuffer = unwrap(cg)->getProducedBinaries()[index];
+  return LTOObjectBuffer{MemBuffer->getBufferStart(),
+                         MemBuffer->getBufferSize()};
+}
+
+void thinlto_debug_options(const char *const *options, int number) {
+  // if options were requested, set them
+  if (number && options) {
+    std::vector<const char *> CodegenArgv(1, "libLTO");
+    for (auto Arg : ArrayRef<const char *>(options, number))
+      CodegenArgv.push_back(Arg);
+    cl::ParseCommandLineOptions(CodegenArgv.size(), CodegenArgv.data());
+  }
+}
+
+bool lto_module_is_thinlto(lto_module_t mod) {
+  return unwrap(mod)->isThinLTO();
+}
+
+void thinlto_codegen_add_must_preserve_symbol(thinlto_code_gen_t cg,
+                                              const char *Name, int Length) {
+  unwrap(cg)->preserveSymbol(StringRef(Name, Length));
+}
+
+void thinlto_codegen_add_cross_referenced_symbol(thinlto_code_gen_t cg,
+                                                 const char *Name, int Length) {
+  unwrap(cg)->crossReferenceSymbol(StringRef(Name, Length));
+}
+
+void thinlto_codegen_set_cpu(thinlto_code_gen_t cg, const char *cpu) {
+  return unwrap(cg)->setCpu(cpu);
+}
+
+void thinlto_codegen_set_cache_dir(thinlto_code_gen_t cg,
+                                   const char *cache_dir) {
+  return unwrap(cg)->setCacheDir(cache_dir);
+}
+
+void thinlto_codegen_set_cache_pruning_interval(thinlto_code_gen_t cg,
+                                                int interval) {
+  return unwrap(cg)->setCachePruningInterval(interval);
+}
+
+void thinlto_codegen_set_cache_entry_expiration(thinlto_code_gen_t cg,
+                                                unsigned expiration) {
+  return unwrap(cg)->setCacheEntryExpiration(expiration);
+}
+
+void thinlto_codegen_set_final_cache_size_relative_to_available_space(
+    thinlto_code_gen_t cg, unsigned Percentage) {
+  return unwrap(cg)->setMaxCacheSizeRelativeToAvailableSpace(Percentage);
+}
+
+void thinlto_codegen_set_savetemps_dir(thinlto_code_gen_t cg,
+                                       const char *save_temps_dir) {
+  return unwrap(cg)->setSaveTempsDir(save_temps_dir);
+}
+
+lto_bool_t thinlto_codegen_set_pic_model(thinlto_code_gen_t cg,
+                                         lto_codegen_model model) {
+  switch (model) {
+  case LTO_CODEGEN_PIC_MODEL_STATIC:
+    unwrap(cg)->setCodePICModel(Reloc::Static);
+    return false;
+  case LTO_CODEGEN_PIC_MODEL_DYNAMIC:
+    unwrap(cg)->setCodePICModel(Reloc::PIC_);
+    return false;
+  case LTO_CODEGEN_PIC_MODEL_DYNAMIC_NO_PIC:
+    unwrap(cg)->setCodePICModel(Reloc::DynamicNoPIC);
+    return false;
+  case LTO_CODEGEN_PIC_MODEL_DEFAULT:
+    unwrap(cg)->setCodePICModel(Reloc::Default);
+    return false;
+  }
+  sLastErrorString = "Unknown PIC model";
+  return true;
 }

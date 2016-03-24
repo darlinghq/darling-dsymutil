@@ -154,6 +154,14 @@ const AArch64NamedImmMapper::Mapping AArch64PState::PStateMapper::PStateMappings
 AArch64PState::PStateMapper::PStateMapper()
   : AArch64NamedImmMapper(PStateMappings, 0) {}
 
+const AArch64NamedImmMapper::Mapping AArch64PSBHint::PSBHintMapper::PSBHintMappings[] = {
+  // v8.2a "Statistical Profiling" extension-specific PSB operand
+  {"csync", CSync, {AArch64::FeatureSPE}},
+};
+
+AArch64PSBHint::PSBHintMapper::PSBHintMapper()
+  : AArch64NamedImmMapper(PSBHintMappings, 0) {}
+
 const AArch64NamedImmMapper::Mapping AArch64SysReg::MRSMapper::MRSMappings[] = {
   {"mdccsr_el0", MDCCSR_EL0, {}},
   {"dbgdtrrx_el0", DBGDTRRX_EL0, {}},
@@ -808,10 +816,25 @@ const AArch64NamedImmMapper::Mapping AArch64SysReg::SysRegMapper::SysRegMappings
 
   // v8.2a registers
   {"uao",           UAO,           {AArch64::HasV8_2aOps}},
+
+  // v8.2a "Statistical Profiling extension" registers
+  {"pmblimitr_el1", PMBLIMITR_EL1, {AArch64::FeatureSPE}},
+  {"pmbptr_el1",    PMBPTR_EL1,    {AArch64::FeatureSPE}},
+  {"pmbsr_el1",     PMBSR_EL1,     {AArch64::FeatureSPE}},
+  {"pmbidr_el1",    PMBIDR_EL1,    {AArch64::FeatureSPE}},
+  {"pmscr_el2",     PMSCR_EL2,     {AArch64::FeatureSPE}},
+  {"pmscr_el12",    PMSCR_EL12,    {AArch64::FeatureSPE}},
+  {"pmscr_el1",     PMSCR_EL1,     {AArch64::FeatureSPE}},
+  {"pmsicr_el1",    PMSICR_EL1,    {AArch64::FeatureSPE}},
+  {"pmsirr_el1",    PMSIRR_EL1,    {AArch64::FeatureSPE}},
+  {"pmsfcr_el1",    PMSFCR_EL1,    {AArch64::FeatureSPE}},
+  {"pmsevfr_el1",   PMSEVFR_EL1,   {AArch64::FeatureSPE}},
+  {"pmslatfr_el1",  PMSLATFR_EL1,  {AArch64::FeatureSPE}},
+  {"pmsidr_el1",    PMSIDR_EL1,    {AArch64::FeatureSPE}},
 };
 
 uint32_t
-AArch64SysReg::SysRegMapper::fromString(StringRef Name, 
+AArch64SysReg::SysRegMapper::fromString(StringRef Name,
     const FeatureBitset& FeatureBits, bool &Valid) const {
   std::string NameLower = Name.lower();
 
@@ -855,7 +878,7 @@ AArch64SysReg::SysRegMapper::fromString(StringRef Name,
 }
 
 std::string
-AArch64SysReg::SysRegMapper::toString(uint32_t Bits, 
+AArch64SysReg::SysRegMapper::toString(uint32_t Bits,
                                       const FeatureBitset& FeatureBits) const {
   // First search the registers shared by all
   for (unsigned i = 0; i < array_lengthof(SysRegMappings); ++i) {

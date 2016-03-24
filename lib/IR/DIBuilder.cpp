@@ -19,6 +19,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Dwarf.h"
+#include "LLVMContextImpl.h"
 
 using namespace llvm;
 using namespace llvm::dwarf;
@@ -148,7 +149,7 @@ DICompileUnit *DIBuilder::createCompileUnit(
   CUNode = DICompileUnit::getDistinct(
       VMContext, Lang, DIFile::get(VMContext, Filename, Directory), Producer,
       isOptimized, Flags, RunTimeVer, SplitName, Kind, nullptr,
-      nullptr, nullptr, nullptr, nullptr, DWOId);
+      nullptr, nullptr, nullptr, nullptr, nullptr, DWOId);
 
   // Create a named metadata so that it is easier to find cu in a module.
   // Note that we only generate this when the caller wants to actually
@@ -168,8 +169,12 @@ static DIImportedEntity *
 createImportedModule(LLVMContext &C, dwarf::Tag Tag, DIScope *Context,
                      Metadata *NS, unsigned Line, StringRef Name,
                      SmallVectorImpl<TrackingMDNodeRef> &AllImportedModules) {
+  unsigned EntitiesCount = C.pImpl->DIImportedEntitys.size();
   auto *M = DIImportedEntity::get(C, Tag, Context, DINodeRef(NS), Line, Name);
-  AllImportedModules.emplace_back(M);
+  if (EntitiesCount < C.pImpl->DIImportedEntitys.size())
+    // A new Imported Entity was just added to the context.
+    // Add it to the Imported Modules list.
+    AllImportedModules.emplace_back(M);
   return M;
 }
 

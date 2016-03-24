@@ -90,12 +90,16 @@ namespace HexagonII {
     PostInc        = 6   // Post increment addressing mode
   };
 
+  // MemAccessSize is represented as 1+log2(N) where N is size in bits.
   enum class MemAccessSize {
     NoMemAccess = 0,            // Not a memory acces instruction.
     ByteAccess = 1,             // Byte access instruction (memb).
     HalfWordAccess = 2,         // Half word access instruction (memh).
     WordAccess = 3,             // Word access instruction (memw).
-    DoubleWordAccess = 4        // Double word access instruction (memd)
+    DoubleWordAccess = 4,       // Double word access instruction (memd)
+                    // 5,       // We do not have a 16 byte vector access.
+    Vector64Access = 7,         // 64 Byte vector access instruction (vmem).
+    Vector128Access = 8         // 128 Byte vector access instruction (vmem).
   };
 
   // MCInstrDesc TSFlags
@@ -175,7 +179,7 @@ namespace HexagonII {
     AddrModeMask = 0x7,
     // Access size for load/store instructions.
     MemAccessSizePos = 43,
-    MemAccesSizeMask = 0x7,
+    MemAccesSizeMask = 0xf,
 
     // Branch predicted taken.
     TakenPos = 47,
@@ -223,7 +227,27 @@ namespace HexagonII {
     MO_LO16, MO_HI16,
 
     // Offset from the base of the SDA.
-    MO_GPREL
+    MO_GPREL,
+
+    // MO_GDGOT - indicates GOT relative relocation for TLS
+    // GeneralDynamic method
+    MO_GDGOT,
+
+    // MO_GDPLT - indicates PLT relative relocation for TLS
+    // GeneralDynamic method
+    MO_GDPLT,
+
+    // MO_IE - indicates non PIC relocation for TLS
+    // Initial Executable method
+    MO_IE,
+
+    // MO_IEGOT - indicates PIC relocation for TLS
+    // Initial Executable method
+    MO_IEGOT,
+
+    // MO_TPREL - indicates relocation for TLS
+    // local Executable method
+    MO_TPREL
   };
 
   // Hexagon Sub-instruction classes.

@@ -328,9 +328,7 @@ static AArch64_AM::ShiftExtendType getShiftTypeForNode(SDValue N) {
 bool AArch64DAGToDAGISel::isWorthFolding(SDValue V) const {
   // it hurts if the value is used at least twice, unless we are optimizing
   // for code size.
-  if (ForCodeSize || V.hasOneUse())
-    return true;
-  return false;
+  return ForCodeSize || V.hasOneUse();
 }
 
 /// SelectShiftedRegister - Select a "shifted register" operand.  If the value
@@ -687,7 +685,7 @@ bool AArch64DAGToDAGISel::SelectAddrModeIndexed(SDValue N, unsigned Size,
 
     const GlobalValue *GV = GAN->getGlobal();
     unsigned Alignment = GV->getAlignment();
-    Type *Ty = GV->getType()->getElementType();
+    Type *Ty = GV->getValueType();
     if (Alignment == 0 && Ty->isSized())
       Alignment = DL.getABITypeAlignment(Ty);
 
@@ -797,10 +795,7 @@ bool AArch64DAGToDAGISel::SelectExtendedSHL(SDValue N, unsigned Size,
   if (ShiftVal != 0 && ShiftVal != LegalShiftVal)
     return false;
 
-  if (isWorthFolding(N))
-    return true;
-
-  return false;
+  return isWorthFolding(N);
 }
 
 bool AArch64DAGToDAGISel::SelectAddrModeWRO(SDValue N, unsigned Size,
@@ -1974,7 +1969,8 @@ static bool isBitfieldPositioningOp(SelectionDAG *CurDAG, SDValue Op,
 // f = Opc Opd0, Opd1, LSB, MSB ; where Opc is a BFM, LSB = imm, and MSB = imm2
 static bool isBitfieldInsertOpFromOr(SDNode *N, unsigned &Opc, SDValue &Dst,
                                      SDValue &Src, unsigned &ImmR,
-                                     unsigned &ImmS, SelectionDAG *CurDAG) {
+                                     unsigned &ImmS, const APInt &UsefulBits,
+                                     SelectionDAG *CurDAG) {
   assert(N->getOpcode() == ISD::OR && "Expect a OR operation");
 
   // Set Opc
@@ -1988,8 +1984,6 @@ static bool isBitfieldInsertOpFromOr(SDNode *N, unsigned &Opc, SDValue &Dst,
 
   // Because of simplify-demanded-bits in DAGCombine, involved masks may not
   // have the expected shape. Try to undo that.
-  APInt UsefulBits;
-  getUsefulBits(SDValue(N, 0), UsefulBits);
 
   unsigned NumberOfIgnoredLowBits = UsefulBits.countTrailingZeros();
   unsigned NumberOfIgnoredHighBits = UsefulBits.countLeadingZeros();
@@ -2083,11 +2077,18 @@ SDNode *AArch64DAGToDAGISel::SelectBitfieldInsertOp(SDNode *N) {
   unsigned Opc;
   unsigned LSB, MSB;
   SDValue Opd0, Opd1;
+  EVT VT = N->getValueType(0);
+  APInt NUsefulBits;
+  getUsefulBits(SDValue(N, 0), NUsefulBits);
 
-  if (!isBitfieldInsertOpFromOr(N, Opc, Opd0, Opd1, LSB, MSB, CurDAG))
+  // If all bits are not useful, just return UNDEF.
+  if (!NUsefulBits)
+    return CurDAG->SelectNodeTo(N, TargetOpcode::IMPLICIT_DEF, VT);
+
+  if (!isBitfieldInsertOpFromOr(N, Opc, Opd0, Opd1, LSB, MSB, NUsefulBits,
+                                CurDAG))
     return nullptr;
 
-  EVT VT = N->getValueType(0);
   SDLoc dl(N);
   SDValue Ops[] = { Opd0,
                     Opd1,

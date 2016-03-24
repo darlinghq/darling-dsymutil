@@ -116,7 +116,7 @@ static bool canBeFeederToNewValueJump(const HexagonInstrInfo *QII,
                                       MachineFunction &MF) {
 
   // Predicated instruction can not be feeder to NVJ.
-  if (QII->isPredicated(II))
+  if (QII->isPredicated(*II))
     return false;
 
   // Bail out if feederReg is a paired register (double regs in
@@ -342,6 +342,24 @@ static unsigned getNewValueJumpOpcode(MachineInstr *MI, int reg,
       return taken ? Hexagon::J4_cmpgtui_t_jumpnv_t
                    : Hexagon::J4_cmpgtui_t_jumpnv_nt;
 
+    case Hexagon::C4_cmpneq:
+      return taken ? Hexagon::J4_cmpeq_f_jumpnv_t
+                   : Hexagon::J4_cmpeq_f_jumpnv_nt;
+
+    case Hexagon::C4_cmplte:
+      if (secondRegNewified)
+        return taken ? Hexagon::J4_cmplt_f_jumpnv_t
+                     : Hexagon::J4_cmplt_f_jumpnv_nt;
+      return taken ? Hexagon::J4_cmpgt_f_jumpnv_t
+                   : Hexagon::J4_cmpgt_f_jumpnv_nt;
+
+    case Hexagon::C4_cmplteu:
+      if (secondRegNewified)
+        return taken ? Hexagon::J4_cmpltu_f_jumpnv_t
+                     : Hexagon::J4_cmpltu_f_jumpnv_nt;
+      return taken ? Hexagon::J4_cmpgtu_f_jumpnv_t
+                   : Hexagon::J4_cmpgtu_f_jumpnv_nt;
+
     default:
        llvm_unreachable("Could not find matching New Value Jump instruction.");
   }
@@ -467,6 +485,8 @@ bool HexagonNewValueJump::runOnMachineFunction(MachineFunction &MF) {
         if (predLive)
           break;
 
+        if (!MI->getOperand(1).isMBB())
+          continue;
         jmpTarget = MI->getOperand(1).getMBB();
         foundJump = true;
         if (MI->getOpcode() == Hexagon::J2_jumpf ||

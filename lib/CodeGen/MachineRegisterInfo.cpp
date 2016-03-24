@@ -27,12 +27,11 @@ void MachineRegisterInfo::Delegate::anchor() {}
 MachineRegisterInfo::MachineRegisterInfo(const MachineFunction *MF)
   : MF(MF), TheDelegate(nullptr), IsSSA(true), TracksLiveness(true),
     TracksSubRegLiveness(false) {
+  unsigned NumRegs = getTargetRegisterInfo()->getNumRegs();
   VRegInfo.reserve(256);
   RegAllocHints.reserve(256);
-  UsedPhysRegMask.resize(getTargetRegisterInfo()->getNumRegs());
-
-  // Create the physreg use/def lists.
-  PhysRegUseDefLists.resize(getTargetRegisterInfo()->getNumRegs(), nullptr);
+  UsedPhysRegMask.resize(NumRegs);
+  PhysRegUseDefLists.reset(new MachineOperand*[NumRegs]());
 }
 
 /// setRegClass - Set the register class of the specified virtual register.
@@ -98,6 +97,32 @@ MachineRegisterInfo::createVirtualRegister(const TargetRegisterClass *RegClass){
   unsigned Reg = TargetRegisterInfo::index2VirtReg(getNumVirtRegs());
   VRegInfo.grow(Reg);
   VRegInfo[Reg].first = RegClass;
+  RegAllocHints.grow(Reg);
+  if (TheDelegate)
+    TheDelegate->MRI_NoteNewVirtualRegister(Reg);
+  return Reg;
+}
+
+unsigned
+MachineRegisterInfo::getSize(unsigned VReg) const {
+  VRegToSizeMap::const_iterator SizeIt = getVRegToSize().find(VReg);
+  return SizeIt != getVRegToSize().end() ? SizeIt->second : 0;
+}
+
+void MachineRegisterInfo::setSize(unsigned VReg, unsigned Size) {
+  getVRegToSize()[VReg] = Size;
+}
+
+unsigned
+MachineRegisterInfo::createGenericVirtualRegister(unsigned Size) {
+  assert(Size && "Cannot create empty virtual register");
+
+  // New virtual register number.
+  unsigned Reg = TargetRegisterInfo::index2VirtReg(getNumVirtRegs());
+  VRegInfo.grow(Reg);
+  // FIXME: Should we use a dummy register class?
+  VRegInfo[Reg].first = nullptr;
+  getVRegToSize()[Reg] = Size;
   RegAllocHints.grow(Reg);
   if (TheDelegate)
     TheDelegate->MRI_NoteNewVirtualRegister(Reg);

@@ -13,21 +13,38 @@
 //===----------------------------------------------------------------------===//
 
 
-#ifndef LLVM_LIB_TARGET_R600_SIREGISTERINFO_H
-#define LLVM_LIB_TARGET_R600_SIREGISTERINFO_H
+#ifndef LLVM_LIB_TARGET_AMDGPU_SIREGISTERINFO_H
+#define LLVM_LIB_TARGET_AMDGPU_SIREGISTERINFO_H
 
 #include "AMDGPURegisterInfo.h"
 #include "AMDGPUSubtarget.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/Support/Debug.h"
 
 namespace llvm {
 
-struct SIRegisterInfo : public AMDGPURegisterInfo {
+struct SIRegisterInfo final : public AMDGPURegisterInfo {
 private:
+  unsigned SGPR32SetID;
+  unsigned VGPR32SetID;
+  BitVector SGPRPressureSets;
+  BitVector VGPRPressureSets;
+
   void reserveRegisterTuples(BitVector &, unsigned Reg) const;
+  void classifyPressureSet(unsigned PSetID, unsigned Reg,
+                           BitVector &PressureSets) const;
 
 public:
   SIRegisterInfo();
+
+  /// Return the end register initially reserved for the scratch buffer in case
+  /// spilling is needed.
+  unsigned reservedPrivateSegmentBufferReg(const MachineFunction &MF) const;
+
+  /// Return the end register initially reserved for the scratch wave offset in
+  /// case spilling is needed.
+  unsigned reservedPrivateSegmentWaveByteOffsetReg(
+    const MachineFunction &MF) const;
 
   BitVector getReservedRegs(const MachineFunction &MF) const override;
 
@@ -35,6 +52,8 @@ public:
                                   unsigned Idx) const override;
 
   bool requiresRegisterScavenging(const MachineFunction &Fn) const override;
+
+  bool requiresFrameIndexScavenging(const MachineFunction &MF) const override;
 
   void eliminateFrameIndex(MachineBasicBlock::iterator MI, int SPAdj,
                            unsigned FIOperandNum,
@@ -56,6 +75,15 @@ public:
     return isSGPRClass(getRegClass(RCID));
   }
 
+  bool isSGPRReg(const MachineRegisterInfo &MRI, unsigned Reg) const {
+    const TargetRegisterClass *RC;
+    if (TargetRegisterInfo::isVirtualRegister(Reg))
+      RC = MRI.getRegClass(Reg);
+    else
+      RC = getPhysRegClass(Reg);
+    return isSGPRClass(RC);
+  }
+
   /// \returns true if this class contains VGPR registers.
   bool hasVGPRs(const TargetRegisterClass *RC) const;
 
@@ -69,6 +97,10 @@ public:
   /// \returns A VGPR reg class with the same width as \p SRC
   const TargetRegisterClass *getEquivalentVGPRClass(
                                           const TargetRegisterClass *SRC) const;
+
+  /// \returns A SGPR reg class with the same width as \p SRC
+  const TargetRegisterClass *getEquivalentSGPRClass(
+                                           const TargetRegisterClass *VRC) const;
 
   /// \returns The register class that is used for a sub-register of \p RC for
   /// the given \p SubIdx.  If \p SubIdx equals NoSubRegister, \p RC will
@@ -93,23 +125,27 @@ public:
 
   /// \returns True if operands defined with this operand type can accept
   /// an inline constant. i.e. An integer value in the range (-16, 64) or
-  /// -4.0f, -2.0f, -1.0f, -0.5f, 0.0f, 0.5f, 1.0f, 2.0f, 4.0f. 
+  /// -4.0f, -2.0f, -1.0f, -0.5f, 0.0f, 0.5f, 1.0f, 2.0f, 4.0f.
   bool opCanUseInlineConstant(unsigned OpType) const;
 
   enum PreloadedValue {
     // SGPRS:
-    SCRATCH_PTR         =  0,
+    PRIVATE_SEGMENT_BUFFER = 0,
     DISPATCH_PTR        =  1,
-    INPUT_PTR           =  3,
-    TGID_X              = 10,
-    TGID_Y              = 11,
-    TGID_Z              = 12,
-    SCRATCH_WAVE_OFFSET = 14,
+    QUEUE_PTR           =  2,
+    KERNARG_SEGMENT_PTR =  3,
+    DISPATCH_ID         =  4,
+    FLAT_SCRATCH_INIT   =  5,
+    WORKGROUP_ID_X      = 10,
+    WORKGROUP_ID_Y      = 11,
+    WORKGROUP_ID_Z      = 12,
+    PRIVATE_SEGMENT_WAVE_BYTE_OFFSET = 14,
+
     // VGPRS:
     FIRST_VGPR_VALUE    = 15,
-    TIDIG_X             = FIRST_VGPR_VALUE,
-    TIDIG_Y             = 16,
-    TIDIG_Z             = 17,
+    WORKITEM_ID_X       = FIRST_VGPR_VALUE,
+    WORKITEM_ID_Y       = 16,
+    WORKITEM_ID_Z       = 17
   };
 
   /// \brief Returns the physical register that \p Value is stored in.
@@ -128,11 +164,14 @@ public:
   unsigned findUnusedRegister(const MachineRegisterInfo &MRI,
                               const TargetRegisterClass *RC) const;
 
+  unsigned getSGPR32PressureSet() const { return SGPR32SetID; };
+  unsigned getVGPR32PressureSet() const { return VGPR32SetID; };
+
 private:
   void buildScratchLoadStore(MachineBasicBlock::iterator MI,
                              unsigned LoadStoreOp, unsigned Value,
                              unsigned ScratchRsrcReg, unsigned ScratchOffset,
-                             int64_t Offset, RegScavenger *RS) const;
+                             int64_t Offset) const;
 };
 
 } // End namespace llvm

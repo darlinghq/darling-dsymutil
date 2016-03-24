@@ -606,18 +606,17 @@ inline uint64_t PowerOf2Floor(uint64_t A) {
 ///
 /// Examples:
 /// \code
-///   RoundUpToAlignment(5, 8) = 8
-///   RoundUpToAlignment(17, 8) = 24
-///   RoundUpToAlignment(~0LL, 8) = 0
-///   RoundUpToAlignment(321, 255) = 510
+///   alignTo(5, 8) = 8
+///   alignTo(17, 8) = 24
+///   alignTo(~0LL, 8) = 0
+///   alignTo(321, 255) = 510
 ///
-///   RoundUpToAlignment(5, 8, 7) = 7
-///   RoundUpToAlignment(17, 8, 1) = 17
-///   RoundUpToAlignment(~0LL, 8, 3) = 3
-///   RoundUpToAlignment(321, 255, 42) = 552
+///   alignTo(5, 8, 7) = 7
+///   alignTo(17, 8, 1) = 17
+///   alignTo(~0LL, 8, 3) = 3
+///   alignTo(321, 255, 42) = 552
 /// \endcode
-inline uint64_t RoundUpToAlignment(uint64_t Value, uint64_t Align,
-                                   uint64_t Skew = 0) {
+inline uint64_t alignTo(uint64_t Value, uint64_t Align, uint64_t Skew = 0) {
   Skew %= Align;
   return (Value + Align - 1 - Skew) / Align * Align + Skew;
 }
@@ -626,7 +625,7 @@ inline uint64_t RoundUpToAlignment(uint64_t Value, uint64_t Align,
 /// or equal to \p Value and is a multiple of \p Align. \p Align must be
 /// non-zero.
 inline uint64_t OffsetToAlignment(uint64_t Value, uint64_t Align) {
-  return RoundUpToAlignment(Value, Align) - Value;
+  return alignTo(Value, Align) - Value;
 }
 
 /// SignExtend32 - Sign extend B-bit number x to 32-bit int.
@@ -659,23 +658,16 @@ inline int64_t SignExtend64(uint64_t X, unsigned B) {
 /// representable value of type T.
 template <typename T>
 typename std::enable_if<std::is_unsigned<T>::value, T>::type
-SaturatingAdd(T X, T Y, bool &ResultOverflowed) {
+SaturatingAdd(T X, T Y, bool *ResultOverflowed = nullptr) {
+  bool Dummy;
+  bool &Overflowed = ResultOverflowed ? *ResultOverflowed : Dummy;
   // Hacker's Delight, p. 29
   T Z = X + Y;
-  ResultOverflowed = (Z < X || Z < Y);
-  if (ResultOverflowed)
+  Overflowed = (Z < X || Z < Y);
+  if (Overflowed)
     return std::numeric_limits<T>::max();
   else
     return Z;
-}
-
-/// \brief Add two unsigned integers, X and Y, of type T.
-/// Clamp the result to the maximum representable value of T on overflow.
-template <typename T>
-typename std::enable_if<std::is_unsigned<T>::value, T>::type
-SaturatingAdd(T X, T Y) {
-  bool ResultOverflowed;
-  return SaturatingAdd(X, Y, ResultOverflowed);
 }
 
 /// \brief Multiply two unsigned integers, X and Y, of type T.
@@ -684,13 +676,16 @@ SaturatingAdd(T X, T Y) {
 /// representable value of type T.
 template <typename T>
 typename std::enable_if<std::is_unsigned<T>::value, T>::type
-SaturatingMultiply(T X, T Y, bool &ResultOverflowed) {
+SaturatingMultiply(T X, T Y, bool *ResultOverflowed = nullptr) {
+  bool Dummy;
+  bool &Overflowed = ResultOverflowed ? *ResultOverflowed : Dummy;
+
   // Hacker's Delight, p. 30 has a different algorithm, but we don't use that
   // because it fails for uint16_t (where multiplication can have undefined
   // behavior due to promotion to int), and requires a division in addition
   // to the multiplication.
 
-  ResultOverflowed = false;
+  Overflowed = false;
 
   // Log2(Z) would be either Log2Z or Log2Z + 1.
   // Special case: if X or Y is 0, Log2_64 gives -1, and Log2Z
@@ -702,7 +697,7 @@ SaturatingMultiply(T X, T Y, bool &ResultOverflowed) {
     return X * Y;
   }
   if (Log2Z > Log2Max) {
-    ResultOverflowed = true;
+    Overflowed = true;
     return Max;
   }
 
@@ -711,7 +706,7 @@ SaturatingMultiply(T X, T Y, bool &ResultOverflowed) {
   // that on at the end.
   T Z = (X >> 1) * Y;
   if (Z & ~(Max >> 1)) {
-    ResultOverflowed = true;
+    Overflowed = true;
     return Max;
   }
   Z <<= 1;
@@ -721,13 +716,23 @@ SaturatingMultiply(T X, T Y, bool &ResultOverflowed) {
   return Z;
 }
 
-/// \brief Multiply two unsigned integers, X and Y, of type T.
-/// Clamp the result to the maximum representable value of T on overflow.
+/// \brief Multiply two unsigned integers, X and Y, and add the unsigned
+/// integer, A to the product. Clamp the result to the maximum representable
+/// value of T on overflow. ResultOverflowed indicates if the result is larger
+/// than the maximum representable value of type T.
+/// Note that this is purely a convenience function as there is no distinction
+/// where overflow occurred in a 'fused' multiply-add for unsigned numbers.
 template <typename T>
 typename std::enable_if<std::is_unsigned<T>::value, T>::type
-SaturatingMultiply(T X, T Y) {
-  bool ResultOverflowed;
-  return SaturatingMultiply(X, Y, ResultOverflowed);
+SaturatingMultiplyAdd(T X, T Y, T A, bool *ResultOverflowed = nullptr) {
+  bool Dummy;
+  bool &Overflowed = ResultOverflowed ? *ResultOverflowed : Dummy;
+
+  T Product = SaturatingMultiply(X, Y, &Overflowed);
+  if (Overflowed)
+    return Product;
+
+  return SaturatingAdd(A, Product, &Overflowed);
 }
 
 extern const float huge_valf;
