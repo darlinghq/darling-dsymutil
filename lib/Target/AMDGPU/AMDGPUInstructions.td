@@ -30,7 +30,7 @@ class AMDGPUInst <dag outs, dag ins, string asm, list<dag> pattern> : Instructio
   field bits<64> SoftFail = 0;
 
   let DecoderNamespace = Namespace;
-  
+
   let TSFlags{63} = isRegisterLoad;
   let TSFlags{62} = isRegisterStore;
 }
@@ -190,6 +190,11 @@ def store_private : PrivateStore <store>;
 def global_store : PatFrag<(ops node:$val, node:$ptr),
     (store node:$val, node:$ptr), [{
         return isGlobalStore(dyn_cast<StoreSDNode>(N));
+}]>;
+
+def global_store_atomic : PatFrag<(ops node:$val, node:$ptr),
+    (atomic_store node:$val, node:$ptr), [{
+        return isGlobalStore(dyn_cast<MemSDNode>(N));
 }]>;
 
 // Global address space loads
@@ -389,6 +394,12 @@ class global_binary_atomic_op<SDNode atomic_op> : PatFrag<
   [{return cast<MemSDNode>(N)->getAddressSpace() == AMDGPUAS::GLOBAL_ADDRESS;}]
 >;
 
+class flat_binary_atomic_op<SDNode atomic_op> : PatFrag<
+  (ops node:$ptr, node:$value),
+  (atomic_op node:$ptr, node:$value),
+  [{return cast<MemSDNode>(N)->getAddressSpace() == AMDGPUAS::FLAT_ADDRESS;}]
+>;
+
 def atomic_swap_global : global_binary_atomic_op<atomic_swap>;
 def atomic_add_global : global_binary_atomic_op<atomic_load_add>;
 def atomic_and_global : global_binary_atomic_op<atomic_load_and>;
@@ -399,6 +410,26 @@ def atomic_sub_global : global_binary_atomic_op<atomic_load_sub>;
 def atomic_umax_global : global_binary_atomic_op<atomic_load_umax>;
 def atomic_umin_global : global_binary_atomic_op<atomic_load_umin>;
 def atomic_xor_global : global_binary_atomic_op<atomic_load_xor>;
+
+def atomic_cmp_swap_global : global_binary_atomic_op<AMDGPUatomic_cmp_swap>;
+def atomic_cmp_swap_global_nortn : PatFrag<
+  (ops node:$ptr, node:$value),
+  (atomic_cmp_swap_global node:$ptr, node:$value),
+  [{ return SDValue(N, 0).use_empty(); }]
+>;
+
+def atomic_swap_flat : flat_binary_atomic_op<atomic_swap>;
+def atomic_add_flat : flat_binary_atomic_op<atomic_load_add>;
+def atomic_and_flat : flat_binary_atomic_op<atomic_load_and>;
+def atomic_max_flat : flat_binary_atomic_op<atomic_load_max>;
+def atomic_min_flat : flat_binary_atomic_op<atomic_load_min>;
+def atomic_or_flat : flat_binary_atomic_op<atomic_load_or>;
+def atomic_sub_flat : flat_binary_atomic_op<atomic_load_sub>;
+def atomic_umax_flat : flat_binary_atomic_op<atomic_load_umax>;
+def atomic_umin_flat : flat_binary_atomic_op<atomic_load_umin>;
+def atomic_xor_flat : flat_binary_atomic_op<atomic_load_xor>;
+
+def atomic_cmp_swap_flat : flat_binary_atomic_op<AMDGPUatomic_cmp_swap>;
 
 //===----------------------------------------------------------------------===//
 // Misc Pattern Fragments
@@ -411,6 +442,7 @@ int TWO_PI_INV = 0x3e22f983;
 int FP_UINT_MAX_PLUS_1 = 0x4f800000;    // 1 << 32 in floating point encoding
 int FP32_NEG_ONE = 0xbf800000;
 int FP32_ONE = 0x3f800000;
+int FP64_ONE = 0x3ff0000000000000;
 }
 def CONST : Constants;
 

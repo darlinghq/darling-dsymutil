@@ -142,9 +142,8 @@ struct TestModulePass {
 
 struct TestSCCPass {
   TestSCCPass(int &RunCount, int &AnalyzedInstrCount,
-                   int &AnalyzedSCCFunctionCount,
-                   int &AnalyzedModuleFunctionCount,
-                   bool OnlyUseCachedResults = false)
+              int &AnalyzedSCCFunctionCount, int &AnalyzedModuleFunctionCount,
+              bool OnlyUseCachedResults = false)
       : RunCount(RunCount), AnalyzedInstrCount(AnalyzedInstrCount),
         AnalyzedSCCFunctionCount(AnalyzedSCCFunctionCount),
         AnalyzedModuleFunctionCount(AnalyzedModuleFunctionCount),
@@ -199,7 +198,7 @@ struct TestSCCPass {
 struct TestFunctionPass {
   TestFunctionPass(int &RunCount) : RunCount(RunCount) {}
 
-  PreservedAnalyses run(Function &M) {
+  PreservedAnalyses run(Function &F, AnalysisManager<Function> &) {
     ++RunCount;
     return PreservedAnalyses::none();
   }
@@ -209,51 +208,50 @@ struct TestFunctionPass {
   int &RunCount;
 };
 
-std::unique_ptr<Module> parseIR(const char *IR) {
-  LLVMContext &C = getGlobalContext();
+std::unique_ptr<Module> parseIR(LLVMContext &C, const char *IR) {
   SMDiagnostic Err;
   return parseAssemblyString(IR, Err, C);
 }
 
 class CGSCCPassManagerTest : public ::testing::Test {
 protected:
+  LLVMContext Context;
   std::unique_ptr<Module> M;
 
 public:
   CGSCCPassManagerTest()
-      : M(parseIR("define void @f() {\n"
-                  "entry:\n"
-                  "  call void @g()\n"
-                  "  call void @h1()\n"
-                  "  ret void\n"
-                  "}\n"
-                  "define void @g() {\n"
-                  "entry:\n"
-                  "  call void @g()\n"
-                  "  call void @x()\n"
-                  "  ret void\n"
-                  "}\n"
-                  "define void @h1() {\n"
-                  "entry:\n"
-                  "  call void @h2()\n"
-                  "  ret void\n"
-                  "}\n"
-                  "define void @h2() {\n"
-                  "entry:\n"
-                  "  call void @h3()\n"
-                  "  call void @x()\n"
-                  "  ret void\n"
-                  "}\n"
-                  "define void @h3() {\n"
-                  "entry:\n"
-                  "  call void @h1()\n"
-                  "  ret void\n"
-                  "}\n"
-                  "define void @x() {\n"
-                  "entry:\n"
-                  "  ret void\n"
-                  "}\n"
-                  )) {}
+      : M(parseIR(Context, "define void @f() {\n"
+                           "entry:\n"
+                           "  call void @g()\n"
+                           "  call void @h1()\n"
+                           "  ret void\n"
+                           "}\n"
+                           "define void @g() {\n"
+                           "entry:\n"
+                           "  call void @g()\n"
+                           "  call void @x()\n"
+                           "  ret void\n"
+                           "}\n"
+                           "define void @h1() {\n"
+                           "entry:\n"
+                           "  call void @h2()\n"
+                           "  ret void\n"
+                           "}\n"
+                           "define void @h2() {\n"
+                           "entry:\n"
+                           "  call void @h3()\n"
+                           "  call void @x()\n"
+                           "  ret void\n"
+                           "}\n"
+                           "define void @h3() {\n"
+                           "entry:\n"
+                           "  call void @h1()\n"
+                           "  ret void\n"
+                           "}\n"
+                           "define void @x() {\n"
+                           "entry:\n"
+                           "  ret void\n"
+                           "}\n")) {}
 };
 
 TEST_F(CGSCCPassManagerTest, Basic) {

@@ -311,11 +311,7 @@ void StructurizeCFG::orderNodes() {
   for (RegionNode *RN : TempOrder) {
     BasicBlock *BB = RN->getEntry();
     Loop *Loop = LI->getLoopFor(BB);
-    if (!LoopBlocks.count(Loop)) {
-      LoopBlocks[Loop] = 1;
-      continue;
-    }
-    LoopBlocks[Loop]++;
+    ++LoopBlocks[Loop];
   }
 
   unsigned CurrentLoopDepth = 0;
@@ -333,11 +329,11 @@ void StructurizeCFG::orderNodes() {
       // the outer loop.
 
       RNVector::iterator LoopI = I;
-      while(LoopBlocks[CurrentLoop]) {
+      while (unsigned &BlockCount = LoopBlocks[CurrentLoop]) {
         LoopI++;
         BasicBlock *LoopBB = (*LoopI)->getEntry();
         if (LI->getLoopFor(LoopBB) == CurrentLoop) {
-          LoopBlocks[CurrentLoop]--;
+          --BlockCount;
           Order.push_back(*LoopI);
         }
       }
@@ -505,21 +501,21 @@ void StructurizeCFG::collectInfos() {
   // Reset the visited nodes
   Visited.clear();
 
-  for (RNVector::reverse_iterator OI = Order.rbegin(), OE = Order.rend();
-       OI != OE; ++OI) {
+  for (RegionNode *RN : reverse(Order)) {
 
-    DEBUG(dbgs() << "Visiting: " <<
-                    ((*OI)->isSubRegion() ? "SubRegion with entry: " : "") <<
-                    (*OI)->getEntry()->getName() << " Loop Depth: " << LI->getLoopDepth((*OI)->getEntry()) << "\n");
+    DEBUG(dbgs() << "Visiting: "
+                 << (RN->isSubRegion() ? "SubRegion with entry: " : "")
+                 << RN->getEntry()->getName() << " Loop Depth: "
+                 << LI->getLoopDepth(RN->getEntry()) << "\n");
 
     // Analyze all the conditions leading to a node
-    gatherPredicates(*OI);
+    gatherPredicates(RN);
 
     // Remember that we've seen this node
-    Visited.insert((*OI)->getEntry());
+    Visited.insert(RN->getEntry());
 
     // Find the last back edges
-    analyzeLoops(*OI);
+    analyzeLoops(RN);
   }
 }
 
@@ -951,6 +947,21 @@ bool StructurizeCFG::runOnRegion(Region *R, RGPassManager &RGM) {
     // TODO: We could probably be smarter here with how we handle sub-regions.
     if (hasOnlyUniformBranches(R)) {
       DEBUG(dbgs() << "Skipping region with uniform control flow: " << *R << '\n');
+
+      // Mark all direct child block terminators as having been treated as
+      // uniform. To account for a possible future in which non-uniform
+      // sub-regions are treated more cleverly, indirect children are not
+      // marked as uniform.
+      MDNode *MD = MDNode::get(R->getEntry()->getParent()->getContext(), {});
+      Region::element_iterator E = R->element_end();
+      for (Region::element_iterator I = R->element_begin(); I != E; ++I) {
+        if (I->isSubRegion())
+          continue;
+
+        if (Instruction *Term = I->getEntry()->getTerminator())
+          Term->setMetadata("structurizecfg.uniform", MD);
+      }
+
       return false;
     }
   }

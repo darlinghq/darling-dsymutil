@@ -342,9 +342,12 @@ that inherits from the ErrorInfo utility:
   public:
     MyError(std::string Msg) : Msg(Msg) {}
     void log(OStream &OS) const override { OS << "MyError - " << Msg; }
+    static char ID;
   private:
     std::string Msg;
   };
+
+  char MyError::ID = 0; // In MyError.cpp
 
   Error bar() {
     if (checkErrorCondition)
@@ -361,11 +364,13 @@ success, enabling the following idiom:
 
 .. code-block:: c++
 
-  if (auto Err = mayFail())
-    return Err;
+  Error mayFail();
 
-  // Success! We can proceed.
-
+  Error foo() {
+    if (auto Err = mayFail())
+      return Err;
+    // Success! We can proceed.
+    ...
 
 For functions that can fail but need to return a value the ``Expected<T>``
 utility can be used. Values of this type can be constructed with either a
@@ -2413,11 +2418,6 @@ In practice, very few places in the API require the explicit specification of a
 determine what context they belong to by looking at their own ``Type``.  If you
 are adding new entities to LLVM IR, please try to maintain this interface
 design.
-
-For clients that do *not* require the benefits of isolation, LLVM provides a
-convenience API ``getGlobalContext()``.  This returns a global, lazily
-initialized ``LLVMContext`` that may be used in situations where isolation is
-not a concern.
 
 .. _jitthreading:
 

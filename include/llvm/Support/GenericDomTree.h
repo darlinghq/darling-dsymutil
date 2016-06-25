@@ -138,8 +138,9 @@ public:
     }
   }
 
-  /// getDFSNumIn/getDFSNumOut - These are an internal implementation detail, do
-  /// not call them.
+  /// getDFSNumIn/getDFSNumOut - These return the DFS visitation order for nodes
+  /// in the dominator tree. They are only guaranteed valid if
+  /// updateDFSNumbers() has been called.
   unsigned getDFSNumIn() const { return DFSNumIn; }
   unsigned getDFSNumOut() const { return DFSNumOut; }
 
@@ -453,7 +454,7 @@ public:
 
     // Compare the result of the tree walk and the dfs numbers, if expensive
     // checks are enabled.
-#ifdef XDEBUG
+#ifdef EXPENSIVE_CHECKS
     assert((!DFSInfoValid ||
             (dominatedBySlowTreeWalk(A, B) == B->DominatedBy(A))) &&
            "Tree walk disagrees with dfs numbers!");

@@ -22,6 +22,7 @@
 #include "llvm/MC/MCSection.h"
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/EndianStream.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/LEB128.h"
 #include "llvm/Support/Path.h"
@@ -112,6 +113,8 @@ EmitDwarfLineTable(MCObjectStreamer *MCOS, MCSection *Section,
             ie = LineEntries.end();
        it != ie; ++it) {
 
+    int64_t LineDelta = static_cast<int64_t>(it->getLine()) - LastLine;
+
     if (FileNum != it->getFileNum()) {
       FileNum = it->getFileNum();
       MCOS->EmitIntValue(dwarf::DW_LNS_set_file, 1);
@@ -146,7 +149,6 @@ EmitDwarfLineTable(MCObjectStreamer *MCOS, MCSection *Section,
     if (it->getFlags() & DWARF2_FLAG_EPILOGUE_BEGIN)
       MCOS->EmitIntValue(dwarf::DW_LNS_set_epilogue_begin, 1);
 
-    int64_t LineDelta = static_cast<int64_t>(it->getLine()) - LastLine;
     MCSymbol *Label = it->getLabel();
 
     // At this point we want to emit/create the sequence to encode the delta in
@@ -156,6 +158,7 @@ EmitDwarfLineTable(MCObjectStreamer *MCOS, MCSection *Section,
     MCOS->EmitDwarfAdvanceLineAddr(LineDelta, LastLabel, Label,
                                    asmInfo->getPointerSize());
 
+    Discriminator = 0;
     LastLine = it->getLine();
     LastLabel = Label;
   }
@@ -818,7 +821,7 @@ static void EmitGenDwarfRanges(MCStreamer *MCOS) {
     // Emit a base address selection entry for the start of this section
     const MCExpr *SectionStartAddr = MCSymbolRefExpr::create(
       StartSymbol, MCSymbolRefExpr::VK_None, context);
-    MCOS->EmitFill(AddrSize, 0xFF);
+    MCOS->emitFill(AddrSize, 0xFF);
     MCOS->EmitValue(SectionStartAddr, AddrSize);
 
     // Emit a range list entry spanning this section

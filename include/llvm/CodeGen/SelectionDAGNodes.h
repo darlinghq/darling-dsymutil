@@ -625,18 +625,32 @@ public:
   /// NOTE: This is an expensive method. Use it carefully.
   bool hasPredecessor(const SDNode *N) const;
 
-  /// Return true if N is a predecessor of this node.
-  /// N is either an operand of this node, or can be reached by recursively
-  /// traversing up the operands.
-  /// In this helper the Visited and worklist sets are held externally to
-  /// cache predecessors over multiple invocations. If you want to test for
-  /// multiple predecessors this method is preferable to multiple calls to
-  /// hasPredecessor. Be sure to clear Visited and Worklist if the DAG
-  /// changes.
-  /// NOTE: This is still very expensive. Use carefully.
-  bool hasPredecessorHelper(const SDNode *N,
-                            SmallPtrSetImpl<const SDNode *> &Visited,
-                            SmallVectorImpl<const SDNode *> &Worklist) const;
+  /// Returns true if N is a predecessor of any node in Worklist. This
+  /// helper keeps Visited and Worklist sets externally to allow unions
+  /// searches to be performed in parallel, caching of results across
+  /// queries and incremental addition to Worklist. Stops early if N is
+  /// found but will resume. Remember to clear Visited and Worklists
+  /// if DAG changes.
+  static bool hasPredecessorHelper(const SDNode *N,
+                                   SmallPtrSetImpl<const SDNode *> &Visited,
+                                   SmallVectorImpl<const SDNode *> &Worklist) {
+    if (Visited.count(N))
+      return true;
+    while (!Worklist.empty()) {
+      const SDNode *M = Worklist.pop_back_val();
+      bool Found = false;
+      for (const SDValue &OpV : M->op_values()) {
+        SDNode *Op = OpV.getNode();
+        if (Visited.insert(Op).second)
+          Worklist.push_back(Op);
+        if (Op == N)
+          Found = true;
+      }
+      if (Found)
+        return true;
+    }
+    return false;
+  }
 
   /// Return the number of values used by this operation.
   unsigned getNumOperands() const { return NumOperands; }
@@ -821,40 +835,20 @@ protected:
 /// be used by the DAGBuilder, the other to be used by others.
 class SDLoc {
 private:
-  // Ptr could be used for either Instruction* or SDNode*. It is used for
-  // Instruction* if IROrder is not -1.
-  const void *Ptr;
-  int IROrder;
+  DebugLoc DL;
+  int IROrder = 0;
 
 public:
-  SDLoc() : Ptr(nullptr), IROrder(0) {}
-  SDLoc(const SDNode *N) : Ptr(N), IROrder(-1) {
-    assert(N && "null SDNode");
-  }
-  SDLoc(const SDValue V) : Ptr(V.getNode()), IROrder(-1) {
-    assert(Ptr && "null SDNode");
-  }
-  SDLoc(const Instruction *I, int Order) : Ptr(I), IROrder(Order) {
+  SDLoc() = default;
+  SDLoc(const SDNode *N) : DL(N->getDebugLoc()), IROrder(N->getIROrder()) {}
+  SDLoc(const SDValue V) : SDLoc(V.getNode()) {}
+  SDLoc(const Instruction *I, int Order) : IROrder(Order) {
     assert(Order >= 0 && "bad IROrder");
+    if (I)
+      DL = I->getDebugLoc();
   }
-  unsigned getIROrder() {
-    if (IROrder >= 0 || Ptr == nullptr) {
-      return (unsigned)IROrder;
-    }
-    const SDNode *N = (const SDNode*)(Ptr);
-    return N->getIROrder();
-  }
-  DebugLoc getDebugLoc() {
-    if (!Ptr) {
-      return DebugLoc();
-    }
-    if (IROrder >= 0) {
-      const Instruction *I = (const Instruction*)(Ptr);
-      return I->getDebugLoc();
-    }
-    const SDNode *N = (const SDNode*)(Ptr);
-    return N->getDebugLoc();
-  }
+  unsigned getIROrder() const { return IROrder; }
+  const DebugLoc &getDebugLoc() const { return DL; }
 };
 
 
@@ -958,8 +952,8 @@ static bool isBinOpWithFlags(unsigned Opcode) {
 class BinaryWithFlagsSDNode : public SDNode {
 public:
   SDNodeFlags Flags;
-  BinaryWithFlagsSDNode(unsigned Opc, unsigned Order, DebugLoc dl, SDVTList VTs,
-                        const SDNodeFlags &NodeFlags)
+  BinaryWithFlagsSDNode(unsigned Opc, unsigned Order, const DebugLoc &dl,
+                        SDVTList VTs, const SDNodeFlags &NodeFlags)
       : SDNode(Opc, Order, dl, VTs), Flags(NodeFlags) {}
   static bool classof(const SDNode *N) {
     return isBinOpWithFlags(N->getOpcode());
@@ -998,8 +992,8 @@ private:
   unsigned DestAddrSpace;
 
 public:
-  AddrSpaceCastSDNode(unsigned Order, DebugLoc dl, EVT VT, unsigned SrcAS,
-                      unsigned DestAS);
+  AddrSpaceCastSDNode(unsigned Order, const DebugLoc &dl, EVT VT,
+                      unsigned SrcAS, unsigned DestAS);
 
   unsigned getSrcAddressSpace() const { return SrcAddrSpace; }
   unsigned getDestAddressSpace() const { return DestAddrSpace; }
@@ -1020,7 +1014,7 @@ protected:
   MachineMemOperand *MMO;
 
 public:
-  MemSDNode(unsigned Opc, unsigned Order, DebugLoc dl, SDVTList VTs,
+  MemSDNode(unsigned Opc, unsigned Order, const DebugLoc &dl, SDVTList VTs,
             EVT MemoryVT, MachineMemOperand *MMO);
 
   bool readMem() const { return MMO->isLoad(); }
@@ -1133,13 +1127,15 @@ class AtomicSDNode : public MemSDNode {
                   AtomicOrdering FailureOrdering,
                   SynchronizationScope SynchScope) {
     // This must match encodeMemSDNodeFlags() in SelectionDAG.cpp.
-    assert((SuccessOrdering & 15) == SuccessOrdering &&
+    assert((AtomicOrdering)((unsigned)SuccessOrdering & 15) ==
+               SuccessOrdering &&
            "Ordering may not require more than 4 bits!");
-    assert((FailureOrdering & 15) == FailureOrdering &&
+    assert((AtomicOrdering)((unsigned)FailureOrdering & 15) ==
+               FailureOrdering &&
            "Ordering may not require more than 4 bits!");
     assert((SynchScope & 1) == SynchScope &&
            "SynchScope may not require more than 1 bit!");
-    SubclassData |= SuccessOrdering << 8;
+    SubclassData |= (unsigned)SuccessOrdering << 8;
     SubclassData |= SynchScope << 12;
     this->FailureOrdering = FailureOrdering;
     assert(getSuccessOrdering() == SuccessOrdering &&
@@ -1150,7 +1146,7 @@ class AtomicSDNode : public MemSDNode {
   }
 
 public:
-  AtomicSDNode(unsigned Opc, unsigned Order, DebugLoc dl, SDVTList VTL,
+  AtomicSDNode(unsigned Opc, unsigned Order, const DebugLoc &dl, SDVTList VTL,
                EVT MemVT, MachineMemOperand *MMO,
                AtomicOrdering SuccessOrdering, AtomicOrdering FailureOrdering,
                SynchronizationScope SynchScope)
@@ -1202,8 +1198,8 @@ public:
 /// with a value not less than FIRST_TARGET_MEMORY_OPCODE.
 class MemIntrinsicSDNode : public MemSDNode {
 public:
-  MemIntrinsicSDNode(unsigned Opc, unsigned Order, DebugLoc dl, SDVTList VTs,
-                     EVT MemoryVT, MachineMemOperand *MMO)
+  MemIntrinsicSDNode(unsigned Opc, unsigned Order, const DebugLoc &dl,
+                     SDVTList VTs, EVT MemoryVT, MachineMemOperand *MMO)
       : MemSDNode(Opc, Order, dl, VTs, MemoryVT, MMO) {
     SubclassData |= 1u << 13;
   }
@@ -1232,7 +1228,7 @@ class ShuffleVectorSDNode : public SDNode {
   const int *Mask;
 protected:
   friend class SelectionDAG;
-  ShuffleVectorSDNode(EVT VT, unsigned Order, DebugLoc dl, const int *M)
+  ShuffleVectorSDNode(EVT VT, unsigned Order, const DebugLoc &dl, const int *M)
       : SDNode(ISD::VECTOR_SHUFFLE, Order, dl, getSDVTList(VT)), Mask(M) {}
 
 public:
@@ -1281,9 +1277,10 @@ class ConstantSDNode : public SDNode {
   const ConstantInt *Value;
   friend class SelectionDAG;
   ConstantSDNode(bool isTarget, bool isOpaque, const ConstantInt *val,
-                 DebugLoc DL, EVT VT)
-    : SDNode(isTarget ? ISD::TargetConstant : ISD::Constant,
-             0, DL, getSDVTList(VT)), Value(val) {
+                 const DebugLoc &DL, EVT VT)
+      : SDNode(isTarget ? ISD::TargetConstant : ISD::Constant, 0, DL,
+               getSDVTList(VT)),
+        Value(val) {
     SubclassData |= (uint16_t)isOpaque;
   }
 public:
@@ -1308,10 +1305,12 @@ public:
 class ConstantFPSDNode : public SDNode {
   const ConstantFP *Value;
   friend class SelectionDAG;
-  ConstantFPSDNode(bool isTarget, const ConstantFP *val, DebugLoc DL, EVT VT)
-    : SDNode(isTarget ? ISD::TargetConstantFP : ISD::ConstantFP,
-             0, DL, getSDVTList(VT)), Value(val) {
-  }
+  ConstantFPSDNode(bool isTarget, const ConstantFP *val, const DebugLoc &DL,
+                   EVT VT)
+      : SDNode(isTarget ? ISD::TargetConstantFP : ISD::ConstantFP, 0, DL,
+               getSDVTList(VT)),
+        Value(val) {}
+
 public:
 
   const APFloat& getValueAPF() const { return Value->getValueAPF(); }
@@ -1362,15 +1361,19 @@ bool isNullFPConstant(SDValue V);
 bool isAllOnesConstant(SDValue V);
 /// Returns true if \p V is a constant integer one.
 bool isOneConstant(SDValue V);
+/// Returns true if \p V is a bitwise not operation. Assumes that an all ones
+/// constant is canonicalized to be operand 1.
+bool isBitwiseNot(SDValue V);
 
 class GlobalAddressSDNode : public SDNode {
   const GlobalValue *TheGlobal;
   int64_t Offset;
   unsigned char TargetFlags;
   friend class SelectionDAG;
-  GlobalAddressSDNode(unsigned Opc, unsigned Order, DebugLoc DL,
+  GlobalAddressSDNode(unsigned Opc, unsigned Order, const DebugLoc &DL,
                       const GlobalValue *GA, EVT VT, int64_t o,
                       unsigned char TargetFlags);
+
 public:
 
   const GlobalValue *getGlobal() const { return TheGlobal; }
@@ -1668,7 +1671,7 @@ public:
 class EHLabelSDNode : public SDNode {
   MCSymbol *Label;
   friend class SelectionDAG;
-  EHLabelSDNode(unsigned Order, DebugLoc dl, MCSymbol *L)
+  EHLabelSDNode(unsigned Order, const DebugLoc &dl, MCSymbol *L)
       : SDNode(ISD::EH_LABEL, Order, dl, getSDVTList(MVT::Other)), Label(L) {}
 
 public:
@@ -1735,7 +1738,7 @@ public:
 class CvtRndSatSDNode : public SDNode {
   ISD::CvtCode CvtCode;
   friend class SelectionDAG;
-  explicit CvtRndSatSDNode(EVT VT, unsigned Order, DebugLoc dl,
+  explicit CvtRndSatSDNode(EVT VT, unsigned Order, const DebugLoc &dl,
                            ISD::CvtCode Code)
       : SDNode(ISD::CONVERT_RNDSAT, Order, dl, getSDVTList(VT)), CvtCode(Code) {
   }
@@ -1769,10 +1772,10 @@ public:
 /// Base class for LoadSDNode and StoreSDNode
 class LSBaseSDNode : public MemSDNode {
 public:
-  LSBaseSDNode(ISD::NodeType NodeTy, unsigned Order, DebugLoc dl,
+  LSBaseSDNode(ISD::NodeType NodeTy, unsigned Order, const DebugLoc &dl,
                SDVTList VTs, ISD::MemIndexedMode AM, EVT MemVT,
                MachineMemOperand *MMO)
-    : MemSDNode(NodeTy, Order, dl, VTs, MemVT, MMO) {
+      : MemSDNode(NodeTy, Order, dl, VTs, MemVT, MMO) {
     SubclassData |= AM << 2;
     assert(getAddressingMode() == AM && "MemIndexedMode encoding error!");
   }
@@ -1802,8 +1805,9 @@ public:
 /// This class is used to represent ISD::LOAD nodes.
 class LoadSDNode : public LSBaseSDNode {
   friend class SelectionDAG;
-  LoadSDNode(unsigned Order, DebugLoc dl, SDVTList VTs, ISD::MemIndexedMode AM,
-             ISD::LoadExtType ETy, EVT MemVT, MachineMemOperand *MMO)
+  LoadSDNode(unsigned Order, const DebugLoc &dl, SDVTList VTs,
+             ISD::MemIndexedMode AM, ISD::LoadExtType ETy, EVT MemVT,
+             MachineMemOperand *MMO)
       : LSBaseSDNode(ISD::LOAD, Order, dl, VTs, AM, MemVT, MMO) {
     SubclassData |= (unsigned short)ETy;
     assert(getExtensionType() == ETy && "LoadExtType encoding error!");
@@ -1829,8 +1833,9 @@ public:
 /// This class is used to represent ISD::STORE nodes.
 class StoreSDNode : public LSBaseSDNode {
   friend class SelectionDAG;
-  StoreSDNode(unsigned Order, DebugLoc dl, SDVTList VTs, ISD::MemIndexedMode AM,
-              bool isTrunc, EVT MemVT, MachineMemOperand *MMO)
+  StoreSDNode(unsigned Order, const DebugLoc &dl, SDVTList VTs,
+              ISD::MemIndexedMode AM, bool isTrunc, EVT MemVT,
+              MachineMemOperand *MMO)
       : LSBaseSDNode(ISD::STORE, Order, dl, VTs, AM, MemVT, MMO) {
     SubclassData |= (unsigned short)isTrunc;
     assert(isTruncatingStore() == isTrunc && "isTrunc encoding error!");
@@ -1857,8 +1862,9 @@ public:
 class MaskedLoadStoreSDNode : public MemSDNode {
 public:
   friend class SelectionDAG;
-  MaskedLoadStoreSDNode(ISD::NodeType NodeTy, unsigned Order, DebugLoc dl,
-                        SDVTList VTs, EVT MemVT, MachineMemOperand *MMO)
+  MaskedLoadStoreSDNode(ISD::NodeType NodeTy, unsigned Order,
+                        const DebugLoc &dl, SDVTList VTs, EVT MemVT,
+                        MachineMemOperand *MMO)
       : MemSDNode(NodeTy, Order, dl, VTs, MemVT, MMO) {}
 
   // In the both nodes address is Op1, mask is Op2:
@@ -1878,7 +1884,7 @@ public:
 class MaskedLoadSDNode : public MaskedLoadStoreSDNode {
 public:
   friend class SelectionDAG;
-  MaskedLoadSDNode(unsigned Order, DebugLoc dl, SDVTList VTs,
+  MaskedLoadSDNode(unsigned Order, const DebugLoc &dl, SDVTList VTs,
                    ISD::LoadExtType ETy, EVT MemVT, MachineMemOperand *MMO)
       : MaskedLoadStoreSDNode(ISD::MLOAD, Order, dl, VTs, MemVT, MMO) {
     SubclassData |= (unsigned short)ETy;
@@ -1898,8 +1904,8 @@ class MaskedStoreSDNode : public MaskedLoadStoreSDNode {
 
 public:
   friend class SelectionDAG;
-  MaskedStoreSDNode(unsigned Order, DebugLoc dl, SDVTList VTs, bool isTrunc,
-                    EVT MemVT, MachineMemOperand *MMO)
+  MaskedStoreSDNode(unsigned Order, const DebugLoc &dl, SDVTList VTs,
+                    bool isTrunc, EVT MemVT, MachineMemOperand *MMO)
       : MaskedLoadStoreSDNode(ISD::MSTORE, Order, dl, VTs, MemVT, MMO) {
     SubclassData |= (unsigned short)isTrunc;
   }
@@ -1921,8 +1927,9 @@ public:
 class MaskedGatherScatterSDNode : public MemSDNode {
 public:
   friend class SelectionDAG;
-  MaskedGatherScatterSDNode(ISD::NodeType NodeTy, unsigned Order, DebugLoc dl,
-                            SDVTList VTs, EVT MemVT, MachineMemOperand *MMO)
+  MaskedGatherScatterSDNode(ISD::NodeType NodeTy, unsigned Order,
+                            const DebugLoc &dl, SDVTList VTs, EVT MemVT,
+                            MachineMemOperand *MMO)
       : MemSDNode(NodeTy, Order, dl, VTs, MemVT, MMO) {}
 
   // In the both nodes address is Op1, mask is Op2:
@@ -1945,8 +1952,8 @@ public:
 class MaskedGatherSDNode : public MaskedGatherScatterSDNode {
 public:
   friend class SelectionDAG;
-  MaskedGatherSDNode(unsigned Order, DebugLoc dl, SDVTList VTs, EVT MemVT,
-                     MachineMemOperand *MMO)
+  MaskedGatherSDNode(unsigned Order, const DebugLoc &dl, SDVTList VTs,
+                     EVT MemVT, MachineMemOperand *MMO)
       : MaskedGatherScatterSDNode(ISD::MGATHER, Order, dl, VTs, MemVT, MMO) {}
 
   static bool classof(const SDNode *N) {
@@ -1960,8 +1967,8 @@ class MaskedScatterSDNode : public MaskedGatherScatterSDNode {
 
 public:
   friend class SelectionDAG;
-  MaskedScatterSDNode(unsigned Order, DebugLoc dl, SDVTList VTs, EVT MemVT,
-                      MachineMemOperand *MMO)
+  MaskedScatterSDNode(unsigned Order, const DebugLoc &dl, SDVTList VTs,
+                      EVT MemVT, MachineMemOperand *MMO)
       : MaskedGatherScatterSDNode(ISD::MSCATTER, Order, dl, VTs, MemVT, MMO) {}
 
   static bool classof(const SDNode *N) {
@@ -1978,8 +1985,8 @@ public:
 
 private:
   friend class SelectionDAG;
-  MachineSDNode(unsigned Opc, unsigned Order, const DebugLoc DL, SDVTList VTs)
-    : SDNode(Opc, Order, DL, VTs), MemRefs(nullptr), MemRefsEnd(nullptr) {}
+  MachineSDNode(unsigned Opc, unsigned Order, const DebugLoc &DL, SDVTList VTs)
+      : SDNode(Opc, Order, DL, VTs), MemRefs(nullptr), MemRefsEnd(nullptr) {}
 
   /// Memory reference descriptions for this instruction.
   mmo_iterator MemRefs;

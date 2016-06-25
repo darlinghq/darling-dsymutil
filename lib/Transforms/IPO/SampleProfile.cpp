@@ -22,10 +22,12 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/Transforms/SampleProfile.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/IR/Constants.h"
@@ -35,6 +37,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Metadata.h"
@@ -47,7 +50,6 @@
 #include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/IPO.h"
-#include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include <cctype>
 
@@ -101,29 +103,18 @@ typedef DenseMap<const BasicBlock *, SmallVector<const BasicBlock *, 8>>
 /// This pass reads profile data from the file specified by
 /// -sample-profile-file and annotates every affected function with the
 /// profile information found in that file.
-class SampleProfileLoader : public ModulePass {
+class SampleProfileLoader {
 public:
-  // Class identification, replacement for typeinfo
-  static char ID;
-
   SampleProfileLoader(StringRef Name = SampleProfileFile)
-      : ModulePass(ID), DT(nullptr), PDT(nullptr), LI(nullptr), Reader(),
+      : DT(nullptr), PDT(nullptr), LI(nullptr), ACT(nullptr), Reader(),
         Samples(nullptr), Filename(Name), ProfileIsValid(false),
-        TotalCollectedSamples(0) {
-    initializeSampleProfileLoaderPass(*PassRegistry::getPassRegistry());
-  }
+        TotalCollectedSamples(0) {}
 
-  bool doInitialization(Module &M) override;
+  bool doInitialization(Module &M);
+  bool runOnModule(Module &M);
+  void setACT(AssumptionCacheTracker *A) { ACT = A; }
 
   void dump() { Reader->dump(); }
-
-  const char *getPassName() const override { return "Sample profile pass"; }
-
-  bool runOnModule(Module &M) override;
-
-  void getAnalysisUsage(AnalysisUsage &AU) const override {
-    AU.addRequired<InstructionCombiningPass>();
-  }
 
 protected:
   bool runOnFunction(Function &F);
@@ -181,6 +172,8 @@ protected:
   std::unique_ptr<DominatorTreeBase<BasicBlock>> PDT;
   std::unique_ptr<LoopInfo> LI;
 
+  AssumptionCacheTracker *ACT;
+
   /// \brief Predecessors for each basic block in the CFG.
   BlockEdgeMap Predecessors;
 
@@ -204,6 +197,32 @@ protected:
   /// This is the sum of all the samples collected in all the functions executed
   /// at runtime.
   uint64_t TotalCollectedSamples;
+};
+
+class SampleProfileLoaderLegacyPass : public ModulePass {
+public:
+  // Class identification, replacement for typeinfo
+  static char ID;
+
+  SampleProfileLoaderLegacyPass(StringRef Name = SampleProfileFile)
+      : ModulePass(ID), SampleLoader(Name) {
+    initializeSampleProfileLoaderLegacyPassPass(
+        *PassRegistry::getPassRegistry());
+  }
+
+  void dump() { SampleLoader.dump(); }
+
+  bool doInitialization(Module &M) override {
+    return SampleLoader.doInitialization(M);
+  }
+  const char *getPassName() const override { return "Sample profile pass"; }
+  bool runOnModule(Module &M) override;
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<AssumptionCacheTracker>();
+  }
+private:
+  SampleProfileLoader SampleLoader;
 };
 
 class SampleCoverageTracker {
@@ -444,12 +463,17 @@ void SampleProfileLoader::printBlockWeight(raw_ostream &OS,
 /// \returns the weight of \p Inst.
 ErrorOr<uint64_t>
 SampleProfileLoader::getInstWeight(const Instruction &Inst) const {
-  DebugLoc DLoc = Inst.getDebugLoc();
+  const DebugLoc &DLoc = Inst.getDebugLoc();
   if (!DLoc)
     return std::error_code();
 
   const FunctionSamples *FS = findFunctionSamples(Inst);
   if (!FS)
+    return std::error_code();
+
+  // Ignore all dbg_value intrinsics.
+  const IntrinsicInst *II = dyn_cast<IntrinsicInst>(&Inst);
+  if (II && II->getIntrinsicID() == Intrinsic::dbg_value)
     return std::error_code();
 
   const DILocation *DIL = DLoc;
@@ -475,6 +499,13 @@ SampleProfileLoader::getInstWeight(const Instruction &Inst) const {
                  << Inst << " (line offset: " << Lineno - HeaderLineno << "."
                  << DIL->getDiscriminator() << " - weight: " << R.get()
                  << ")\n");
+  } else {
+    // If a call instruction is inlined in profile, but not inlined here,
+    // it means that the inlined callsite has no sample, thus the call
+    // instruction should have 0 count.
+    const CallInst *CI = dyn_cast<CallInst>(&Inst);
+    if (CI && findCalleeFunctionSamples(*CI))
+      R = 0;
   }
   return R;
 }
@@ -489,19 +520,22 @@ SampleProfileLoader::getInstWeight(const Instruction &Inst) const {
 /// \returns the weight for \p BB.
 ErrorOr<uint64_t>
 SampleProfileLoader::getBlockWeight(const BasicBlock *BB) const {
-  bool Found = false;
-  uint64_t Weight = 0;
+  DenseMap<uint64_t, uint64_t> CM;
   for (auto &I : BB->getInstList()) {
     const ErrorOr<uint64_t> &R = getInstWeight(I);
-    if (R && R.get() >= Weight) {
-      Weight = R.get();
-      Found = true;
+    if (R) CM[R.get()]++;
+  }
+  if (CM.size() == 0) return std::error_code();
+  uint64_t W = 0, C = 0;
+  for (const auto &C_W : CM) {
+    if (C_W.second == W) {
+      C = std::max(C, C_W.first);
+    } else if (C_W.second > W) {
+      C = C_W.first;
+      W = C_W.second;
     }
   }
-  if (Found)
-    return Weight;
-  else
-    return std::error_code();
+  return C;
 }
 
 /// \brief Compute and store the weights of every basic block.
@@ -572,17 +606,12 @@ SampleProfileLoader::findFunctionSamples(const Instruction &Inst) const {
   if (!DIL) {
     return Samples;
   }
-  StringRef CalleeName;
-  for (const DILocation *DIL = Inst.getDebugLoc(); DIL;
-       DIL = DIL->getInlinedAt()) {
+  for (DIL = DIL->getInlinedAt(); DIL; DIL = DIL->getInlinedAt()) {
     DISubprogram *SP = DIL->getScope()->getSubprogram();
     if (!SP)
       return nullptr;
-    if (!CalleeName.empty()) {
-      S.push_back(LineLocation(getOffset(DIL->getLine(), SP->getLine()),
-                               DIL->getDiscriminator()));
-    }
-    CalleeName = SP->getLinkageName();
+    S.push_back(LineLocation(getOffset(DIL->getLine(), SP->getLine()),
+                             DIL->getDiscriminator()));
   }
   if (S.size() == 0)
     return Samples;
@@ -677,7 +706,7 @@ bool SampleProfileLoader::inlineHotFunctions(Function &F) {
       }
     }
     for (auto CI : CIS) {
-      InlineFunctionInfo IFI;
+      InlineFunctionInfo IFI(nullptr, ACT);
       Function *CalledFunction = CI->getCalledFunction();
       DebugLoc DLoc = CI->getDebugLoc();
       uint64_t NumSamples = findCalleeFunctionSamples(*CI)->getTotalSamples();
@@ -1204,13 +1233,12 @@ bool SampleProfileLoader::emitAnnotations(Function &F) {
   return Changed;
 }
 
-char SampleProfileLoader::ID = 0;
-INITIALIZE_PASS_BEGIN(SampleProfileLoader, "sample-profile",
-                      "Sample Profile loader", false, false)
-INITIALIZE_PASS_DEPENDENCY(AddDiscriminators)
-INITIALIZE_PASS_DEPENDENCY(InstructionCombiningPass)
-INITIALIZE_PASS_END(SampleProfileLoader, "sample-profile",
-                    "Sample Profile loader", false, false)
+char SampleProfileLoaderLegacyPass::ID = 0;
+INITIALIZE_PASS_BEGIN(SampleProfileLoaderLegacyPass, "sample-profile",
+                "Sample Profile loader", false, false)
+INITIALIZE_PASS_DEPENDENCY(AssumptionCacheTracker)
+INITIALIZE_PASS_END(SampleProfileLoaderLegacyPass, "sample-profile",
+                "Sample Profile loader", false, false)
 
 bool SampleProfileLoader::doInitialization(Module &M) {
   auto &Ctx = M.getContext();
@@ -1226,11 +1254,11 @@ bool SampleProfileLoader::doInitialization(Module &M) {
 }
 
 ModulePass *llvm::createSampleProfileLoaderPass() {
-  return new SampleProfileLoader(SampleProfileFile);
+  return new SampleProfileLoaderLegacyPass(SampleProfileFile);
 }
 
 ModulePass *llvm::createSampleProfileLoaderPass(StringRef Name) {
-  return new SampleProfileLoader(Name);
+  return new SampleProfileLoaderLegacyPass(Name);
 }
 
 bool SampleProfileLoader::runOnModule(Module &M) {
@@ -1247,14 +1275,33 @@ bool SampleProfileLoader::runOnModule(Module &M) {
       clearFunctionData();
       retval |= runOnFunction(F);
     }
+  M.setProfileSummary(Reader->getSummary().getMD(M.getContext()));
   return retval;
+}
+
+bool SampleProfileLoaderLegacyPass::runOnModule(Module &M) {
+  // FIXME: pass in AssumptionCache correctly for the new pass manager. 
+  SampleLoader.setACT(&getAnalysis<AssumptionCacheTracker>());
+  return SampleLoader.runOnModule(M);
 }
 
 bool SampleProfileLoader::runOnFunction(Function &F) {
   F.setEntryCount(0);
-  getAnalysis<InstructionCombiningPass>(F);
   Samples = Reader->getSamplesFor(F);
   if (!Samples->empty())
     return emitAnnotations(F);
   return false;
+}
+
+PreservedAnalyses SampleProfileLoaderPass::run(Module &M,
+                                               AnalysisManager<Module> &AM) {
+
+  SampleProfileLoader SampleLoader(SampleProfileFile);
+
+  SampleLoader.doInitialization(M);
+
+  if (!SampleLoader.runOnModule(M))
+    return PreservedAnalyses::all();
+
+  return PreservedAnalyses::none();
 }

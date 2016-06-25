@@ -16,11 +16,25 @@
 namespace llvm {
 
 class AMDGPUMachineFunction : public MachineFunctionInfo {
+  uint64_t KernArgSize;
+  unsigned MaxKernArgAlign;
+
   virtual void anchor();
-  unsigned ShaderType;
 
 public:
   AMDGPUMachineFunction(const MachineFunction &MF);
+
+  uint64_t allocateKernArg(uint64_t Size, unsigned Align) {
+    assert(isPowerOf2_32(Align));
+    KernArgSize = alignTo(KernArgSize, Align);
+
+    uint64_t Result = KernArgSize;
+    KernArgSize += Size;
+
+    MaxKernArgAlign = std::max(Align, MaxKernArgAlign);
+    return Result;
+  }
+
   /// A map to keep track of local memory objects and their offsets within
   /// the local memory space.
   std::map<const GlobalValue *, unsigned> LocalMemoryObjects;
@@ -29,10 +43,6 @@ public:
 
   /// Start of implicit kernel args
   unsigned ABIArgOffset;
-
-  unsigned getShaderType() const {
-    return ShaderType;
-  }
 
   bool isKernel() const {
     // FIXME: Assume everything is a kernel until function calls are supported.

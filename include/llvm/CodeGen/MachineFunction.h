@@ -18,6 +18,7 @@
 #ifndef LLVM_CODEGEN_MACHINEFUNCTION_H
 #define LLVM_CODEGEN_MACHINEFUNCTION_H
 
+#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/ilist.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/IR/DebugLoc.h"
@@ -88,6 +89,74 @@ struct MachineFunctionInfo {
   }
 };
 
+/// Properties which a MachineFunction may have at a given point in time.
+/// Each of these has checking code in the MachineVerifier, and passes can
+/// require that a property be set.
+class MachineFunctionProperties {
+  // TODO: Add MachineVerifier checks for AllVRegsAllocated
+  // TODO: Add a way to print the properties and make more useful error messages
+  // Possible TODO: Allow targets to extend this (perhaps by allowing the
+  // constructor to specify the size of the bit vector)
+  // Possible TODO: Allow requiring the negative (e.g. VRegsAllocated could be
+  // stated as the negative of "has vregs"
+
+public:
+  // The properties are stated in "positive" form; i.e. a pass could require
+  // that the property hold, but not that it does not hold.
+
+  // Property descriptions:
+  // IsSSA: True when the machine function is in SSA form and virtual registers
+  //  have a single def.
+  // TracksLiveness: True when tracking register liveness accurately.
+  //  While this property is set, register liveness information in basic block
+  //  live-in lists and machine instruction operands (e.g. kill flags, implicit
+  //  defs) is accurate. This means it can be used to change the code in ways
+  //  that affect the values in registers, for example by the register
+  //  scavenger.
+  //  When this property is clear, liveness is no longer reliable.
+  // AllVRegsAllocated: All virtual registers have been allocated; i.e. all
+  //  register operands are physical registers.
+  enum class Property : unsigned {
+    IsSSA,
+    TracksLiveness,
+    AllVRegsAllocated,
+    LastProperty,
+  };
+
+  bool hasProperty(Property P) const {
+    return Properties[static_cast<unsigned>(P)];
+  }
+  MachineFunctionProperties &set(Property P) {
+    Properties.set(static_cast<unsigned>(P));
+    return *this;
+  }
+  MachineFunctionProperties &clear(Property P) {
+    Properties.reset(static_cast<unsigned>(P));
+    return *this;
+  }
+  MachineFunctionProperties &set(const MachineFunctionProperties &MFP) {
+    Properties |= MFP.Properties;
+    return *this;
+  }
+  MachineFunctionProperties &clear(const MachineFunctionProperties &MFP) {
+    Properties.reset(MFP.Properties);
+    return *this;
+  }
+  // Returns true if all properties set in V (i.e. required by a pass) are set
+  // in this.
+  bool verifyRequiredProperties(const MachineFunctionProperties &V) const {
+    return !V.Properties.test(Properties);
+  }
+
+  // Print the MachineFunctionProperties in human-readable form. If OnlySet is
+  // true, only print the properties that are set.
+  void print(raw_ostream &ROS, bool OnlySet=false) const;
+
+private:
+  BitVector Properties =
+      BitVector(static_cast<unsigned>(Property::LastProperty));
+};
+
 class MachineFunction {
   const Function *Fn;
   const TargetMachine &Target;
@@ -153,6 +222,10 @@ class MachineFunction {
 
   /// True if the function includes any inline assembly.
   bool HasInlineAsm = false;
+
+  /// Current high-level properties of the IR of the function (e.g. is in SSA
+  /// form or whether registers have been allocated)
+  MachineFunctionProperties Properties;
 
   // Allocation management for pseudo source values.
   std::unique_ptr<PseudoSourceValueManager> PSVManager;
@@ -271,6 +344,10 @@ public:
     HasInlineAsm = B;
   }
 
+  /// Get the function properties
+  const MachineFunctionProperties &getProperties() const { return Properties; }
+  MachineFunctionProperties &getProperties() { return Properties; }
+
   /// getInfo - Keep track of various per-function pieces of information for
   /// backends that would like to do so.
   ///
@@ -314,7 +391,7 @@ public:
   /// print - Print out the MachineFunction in a format suitable for debugging
   /// to the specified stream.
   ///
-  void print(raw_ostream &OS, SlotIndexes* = nullptr) const;
+  void print(raw_ostream &OS, const SlotIndexes* = nullptr) const;
 
   /// viewCFG - This function is meant for use from the debugger.  You can just
   /// say 'call F->viewCFG()' and a ghostview window should pop up from the
@@ -425,8 +502,7 @@ public:
   /// CreateMachineInstr - Allocate a new MachineInstr. Use this instead
   /// of `new MachineInstr'.
   ///
-  MachineInstr *CreateMachineInstr(const MCInstrDesc &MCID,
-                                   DebugLoc DL,
+  MachineInstr *CreateMachineInstr(const MCInstrDesc &MCID, const DebugLoc &DL,
                                    bool NoImp = false);
 
   /// CloneMachineInstr - Create a new MachineInstr which is a copy of the

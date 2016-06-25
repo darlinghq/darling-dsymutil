@@ -77,8 +77,8 @@ struct StoreToLoadForwardingCandidate {
     // Currently we only support accesses with unit stride.  FIXME: we should be
     // able to handle non unit stirde as well as long as the stride is equal to
     // the dependence distance.
-    if (isStridedPtr(PSE, LoadPtr, L) != 1 ||
-        isStridedPtr(PSE, LoadPtr, L) != 1)
+    if (getPtrStride(PSE, LoadPtr, L) != 1 ||
+        getPtrStride(PSE, StorePtr, L) != 1)
       return false;
 
     auto &DL = Load->getParent()->getModule()->getDataLayout();
@@ -171,6 +171,12 @@ public:
       auto *Load = dyn_cast<LoadInst>(Destination);
       if (!Load)
         continue;
+
+      // Only progagate the value if they are of the same type.
+      if (Store->getPointerOperand()->getType() !=
+          Load->getPointerOperand()->getType())
+        continue;
+
       Candidates.emplace_front(Load, Store);
     }
 
@@ -438,10 +444,6 @@ public:
     unsigned NumForwarding = 0;
     for (const StoreToLoadForwardingCandidate Cand : StoreToLoadDependences) {
       DEBUG(dbgs() << "Candidate " << Cand);
-      // Only progagate value if they are of the same type.
-      if (Cand.Store->getPointerOperand()->getType() !=
-          Cand.Load->getPointerOperand()->getType())
-        continue;
 
       // Make sure that the stored values is available everywhere in the loop in
       // the next iteration.
@@ -529,6 +531,9 @@ public:
   }
 
   bool runOnFunction(Function &F) override {
+    if (skipFunction(F))
+      return false;
+
     auto *LI = &getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
     auto *LAA = &getAnalysis<LoopAccessAnalysis>();
     auto *DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
@@ -547,7 +552,7 @@ public:
     // Now walk the identified inner loops.
     bool Changed = false;
     for (Loop *L : Worklist) {
-      const LoopAccessInfo &LAI = LAA->getInfo(L, ValueToValueMap());
+      const LoopAccessInfo &LAI = LAA->getInfo(L);
       // The actual work is performed by LoadEliminationForLoop.
       LoadEliminationForLoop LEL(L, LI, LAI, DT);
       Changed |= LEL.processLoop();

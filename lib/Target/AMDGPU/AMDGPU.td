@@ -216,12 +216,6 @@ def FeatureDumpCodeLower : SubtargetFeature <"dumpcode",
   "Dump MachineInstrs in the CodeEmitter"
 >;
 
-def FeatureIRStructurizer : SubtargetFeature <"disable-irstructurizer",
-  "EnableIRStructurizer",
-  "false",
-  "Disable IR Structurizer"
->;
-
 def FeaturePromoteAlloca : SubtargetFeature <"promote-alloca",
   "EnablePromoteAlloca",
   "true",
@@ -315,6 +309,31 @@ def FeatureVolcanicIslands : SubtargetFeatureGeneration<"VOLCANIC_ISLANDS",
    FeatureGCN3Encoding, FeatureCIInsts, Feature16BitInsts,
    FeatureSMemRealTime
   ]
+>;
+
+//===----------------------------------------------------------------------===//
+// Debugger related subtarget features.
+//===----------------------------------------------------------------------===//
+
+def FeatureDebuggerInsertNops : SubtargetFeature<
+  "amdgpu-debugger-insert-nops",
+  "DebuggerInsertNops",
+  "true",
+  "Insert one nop instruction for each high level source statement"
+>;
+
+def FeatureDebuggerReserveRegs : SubtargetFeature<
+  "amdgpu-debugger-reserve-regs",
+  "DebuggerReserveRegs",
+  "true",
+  "Reserve registers for debugger usage"
+>;
+
+def FeatureDebuggerEmitPrologue : SubtargetFeature<
+  "amdgpu-debugger-emit-prologue",
+  "DebuggerEmitPrologue",
+  "true",
+  "Emit debugger prologue"
 >;
 
 //===----------------------------------------------------------------------===//

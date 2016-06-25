@@ -257,15 +257,9 @@ NVPTXTargetLowering::NVPTXTargetLowering(const NVPTXTargetMachine &TM,
   setOperationAction(ISD::CTLZ, MVT::i16, Legal);
   setOperationAction(ISD::CTLZ, MVT::i32, Legal);
   setOperationAction(ISD::CTLZ, MVT::i64, Legal);
-  setOperationAction(ISD::CTLZ_ZERO_UNDEF, MVT::i16, Legal);
-  setOperationAction(ISD::CTLZ_ZERO_UNDEF, MVT::i32, Legal);
-  setOperationAction(ISD::CTLZ_ZERO_UNDEF, MVT::i64, Legal);
   setOperationAction(ISD::CTTZ, MVT::i16, Expand);
   setOperationAction(ISD::CTTZ, MVT::i32, Expand);
   setOperationAction(ISD::CTTZ, MVT::i64, Expand);
-  setOperationAction(ISD::CTTZ_ZERO_UNDEF, MVT::i16, Expand);
-  setOperationAction(ISD::CTTZ_ZERO_UNDEF, MVT::i32, Expand);
-  setOperationAction(ISD::CTTZ_ZERO_UNDEF, MVT::i64, Expand);
   setOperationAction(ISD::CTPOP, MVT::i16, Legal);
   setOperationAction(ISD::CTPOP, MVT::i32, Legal);
   setOperationAction(ISD::CTPOP, MVT::i64, Legal);
@@ -1620,9 +1614,11 @@ SDValue NVPTXTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
       for (unsigned i = 0, e = Ins.size(); i != e; ++i) {
         unsigned sz = VTs[i].getSizeInBits();
         unsigned AlignI = GreatestCommonDivisor64(RetAlign, Offsets[i]);
-        bool needTruncate = sz < 8;
-        if (VTs[i].isInteger() && (sz < 8))
+        bool needTruncate = false;
+        if (VTs[i].isInteger() && sz < 8) {
           sz = 8;
+          needTruncate = true;
+        }
 
         SmallVector<EVT, 4> LoadRetVTs;
         EVT TheLoadType = VTs[i];
@@ -1631,10 +1627,16 @@ SDValue NVPTXTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
           // aggregates.
           LoadRetVTs.push_back(MVT::i32);
           TheLoadType = MVT::i32;
+          needTruncate = true;
         } else if (sz < 16) {
           // If loading i1/i8 result, generate
           //   load i8 (-> i16)
           //   trunc i16 to i1/i8
+
+          // FIXME: Do we need to set needTruncate to true here, too?  We could
+          // not figure out what this branch is for in D17872, so we left it
+          // alone.  The comment above about loading i1/i8 may be wrong, as the
+          // branch above seems to cover integers of size < 32.
           LoadRetVTs.push_back(MVT::i16);
         } else
           LoadRetVTs.push_back(Ins[i].VT);
@@ -1690,7 +1692,7 @@ NVPTXTargetLowering::LowerCONCAT_VECTORS(SDValue Op, SelectionDAG &DAG) const {
                                 DAG.getIntPtrConstant(j, dl)));
     }
   }
-  return DAG.getNode(ISD::BUILD_VECTOR, dl, Node->getValueType(0), Ops);
+  return DAG.getBuildVector(Node->getValueType(0), dl, Ops);
 }
 
 /// LowerShiftRightParts - Lower SRL_PARTS, SRA_PARTS, which
@@ -2039,7 +2041,7 @@ NVPTXTargetLowering::getParamSymbol(SelectionDAG &DAG, int idx, EVT v) const {
 
 // Check to see if the kernel argument is image*_t or sampler_t
 
-bool llvm::isImageOrSamplerVal(const Value *arg, const Module *context) {
+static bool isImageOrSamplerVal(const Value *arg, const Module *context) {
   static const char *const specialTypes[] = { "struct._image2d_t",
                                               "struct._image3d_t",
                                               "struct._sampler_t" };
@@ -2054,16 +2056,17 @@ bool llvm::isImageOrSamplerVal(const Value *arg, const Module *context) {
     return false;
 
   auto *STy = dyn_cast<StructType>(PTy->getElementType());
-  const std::string TypeName = STy && !STy->isLiteral() ? STy->getName() : "";
+  if (!STy || STy->isLiteral())
+    return false;
 
   return std::find(std::begin(specialTypes), std::end(specialTypes),
-                   TypeName) != std::end(specialTypes);
+                   STy->getName()) != std::end(specialTypes);
 }
 
 SDValue NVPTXTargetLowering::LowerFormalArguments(
     SDValue Chain, CallingConv::ID CallConv, bool isVarArg,
-    const SmallVectorImpl<ISD::InputArg> &Ins, SDLoc dl, SelectionDAG &DAG,
-    SmallVectorImpl<SDValue> &InVals) const {
+    const SmallVectorImpl<ISD::InputArg> &Ins, const SDLoc &dl,
+    SelectionDAG &DAG, SmallVectorImpl<SDValue> &InVals) const {
   MachineFunction &MF = DAG.getMachineFunction();
   const DataLayout &DL = DAG.getDataLayout();
   auto PtrVT = getPointerTy(DAG.getDataLayout());
@@ -2075,7 +2078,6 @@ SDValue NVPTXTargetLowering::LowerFormalArguments(
   SDValue Root = DAG.getRoot();
   std::vector<SDValue> OutChains;
 
-  bool isKernel = llvm::isKernelFunction(*F);
   bool isABI = (STI.getSmVersion() >= 20);
   assert(isABI && "Non-ABI compilation is not supported");
   if (!isABI)
@@ -2109,7 +2111,8 @@ SDValue NVPTXTargetLowering::LowerFormalArguments(
             theArgs[i],
             (theArgs[i]->getParent() ? theArgs[i]->getParent()->getParent()
                                      : nullptr))) {
-      assert(isKernel && "Only kernels can have image/sampler params");
+      assert(llvm::isKernelFunction(*F) &&
+             "Only kernels can have image/sampler params");
       InVals.push_back(DAG.getConstant(i + 1, dl, MVT::i32));
       continue;
     }
@@ -2331,6 +2334,11 @@ SDValue NVPTXTargetLowering::LowerFormalArguments(
     // machine instruction fails because TargetExternalSymbol
     // (not lowered) is target dependent, and CopyToReg assumes
     // the source is lowered.
+    //
+    // Byval arguments for regular function are lowered the same way
+    // as for kernels in order to generate better code and work around
+    // a known issue in ptxas. See comments in
+    // NVPTXDAGToDAGISel::SelectAddrSpaceCast() for the gory details.
     EVT ObjectVT = getValueType(DL, Ty);
     assert(ObjectVT == Ins[InsIdx].VT &&
            "Ins type did not match function type");
@@ -2338,14 +2346,7 @@ SDValue NVPTXTargetLowering::LowerFormalArguments(
     SDValue p = DAG.getNode(NVPTXISD::MoveParam, dl, ObjectVT, Arg);
     if (p.getNode())
       p.getNode()->setIROrder(idx + 1);
-    if (isKernel)
-      InVals.push_back(p);
-    else {
-      SDValue p2 = DAG.getNode(
-          ISD::INTRINSIC_WO_CHAIN, dl, ObjectVT,
-          DAG.getConstant(Intrinsic::nvvm_ptr_local_to_gen, dl, MVT::i32), p);
-      InVals.push_back(p2);
-    }
+    InVals.push_back(p);
   }
 
   // Clang will check explicit VarArg and issue error if any. However, Clang
@@ -2362,13 +2363,12 @@ SDValue NVPTXTargetLowering::LowerFormalArguments(
   return Chain;
 }
 
-
 SDValue
 NVPTXTargetLowering::LowerReturn(SDValue Chain, CallingConv::ID CallConv,
                                  bool isVarArg,
                                  const SmallVectorImpl<ISD::OutputArg> &Outs,
                                  const SmallVectorImpl<SDValue> &OutVals,
-                                 SDLoc dl, SelectionDAG &DAG) const {
+                                 const SDLoc &dl, SelectionDAG &DAG) const {
   MachineFunction &MF = DAG.getMachineFunction();
   const Function *F = MF.getFunction();
   Type *RetTy = F->getReturnType();
@@ -4150,7 +4150,7 @@ static bool AreMulWideOperandsDemotable(SDValue LHS, SDValue RHS,
 
   // The RHS can be a demotable op or a constant
   if (ConstantSDNode *CI = dyn_cast<ConstantSDNode>(RHS)) {
-    APInt Val = CI->getAPIntValue();
+    const APInt &Val = CI->getAPIntValue();
     if (LHSSign == Unsigned) {
       return Val.isIntN(OptSize);
     } else {
@@ -4377,7 +4377,7 @@ static void ReplaceLoadVector(SDNode *N, SelectionDAG &DAG,
 
   SDValue LoadChain = NewLD.getValue(NumElts);
 
-  SDValue BuildVec = DAG.getNode(ISD::BUILD_VECTOR, DL, ResVT, ScalarRes);
+  SDValue BuildVec = DAG.getBuildVector(ResVT, DL, ScalarRes);
 
   Results.push_back(BuildVec);
   Results.push_back(LoadChain);
@@ -4490,7 +4490,7 @@ static void ReplaceINTRINSIC_W_CHAIN(SDNode *N, SelectionDAG &DAG,
       SDValue LoadChain = NewLD.getValue(NumElts);
 
       SDValue BuildVec =
-          DAG.getNode(ISD::BUILD_VECTOR, DL, ResVT, ScalarRes);
+          DAG.getBuildVector(ResVT, DL, ScalarRes);
 
       Results.push_back(BuildVec);
       Results.push_back(LoadChain);

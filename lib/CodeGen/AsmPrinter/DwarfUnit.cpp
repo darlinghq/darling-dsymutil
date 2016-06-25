@@ -46,9 +46,8 @@ GenerateDwarfTypeUnits("generate-type-units", cl::Hidden,
 
 DIEDwarfExpression::DIEDwarfExpression(const AsmPrinter &AP, DwarfUnit &DU,
                                        DIELoc &DIE)
-    : DwarfExpression(*AP.MF->getSubtarget().getRegisterInfo(),
-                      AP.getDwarfDebug()->getDwarfVersion()),
-      AP(AP), DU(DU), DIE(DIE) {}
+    : DwarfExpression(AP.getDwarfDebug()->getDwarfVersion()), AP(AP), DU(DU),
+      DIE(DIE) {}
 
 void DIEDwarfExpression::EmitOp(uint8_t Op, const char* Comment) {
   DU.addUInt(DIE, dwarf::DW_FORM_data1, Op);
@@ -59,7 +58,8 @@ void DIEDwarfExpression::EmitSigned(int64_t Value) {
 void DIEDwarfExpression::EmitUnsigned(uint64_t Value) {
   DU.addUInt(DIE, dwarf::DW_FORM_udata, Value);
 }
-bool DIEDwarfExpression::isFrameRegister(unsigned MachineReg) {
+bool DIEDwarfExpression::isFrameRegister(const TargetRegisterInfo &TRI,
+                                         unsigned MachineReg) {
   return MachineReg == TRI.getFrameRegister(*AP.MF);
 }
 
@@ -298,15 +298,10 @@ void DwarfUnit::addDIEEntry(DIE &Die, dwarf::Attribute Attribute,
                Entry);
 }
 
-DIE *DwarfUnit::createDIE(unsigned Tag, const DINode *N) {
-  DIE *Die = DIE::get(DIEValueAllocator, (dwarf::Tag)Tag);
-  if (N)
-    insertDIE(N, Die);
-  return Die;
-}
-
 DIE &DwarfUnit::createAndAddDIE(unsigned Tag, DIE &Parent, const DINode *N) {
-  DIE &Die = Parent.addChild(createDIE(Tag, N));
+  DIE &Die = Parent.addChild(DIE::get(DIEValueAllocator, (dwarf::Tag)Tag));
+  if (N)
+    insertDIE(N, &Die);
   return Die;
 }
 
@@ -373,14 +368,16 @@ void DwarfUnit::addSourceLine(DIE &Die, const DINamespace *NS) {
 bool DwarfUnit::addRegisterOpPiece(DIELoc &TheDie, unsigned Reg,
                                    unsigned SizeInBits, unsigned OffsetInBits) {
   DIEDwarfExpression Expr(*Asm, *this, TheDie);
-  Expr.AddMachineRegPiece(Reg, SizeInBits, OffsetInBits);
+  Expr.AddMachineRegPiece(*Asm->MF->getSubtarget().getRegisterInfo(), Reg,
+                          SizeInBits, OffsetInBits);
   return true;
 }
 
 bool DwarfUnit::addRegisterOffset(DIELoc &TheDie, unsigned Reg,
                                   int64_t Offset) {
   DIEDwarfExpression Expr(*Asm, *this, TheDie);
-  return Expr.AddMachineRegIndirect(Reg, Offset);
+  return Expr.AddMachineRegIndirect(*Asm->MF->getSubtarget().getRegisterInfo(),
+                                    Reg, Offset);
 }
 
 /* Byref variables, in Blocks, are declared by the programmer as "SomeType
@@ -670,7 +667,7 @@ void DwarfUnit::addConstantValue(DIE &Die, const APInt &Val, bool Unsigned) {
 }
 
 void DwarfUnit::addLinkageName(DIE &Die, StringRef LinkageName) {
-  if (!LinkageName.empty() && DD->useLinkageNames())
+  if (!LinkageName.empty())
     addString(Die,
               DD->getDwarfVersion() >= 4 ? dwarf::DW_AT_linkage_name
                                          : dwarf::DW_AT_MIPS_linkage_name,
@@ -723,8 +720,6 @@ DIE *DwarfUnit::getOrCreateTypeDIE(const MDNode *TyNode) {
     return nullptr;
 
   auto *Ty = cast<DIType>(TyNode);
-  assert(Ty == resolve(Ty->getRef()) &&
-         "type was not uniqued, possible ODR violation.");
 
   // DW_TAG_restrict_type is not supported in DWARF2
   if (Ty->getTag() == dwarf::DW_TAG_restrict_type && DD->getDwarfVersion() <= 2)
@@ -732,18 +727,15 @@ DIE *DwarfUnit::getOrCreateTypeDIE(const MDNode *TyNode) {
 
   // Construct the context before querying for the existence of the DIE in case
   // such construction creates the DIE.
-  // For Local Scope, do not construct context DIE.
   auto *Context = resolve(Ty->getScope());
-  bool IsLocalScope = Context && isa<DILocalScope>(Context);
-  DIE *ContextDIE = IsLocalScope ? nullptr : getOrCreateContextDIE(Context);
-  assert(ContextDIE || IsLocalScope);
+  DIE *ContextDIE = getOrCreateContextDIE(Context);
+  assert(ContextDIE);
 
   if (DIE *TyDIE = getDIE(Ty))
     return TyDIE;
 
-  // Create new type and add to map.
-  DIE &TyDIE = IsLocalScope ? *createDIE(Ty->getTag(), Ty)
-                            : createAndAddDIE(Ty->getTag(), *ContextDIE, Ty);
+  // Create new type.
+  DIE &TyDIE = createAndAddDIE(Ty->getTag(), *ContextDIE, Ty);
 
   updateAcceleratorTables(Context, Ty, TyDIE);
 
@@ -908,6 +900,11 @@ void DwarfUnit::constructTypeDIE(DIE &Buffer, const DISubroutineType *CTy) {
       (Language == dwarf::DW_LANG_C89 || Language == dwarf::DW_LANG_C99 ||
        Language == dwarf::DW_LANG_ObjC))
     addFlag(Buffer, dwarf::DW_AT_prototyped);
+
+  // Add a DW_AT_calling_convention if this has an explicit convention.
+  if (CTy->getCC() && CTy->getCC() != dwarf::DW_CC_normal)
+    addUInt(Buffer, dwarf::DW_AT_calling_convention, dwarf::DW_FORM_data1,
+            CTy->getCC());
 
   if (CTy->isLValueReference())
     addFlag(Buffer, dwarf::DW_AT_reference);
@@ -1177,7 +1174,9 @@ bool DwarfUnit::applySubprogramDefinitionAttributes(const DISubprogram *SP,
   assert(((LinkageName.empty() || DeclLinkageName.empty()) ||
           LinkageName == DeclLinkageName) &&
          "decl has a linkage name and it is different");
-  if (DeclLinkageName.empty())
+  if (DeclLinkageName.empty() &&
+      // Always emit it for abstract subprograms.
+      (DD->useAllLinkageNames() || DU->getAbstractSPDies().lookup(SP)))
     addLinkageName(SPDie, LinkageName);
 
   if (!DeclDie)
@@ -1213,9 +1212,16 @@ void DwarfUnit::applySubprogramAttributes(const DISubprogram *SP, DIE &SPDie,
        Language == dwarf::DW_LANG_ObjC))
     addFlag(SPDie, dwarf::DW_AT_prototyped);
 
+  unsigned CC = 0;
   DITypeRefArray Args;
-  if (const DISubroutineType *SPTy = SP->getType())
+  if (const DISubroutineType *SPTy = SP->getType()) {
     Args = SPTy->getTypeArray();
+    CC = SPTy->getCC();
+  }
+
+  // Add a DW_AT_calling_convention if this has an explicit convention.
+  if (CC && CC != dwarf::DW_CC_normal)
+    addUInt(SPDie, dwarf::DW_AT_calling_convention, dwarf::DW_FORM_data1, CC);
 
   // Add a return type. If this is a type like a C/C++ void type we don't add a
   // return type.
@@ -1250,11 +1256,13 @@ void DwarfUnit::applySubprogramAttributes(const DISubprogram *SP, DIE &SPDie,
   if (!SP->isLocalToUnit())
     addFlag(SPDie, dwarf::DW_AT_external);
 
-  if (SP->isOptimized())
-    addFlag(SPDie, dwarf::DW_AT_APPLE_optimized);
+  if (DD->useAppleExtensionAttributes()) {
+    if (SP->isOptimized())
+      addFlag(SPDie, dwarf::DW_AT_APPLE_optimized);
 
-  if (unsigned isa = Asm->getISAEncoding())
-    addUInt(SPDie, dwarf::DW_AT_APPLE_isa, dwarf::DW_FORM_flag, isa);
+    if (unsigned isa = Asm->getISAEncoding())
+      addUInt(SPDie, dwarf::DW_AT_APPLE_isa, dwarf::DW_FORM_flag, isa);
+  }
 
   if (SP->isLValueReference())
     addFlag(SPDie, dwarf::DW_AT_reference);
@@ -1399,55 +1407,46 @@ void DwarfUnit::constructMemberDIE(DIE &Buffer, const DIDerivedType *DT) {
     uint64_t FieldSize = getBaseTypeSize(DD, DT);
     uint64_t OffsetInBytes;
 
-    if (FieldSize && Size != FieldSize) {
+    bool IsBitfield = FieldSize && Size != FieldSize;
+    if (IsBitfield) {
       // Handle bitfield, assume bytes are 8 bits.
-      addUInt(MemberDie, dwarf::DW_AT_byte_size, None, FieldSize/8);
+      if (DD->useDWARF2Bitfields())
+        addUInt(MemberDie, dwarf::DW_AT_byte_size, None, FieldSize/8);
       addUInt(MemberDie, dwarf::DW_AT_bit_size, None, Size);
-      //
-      // The DWARF 2 DW_AT_bit_offset is counting the bits between the most
-      // significant bit of the aligned storage unit containing the bit field to
-      // the most significan bit of the bit field.
-      //
-      // FIXME: DWARF 4 states that DW_AT_data_bit_offset (which
-      // counts from the beginning, regardless of endianness) should
-      // be used instead.
-      //
-      //
-      // Struct      Align       Align       Align
-      // v           v           v           v
-      // +-----------+-----*-----+-----*-----+--
-      // | ...             |b1|b2|b3|b4|
-      // +-----------+-----*-----+-----*-----+--
-      // |           |     |<-- Size ->|     |
-      // |<---- Offset --->|           |<--->|
-      // |           |     |              \_ DW_AT_bit_offset (little endian)
-      // |           |<--->|
-      // |<--------->|  \_ StartBitOffset = DW_AT_bit_offset (big endian)
-      //     \                            = DW_AT_data_bit_offset (biendian)
-      //      \_ OffsetInBytes
+
       uint64_t Offset = DT->getOffsetInBits();
       uint64_t Align = DT->getAlignInBits() ? DT->getAlignInBits() : FieldSize;
       uint64_t AlignMask = ~(Align - 1);
       // The bits from the start of the storage unit to the start of the field.
       uint64_t StartBitOffset = Offset - (Offset & AlignMask);
-      // The endian-dependent DWARF 2 offset.
-      uint64_t DwarfBitOffset = Asm->getDataLayout().isLittleEndian()
-        ? OffsetToAlignment(Offset + Size, Align)
-        : StartBitOffset;
-
       // The byte offset of the field's aligned storage unit inside the struct.
       OffsetInBytes = (Offset - StartBitOffset) / 8;
-      addUInt(MemberDie, dwarf::DW_AT_bit_offset, None, DwarfBitOffset);
-    } else
+
+      if (DD->useDWARF2Bitfields()) {
+        uint64_t HiMark = (Offset + FieldSize) & AlignMask;
+        uint64_t FieldOffset = (HiMark - FieldSize);
+        Offset -= FieldOffset;
+
+        // Maybe we need to work from the other end.
+        if (Asm->getDataLayout().isLittleEndian())
+          Offset = FieldSize - (Offset + Size);
+
+        addUInt(MemberDie, dwarf::DW_AT_bit_offset, None, Offset);
+        OffsetInBytes = FieldOffset >> 3;
+      } else {
+        addUInt(MemberDie, dwarf::DW_AT_data_bit_offset, None, Offset);
+      }
+    } else {
       // This is not a bitfield.
       OffsetInBytes = DT->getOffsetInBits() / 8;
+    }
 
     if (DD->getDwarfVersion() <= 2) {
       DIELoc *MemLocationDie = new (DIEValueAllocator) DIELoc;
       addUInt(*MemLocationDie, dwarf::DW_FORM_data1, dwarf::DW_OP_plus_uconst);
       addUInt(*MemLocationDie, dwarf::DW_FORM_udata, OffsetInBytes);
       addBlock(MemberDie, dwarf::DW_AT_data_member_location, MemLocationDie);
-    } else
+    } else if (!IsBitfield || DD->useDWARF2Bitfields())
       addUInt(MemberDie, dwarf::DW_AT_data_member_location, None,
               OffsetInBytes);
   }
