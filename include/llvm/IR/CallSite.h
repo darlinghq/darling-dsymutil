@@ -109,6 +109,17 @@ public:
     *getCallee() = V;
   }
 
+  /// Return the intrinsic ID of the intrinsic called by this CallSite,
+  /// or Intrinsic::not_intrinsic if the called function is not an
+  /// intrinsic, or if this CallSite is an indirect call.
+  Intrinsic::ID getIntrinsicID() const {
+    if (auto *F = getCalledFunction())
+      return F->getIntrinsicID();
+    // Don't use Intrinsic::not_intrinsic, as it will require pulling
+    // Intrinsics.h into every header that uses CallSite.
+    return static_cast<Intrinsic::ID>(0);
+  }
+
   /// isCallee - Determine whether the passed iterator points to the
   /// callee operand's Use.
   bool isCallee(Value::const_user_iterator UI) const {
@@ -273,6 +284,10 @@ public:
     CALLSITE_DELEGATE_GETTER(getArgOperand(i));
   }
 
+  ValTy *getReturnedArgOperand() const {
+    CALLSITE_DELEGATE_GETTER(getReturnedArgOperand());
+  }
+
   bool isInlineAsm() const {
     if (isCall())
       return cast<CallInst>(getInstruction())->isInlineAsm();
@@ -298,19 +313,15 @@ public:
 
   /// getAttributes/setAttributes - get or set the parameter attributes of
   /// the call.
-  const AttributeSet &getAttributes() const {
+  AttributeSet getAttributes() const {
     CALLSITE_DELEGATE_GETTER(getAttributes());
   }
-  void setAttributes(const AttributeSet &PAL) {
+  void setAttributes(AttributeSet PAL) {
     CALLSITE_DELEGATE_SETTER(setAttributes(PAL));
   }
 
   void addAttribute(unsigned i, Attribute::AttrKind Kind) {
     CALLSITE_DELEGATE_SETTER(addAttribute(i, Kind));
-  }
-
-  void addAttribute(unsigned i, StringRef Kind, StringRef Value) {
-    CALLSITE_DELEGATE_SETTER(addAttribute(i, Kind, Value));
   }
 
   void addAttribute(unsigned i, Attribute Attr) {
@@ -323,10 +334,6 @@ public:
 
   void removeAttribute(unsigned i, StringRef Kind) {
     CALLSITE_DELEGATE_SETTER(removeAttribute(i, Kind));
-  }
-
-  void removeAttribute(unsigned i, Attribute Attr) {
-    CALLSITE_DELEGATE_SETTER(removeAttribute(i, Attr));
   }
 
   /// \brief Return true if this function has the given attribute.
@@ -415,6 +422,14 @@ public:
   }
   void setOnlyReadsMemory() {
     CALLSITE_DELEGATE_SETTER(setOnlyReadsMemory());
+  }
+
+  /// @brief Determine if the call does not access or only writes memory.
+  bool doesNotReadMemory() const {
+    CALLSITE_DELEGATE_GETTER(doesNotReadMemory());
+  }
+  void setDoesNotReadMemory() {
+    CALLSITE_DELEGATE_SETTER(setDoesNotReadMemory());
   }
 
   /// @brief Determine if the call can access memmory only using pointers based

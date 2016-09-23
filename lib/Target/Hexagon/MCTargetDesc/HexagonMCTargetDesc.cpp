@@ -16,7 +16,6 @@
 #include "HexagonMCAsmInfo.h"
 #include "HexagonMCELFStreamer.h"
 #include "MCTargetDesc/HexagonInstPrinter.h"
-#include "llvm/MC/MCCodeGenInfo.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCELFStreamer.h"
 #include "llvm/MC/MCInstrInfo.h"
@@ -75,7 +74,7 @@ static StringRef HexagonGetArchVariant() {
   return "";
 }
 
-StringRef HEXAGON_MC::selectHexagonCPU(const Triple &TT, StringRef CPU) {
+StringRef Hexagon_MC::selectHexagonCPU(const Triple &TT, StringRef CPU) {
   StringRef ArchV = HexagonGetArchVariant();
   if (!ArchV.empty() && !CPU.empty()) {
     if (ArchV != CPU)
@@ -104,7 +103,7 @@ static MCRegisterInfo *createHexagonMCRegisterInfo(const Triple &TT) {
 
 static MCSubtargetInfo *
 createHexagonMCSubtargetInfo(const Triple &TT, StringRef CPU, StringRef FS) {
-  CPU = HEXAGON_MC::selectHexagonCPU(TT, CPU);
+  CPU = Hexagon_MC::selectHexagonCPU(TT, CPU);
   return createHexagonMCSubtargetInfoImpl(TT, CPU, FS);
 }
 
@@ -199,15 +198,6 @@ static MCAsmInfo *createHexagonMCAsmInfo(const MCRegisterInfo &MRI,
   return MAI;
 }
 
-static MCCodeGenInfo *createHexagonMCCodeGenInfo(const Triple &TT,
-                                                 Reloc::Model RM,
-                                                 CodeModel::Model CM,
-                                                 CodeGenOpt::Level OL) {
-  MCCodeGenInfo *X = new MCCodeGenInfo();
-  X->initMCCodeGenInfo(RM, CM, OL);
-  return X;
-}
-
 static MCInstPrinter *createHexagonMCInstPrinter(const Triple &T,
                                                  unsigned SyntaxVariant,
                                                  const MCAsmInfo &MAI,
@@ -241,10 +231,6 @@ createHexagonObjectTargetStreamer(MCStreamer &S, MCSubtargetInfo const &STI) {
 extern "C" void LLVMInitializeHexagonTargetMC() {
   // Register the MC asm info.
   RegisterMCAsmInfoFn X(TheHexagonTarget, createHexagonMCAsmInfo);
-
-  // Register the MC codegen info.
-  TargetRegistry::RegisterMCCodeGenInfo(TheHexagonTarget,
-                                        createHexagonMCCodeGenInfo);
 
   // Register the MC instruction info.
   TargetRegistry::RegisterMCInstrInfo(TheHexagonTarget,

@@ -11,11 +11,40 @@
 ///
 //===----------------------------------------------------------------------===//
 
+#include "CoverageReport.h"
 #include "SourceCoverageViewText.h"
+#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 
 using namespace llvm;
+
+Expected<CoveragePrinter::OwnedStream>
+CoveragePrinterText::createViewFile(StringRef Path, bool InToplevel) {
+  return createOutputStream(Path, "txt", InToplevel);
+}
+
+void CoveragePrinterText::closeViewFile(OwnedStream OS) {
+  OS->operator<<('\n');
+}
+
+Error CoveragePrinterText::createIndexFile(
+    ArrayRef<StringRef> SourceFiles,
+    const coverage::CoverageMapping &Coverage) {
+  auto OSOrErr = createOutputStream("index", "txt", /*InToplevel=*/true);
+  if (Error E = OSOrErr.takeError())
+    return E;
+  auto OS = std::move(OSOrErr.get());
+  raw_ostream &OSRef = *OS.get();
+
+  CoverageReport Report(Opts, Coverage);
+  Report.renderFileReports(OSRef);
+
+  Opts.colored_ostream(OSRef, raw_ostream::CYAN) << "\n"
+                                                 << Opts.getLLVMVersionString();
+
+  return Error::success();
+}
 
 namespace {
 
@@ -36,9 +65,13 @@ unsigned getDividerWidth(const CoverageViewOptions &Opts) {
 
 } // anonymous namespace
 
-void SourceCoverageViewText::renderSourceName(raw_ostream &OS) {
-  getOptions().colored_ostream(OS, raw_ostream::CYAN) << getSourceName()
-                                                      << ":\n";
+void SourceCoverageViewText::renderViewHeader(raw_ostream &) {}
+
+void SourceCoverageViewText::renderViewFooter(raw_ostream &) {}
+
+void SourceCoverageViewText::renderSourceName(raw_ostream &OS, bool WholeFile) {
+  std::string ViewInfo = WholeFile ? getVerboseSourceName() : getSourceName();
+  getOptions().colored_ostream(OS, raw_ostream::CYAN) << ViewInfo << ":\n";
 }
 
 void SourceCoverageViewText::renderLinePrefix(raw_ostream &OS,
@@ -46,6 +79,8 @@ void SourceCoverageViewText::renderLinePrefix(raw_ostream &OS,
   for (unsigned I = 0; I < ViewDepth; ++I)
     OS << "  |";
 }
+
+void SourceCoverageViewText::renderLineSuffix(raw_ostream &, unsigned) {}
 
 void SourceCoverageViewText::renderViewDivider(raw_ostream &OS,
                                                unsigned ViewDepth) {
@@ -156,38 +191,49 @@ void SourceCoverageViewText::renderRegionMarkers(
              << formatCount(S->Count) << (S->IsRegionEntry ? "\n" : " (pop)\n");
 }
 
-unsigned SourceCoverageViewText::renderExpansionView(
-    raw_ostream &OS, ExpansionView &ESV, Optional<LineRef> FirstLine,
-    const coverage::CoverageSegment *WrappedSegment,
+void SourceCoverageViewText::renderExpansionSite(
+    raw_ostream &OS, LineRef L, const coverage::CoverageSegment *WrappedSegment,
     CoverageSegmentArray Segments, unsigned ExpansionCol, unsigned ViewDepth) {
-  unsigned NextExpansionCol = ExpansionCol;
+  renderLinePrefix(OS, ViewDepth);
+  OS.indent(getCombinedColumnWidth(getOptions()) + (ViewDepth == 0 ? 0 : 1));
+  renderLine(OS, L, WrappedSegment, Segments, ExpansionCol, ViewDepth);
+}
 
-  if (FirstLine.hasValue()) {
-    // Re-render the current line and highlight the expansion range for
-    // this subview.
-    NextExpansionCol = ESV.getStartCol();
-    renderLinePrefix(OS, ViewDepth);
-    OS.indent(getCombinedColumnWidth(getOptions()) + (ViewDepth == 0 ? 0 : 1));
-    renderLine(OS, *FirstLine, WrappedSegment, Segments, ExpansionCol,
-               ViewDepth);
-    renderViewDivider(OS, ViewDepth + 1);
-  }
-
+void SourceCoverageViewText::renderExpansionView(raw_ostream &OS,
+                                                 ExpansionView &ESV,
+                                                 unsigned ViewDepth) {
   // Render the child subview.
   if (getOptions().Debug)
     errs() << "Expansion at line " << ESV.getLine() << ", " << ESV.getStartCol()
            << " -> " << ESV.getEndCol() << '\n';
   ESV.View->print(OS, /*WholeFile=*/false, /*ShowSourceName=*/false,
                   ViewDepth + 1);
-
-  return NextExpansionCol;
 }
 
 void SourceCoverageViewText::renderInstantiationView(raw_ostream &OS,
                                                      InstantiationView &ISV,
                                                      unsigned ViewDepth) {
-  renderViewDivider(OS, ViewDepth);
   renderLinePrefix(OS, ViewDepth);
   OS << ' ';
-  ISV.View->print(OS, /*WholeFile=*/false, /*ShowSourceName=*/true, ViewDepth);
+  if (!ISV.View)
+    getOptions().colored_ostream(OS, raw_ostream::RED)
+        << "Unexecuted instantiation: " << ISV.FunctionName << "\n";
+  else
+    ISV.View->print(OS, /*WholeFile=*/false, /*ShowSourceName=*/true,
+                    ViewDepth);
 }
+
+void SourceCoverageViewText::renderTitle(raw_ostream &OS, StringRef Title) {
+  if (getOptions().hasProjectTitle())
+    getOptions().colored_ostream(OS, raw_ostream::CYAN)
+        << getOptions().ProjectTitle << "\n";
+
+  getOptions().colored_ostream(OS, raw_ostream::CYAN) << Title << "\n";
+
+  if (getOptions().hasCreatedTime())
+    getOptions().colored_ostream(OS, raw_ostream::CYAN)
+        << getOptions().CreatedTimeStr << "\n";
+}
+
+void SourceCoverageViewText::renderTableHeader(raw_ostream &, unsigned,
+                                               unsigned) {}

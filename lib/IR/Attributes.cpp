@@ -38,7 +38,7 @@ using namespace llvm;
 //
 // In order to do this, we need to reserve one value of the second (optional)
 // allocsize argument to signify "not present."
-LLVM_CONSTEXPR static unsigned AllocSizeNumElemsNotPresent = -1;
+static const unsigned AllocSizeNumElemsNotPresent = -1;
 
 static uint64_t packAllocSizeArgs(unsigned ElemSizeArg,
                                   const Optional<unsigned> &NumElemsArg) {
@@ -292,6 +292,8 @@ std::string Attribute::getAsString(bool InAttrGrp) const {
     return "readnone";
   if (hasAttribute(Attribute::ReadOnly))
     return "readonly";
+  if (hasAttribute(Attribute::WriteOnly))
+    return "writeonly";
   if (hasAttribute(Attribute::Returned))
     return "returned";
   if (hasAttribute(Attribute::ReturnsTwice))
@@ -379,10 +381,18 @@ std::string Attribute::getAsString(bool InAttrGrp) const {
     std::string Result;
     Result += (Twine('"') + getKindAsString() + Twine('"')).str();
 
-    StringRef Val = pImpl->getValueAsString();
-    if (Val.empty()) return Result;
+    std::string AttrVal = pImpl->getValueAsString();
+    if (AttrVal.empty()) return Result;
 
-    Result += ("=\"" + Val + Twine('"')).str();
+    // Since some attribute strings contain special characters that cannot be
+    // printable, those have to be escaped to make the attribute value printable
+    // as is.  e.g. "\01__gnu_mcount_nc"
+    {
+      raw_string_ostream OS(Result);
+      OS << "=\"";
+      PrintEscapedString(AttrVal, OS);
+      OS << "\"";
+    }
     return Result;
   }
 
@@ -516,6 +526,7 @@ uint64_t AttributeImpl::getAttrMask(Attribute::AttrKind Val) {
   case Attribute::InaccessibleMemOrArgMemOnly: return 1ULL << 50;
   case Attribute::SwiftSelf:       return 1ULL << 51;
   case Attribute::SwiftError:      return 1ULL << 52;
+  case Attribute::WriteOnly:       return 1ULL << 53;
   case Attribute::Dereferenceable:
     llvm_unreachable("dereferenceable attribute not supported in raw format");
     break;
@@ -570,61 +581,61 @@ AttributeSetNode *AttributeSetNode::get(LLVMContext &C,
 }
 
 bool AttributeSetNode::hasAttribute(StringRef Kind) const {
-  for (iterator I = begin(), E = end(); I != E; ++I)
-    if (I->hasAttribute(Kind))
+  for (Attribute I : *this)
+    if (I.hasAttribute(Kind))
       return true;
   return false;
 }
 
 Attribute AttributeSetNode::getAttribute(Attribute::AttrKind Kind) const {
   if (hasAttribute(Kind)) {
-    for (iterator I = begin(), E = end(); I != E; ++I)
-      if (I->hasAttribute(Kind))
-        return *I;
+    for (Attribute I : *this)
+      if (I.hasAttribute(Kind))
+        return I;
   }
   return Attribute();
 }
 
 Attribute AttributeSetNode::getAttribute(StringRef Kind) const {
-  for (iterator I = begin(), E = end(); I != E; ++I)
-    if (I->hasAttribute(Kind))
-      return *I;
+  for (Attribute I : *this)
+    if (I.hasAttribute(Kind))
+      return I;
   return Attribute();
 }
 
 unsigned AttributeSetNode::getAlignment() const {
-  for (iterator I = begin(), E = end(); I != E; ++I)
-    if (I->hasAttribute(Attribute::Alignment))
-      return I->getAlignment();
+  for (Attribute I : *this)
+    if (I.hasAttribute(Attribute::Alignment))
+      return I.getAlignment();
   return 0;
 }
 
 unsigned AttributeSetNode::getStackAlignment() const {
-  for (iterator I = begin(), E = end(); I != E; ++I)
-    if (I->hasAttribute(Attribute::StackAlignment))
-      return I->getStackAlignment();
+  for (Attribute I : *this)
+    if (I.hasAttribute(Attribute::StackAlignment))
+      return I.getStackAlignment();
   return 0;
 }
 
 uint64_t AttributeSetNode::getDereferenceableBytes() const {
-  for (iterator I = begin(), E = end(); I != E; ++I)
-    if (I->hasAttribute(Attribute::Dereferenceable))
-      return I->getDereferenceableBytes();
+  for (Attribute I : *this)
+    if (I.hasAttribute(Attribute::Dereferenceable))
+      return I.getDereferenceableBytes();
   return 0;
 }
 
 uint64_t AttributeSetNode::getDereferenceableOrNullBytes() const {
-  for (iterator I = begin(), E = end(); I != E; ++I)
-    if (I->hasAttribute(Attribute::DereferenceableOrNull))
-      return I->getDereferenceableOrNullBytes();
+  for (Attribute I : *this)
+    if (I.hasAttribute(Attribute::DereferenceableOrNull))
+      return I.getDereferenceableOrNullBytes();
   return 0;
 }
 
 std::pair<unsigned, Optional<unsigned>>
 AttributeSetNode::getAllocSizeArgs() const {
-  for (iterator I = begin(), E = end(); I != E; ++I)
-    if (I->hasAttribute(Attribute::AllocSize))
-      return I->getAllocSizeArgs();
+  for (Attribute I : *this)
+    if (I.hasAttribute(Attribute::AllocSize))
+      return I.getAllocSizeArgs();
   return std::make_pair(0, 0);
 }
 
@@ -718,10 +729,11 @@ AttributeSet AttributeSet::get(LLVMContext &C,
                            const std::pair<unsigned, Attribute> &RHS) {
                           return LHS.first < RHS.first;
                         }) && "Misordered Attributes list!");
-  assert(std::none_of(Attrs.begin(), Attrs.end(),
-                      [](const std::pair<unsigned, Attribute> &Pair) {
-                        return Pair.second.hasAttribute(Attribute::None);
-                      }) && "Pointless attribute!");
+  assert(none_of(Attrs,
+                 [](const std::pair<unsigned, Attribute> &Pair) {
+                   return Pair.second.hasAttribute(Attribute::None);
+                 }) &&
+         "Pointless attribute!");
 
   // Create a vector if (unsigned, AttributeSetNode*) pairs from the attributes
   // list.
@@ -735,8 +747,7 @@ AttributeSet AttributeSet::get(LLVMContext &C,
       ++I;
     }
 
-    AttrPairVec.push_back(std::make_pair(Index,
-                                         AttributeSetNode::get(C, AttrVec)));
+    AttrPairVec.emplace_back(Index, AttributeSetNode::get(C, AttrVec));
   }
 
   return getImpl(C, AttrPairVec);
@@ -788,13 +799,12 @@ AttributeSet AttributeSet::get(LLVMContext &C, unsigned Index,
     default:
       Attr = Attribute::get(C, Kind);
     }
-    Attrs.push_back(std::make_pair(Index, Attr));
+    Attrs.emplace_back(Index, Attr);
   }
 
   // Add target-dependent (string) attributes.
   for (const auto &TDA : B.td_attrs())
-    Attrs.push_back(
-        std::make_pair(Index, Attribute::get(C, TDA.first, TDA.second)));
+    Attrs.emplace_back(Index, Attribute::get(C, TDA.first, TDA.second));
 
   return get(C, Attrs);
 }
@@ -803,7 +813,7 @@ AttributeSet AttributeSet::get(LLVMContext &C, unsigned Index,
                                ArrayRef<Attribute::AttrKind> Kinds) {
   SmallVector<std::pair<unsigned, Attribute>, 8> Attrs;
   for (Attribute::AttrKind K : Kinds)
-    Attrs.push_back(std::make_pair(Index, Attribute::get(C, K)));
+    Attrs.emplace_back(Index, Attribute::get(C, K));
   return get(C, Attrs);
 }
 
@@ -811,7 +821,7 @@ AttributeSet AttributeSet::get(LLVMContext &C, unsigned Index,
                                ArrayRef<StringRef> Kinds) {
   SmallVector<std::pair<unsigned, Attribute>, 8> Attrs;
   for (StringRef K : Kinds)
-    Attrs.push_back(std::make_pair(Index, Attribute::get(C, K)));
+    Attrs.emplace_back(Index, Attribute::get(C, K));
   return get(C, Attrs);
 }
 
@@ -1105,14 +1115,21 @@ bool AttributeSet::hasFnAttribute(Attribute::AttrKind Kind) const {
   return pImpl && pImpl->hasFnAttribute(Kind);
 }
 
-bool AttributeSet::hasAttrSomewhere(Attribute::AttrKind Attr) const {
+bool AttributeSet::hasFnAttribute(StringRef Kind) const {
+  return hasAttribute(AttributeSet::FunctionIndex, Kind);
+}
+
+bool AttributeSet::hasAttrSomewhere(Attribute::AttrKind Attr,
+                                    unsigned *Index) const {
   if (!pImpl) return false;
 
   for (unsigned I = 0, E = pImpl->getNumSlots(); I != E; ++I)
     for (AttributeSetImpl::iterator II = pImpl->begin(I),
            IE = pImpl->end(I); II != IE; ++II)
-      if (II->hasAttribute(Attr))
+      if (II->hasAttribute(Attr)) {
+        if (Index) *Index = pImpl->getSlotIndex(I);
         return true;
+      }
 
   return false;
 }
@@ -1152,7 +1169,7 @@ uint64_t AttributeSet::getDereferenceableOrNullBytes(unsigned Index) const {
 std::pair<unsigned, Optional<unsigned>>
 AttributeSet::getAllocSizeArgs(unsigned Index) const {
   AttributeSetNode *ASN = getAttributes(Index);
-  return ASN ? ASN->getAllocSizeArgs() : std::make_pair(0, 0);
+  return ASN ? ASN->getAllocSizeArgs() : std::make_pair(0u, Optional<unsigned>(0u));
 }
 
 std::string AttributeSet::getAsString(unsigned Index, bool InAttrGrp) const {

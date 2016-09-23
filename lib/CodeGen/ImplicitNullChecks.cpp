@@ -129,7 +129,7 @@ public:
 
   MachineFunctionProperties getRequiredProperties() const override {
     return MachineFunctionProperties().set(
-        MachineFunctionProperties::Property::AllVRegsAllocated);
+        MachineFunctionProperties::Property::NoVRegs);
   }
 };
 
@@ -332,7 +332,7 @@ bool ImplicitNullChecks::analyzeBlockForNullChecks(
 
   MachineBranchPredicate MBP;
 
-  if (TII->AnalyzeBranchPredicate(MBB, MBP, true))
+  if (TII->analyzeBranchPredicate(MBB, MBP, true))
     return false;
 
   // Is the predicate comparing an integer to zero?
@@ -421,14 +421,14 @@ bool ImplicitNullChecks::analyzeBlockForNullChecks(
 
   for (auto MII = NotNullSucc->begin(), MIE = NotNullSucc->end(); MII != MIE;
        ++MII) {
-    MachineInstr *MI = &*MII;
+    MachineInstr &MI = *MII;
     unsigned BaseReg;
     int64_t Offset;
     MachineInstr *Dependency = nullptr;
     if (TII->getMemOpBaseRegImmOfs(MI, BaseReg, Offset, TRI))
-      if (MI->mayLoad() && !MI->isPredicable() && BaseReg == PointerReg &&
-          Offset < PageSize && MI->getDesc().getNumDefs() <= 1 &&
-          HD.isSafeToHoist(MI, Dependency)) {
+      if (MI.mayLoad() && !MI.isPredicable() && BaseReg == PointerReg &&
+          Offset < PageSize && MI.getDesc().getNumDefs() <= 1 &&
+          HD.isSafeToHoist(&MI, Dependency)) {
 
         auto DependencyOperandIsOk = [&](MachineOperand &MO) {
           assert(!(MO.isReg() && MO.isUse()) &&
@@ -463,13 +463,13 @@ bool ImplicitNullChecks::analyzeBlockForNullChecks(
             all_of(Dependency->operands(), DependencyOperandIsOk);
 
         if (DependencyOperandsAreOk) {
-          NullCheckList.emplace_back(MI, MBP.ConditionDef, &MBB, NotNullSucc,
+          NullCheckList.emplace_back(&MI, MBP.ConditionDef, &MBB, NotNullSucc,
                                      NullSucc, Dependency);
           return true;
         }
       }
 
-    HD.rememberInstruction(MI);
+    HD.rememberInstruction(&MI);
     if (HD.isClobbered())
       return false;
   }
@@ -518,7 +518,7 @@ void ImplicitNullChecks::rewriteNullChecks(
 
   for (auto &NC : NullCheckList) {
     // Remove the conditional branch dependent on the null check.
-    unsigned BranchesRemoved = TII->RemoveBranch(*NC.getCheckBlock());
+    unsigned BranchesRemoved = TII->removeBranch(*NC.getCheckBlock());
     (void)BranchesRemoved;
     assert(BranchesRemoved > 0 && "expected at least one branch!");
 
@@ -560,7 +560,7 @@ void ImplicitNullChecks::rewriteNullChecks(
     NC.getCheckOperation()->eraseFromParent();
 
     // Insert an *unconditional* branch to not-null successor.
-    TII->InsertBranch(*NC.getCheckBlock(), NC.getNotNullSucc(), nullptr,
+    TII->insertBranch(*NC.getCheckBlock(), NC.getNotNullSucc(), nullptr,
                       /*Cond=*/None, DL);
 
     NumImplicitNullChecks++;

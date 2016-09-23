@@ -59,7 +59,7 @@ struct LoadCommand {
 
 struct NListEntry {
   uint32_t n_strx;
-  uint8_t n_type;
+  llvm::yaml::Hex8 n_type;
   uint8_t n_sect;
   uint16_t n_desc;
   uint64_t n_value;
@@ -100,6 +100,8 @@ struct LinkEditData {
   MachOYAML::ExportEntry ExportTrie;
   std::vector<NListEntry> NameList;
   std::vector<StringRef> StringTable;
+
+  bool isEmpty() const;
 };
 
 struct Object {
@@ -127,12 +129,6 @@ struct UniversalBinary {
   FatHeader Header;
   std::vector<FatArch> FatArchs;
   std::vector<Object> Slices;
-};
-
-struct MachFile {
-  bool isFat;
-  UniversalBinary FatFile;
-  Object ThinFile;
 };
 
 } // namespace llvm::MachOYAML
@@ -172,10 +168,6 @@ template <> struct MappingTraits<MachOYAML::FatArch> {
 
 template <> struct MappingTraits<MachOYAML::UniversalBinary> {
   static void mapping(IO &IO, MachOYAML::UniversalBinary &UniversalBinary);
-};
-
-template <> struct MappingTraits<MachOYAML::MachFile> {
-  static void mapping(IO &IO, MachOYAML::MachFile &MachFile);
 };
 
 template <> struct MappingTraits<MachOYAML::LoadCommand> {

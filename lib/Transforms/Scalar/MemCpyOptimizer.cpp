@@ -521,16 +521,14 @@ static bool moveUp(AliasAnalysis &AA, StoreInst *SI, Instruction *P) {
     if (Args.erase(C))
       NeedLift = true;
     else if (MayAlias) {
-      NeedLift = std::any_of(MemLocs.begin(), MemLocs.end(),
-        [C, &AA](const MemoryLocation &ML) {
-          return AA.getModRefInfo(C, ML);
-        });
+      NeedLift = any_of(MemLocs, [C, &AA](const MemoryLocation &ML) {
+        return AA.getModRefInfo(C, ML);
+      });
 
       if (!NeedLift)
-        NeedLift = std::any_of(CallSites.begin(), CallSites.end(),
-          [C, &AA](const ImmutableCallSite &CS) {
-            return AA.getModRefInfo(C, CS);
-          });
+        NeedLift = any_of(CallSites, [C, &AA](const ImmutableCallSite &CS) {
+          return AA.getModRefInfo(C, CS);
+        });
     }
 
     if (!NeedLift)
@@ -1110,8 +1108,11 @@ bool MemCpyOptPass::processMemSetMemCpyDependence(MemCpyInst *MemCpy,
 /// The \p MemCpy must have a Constant length.
 bool MemCpyOptPass::performMemCpyToMemSetOptzn(MemCpyInst *MemCpy,
                                                MemSetInst *MemSet) {
-  // This only makes sense on memcpy(..., memset(...), ...).
-  if (MemSet->getRawDest() != MemCpy->getRawSource())
+  AliasAnalysis &AA = LookupAliasAnalysis();
+
+  // Make sure that memcpy(..., memset(...), ...), that is we are memsetting and
+  // memcpying from the same address. Otherwise it is hard to reason about.
+  if (!AA.isMustAlias(MemSet->getRawDest(), MemCpy->getRawSource()))
     return false;
 
   ConstantInt *CopySize = cast<ConstantInt>(MemCpy->getLength());
@@ -1334,8 +1335,8 @@ bool MemCpyOptPass::iterateOnFunction(Function &F) {
   bool MadeChange = false;
 
   // Walk all instruction in the function.
-  for (Function::iterator BB = F.begin(), BBE = F.end(); BB != BBE; ++BB) {
-    for (BasicBlock::iterator BI = BB->begin(), BE = BB->end(); BI != BE;) {
+  for (BasicBlock &BB : F) {
+    for (BasicBlock::iterator BI = BB.begin(), BE = BB.end(); BI != BE;) {
       // Avoid invalidating the iterator.
       Instruction *I = &*BI++;
 
@@ -1357,7 +1358,8 @@ bool MemCpyOptPass::iterateOnFunction(Function &F) {
 
       // Reprocess the instruction if desired.
       if (RepeatInstruction) {
-        if (BI != BB->begin()) --BI;
+        if (BI != BB.begin())
+          --BI;
         MadeChange = true;
       }
     }

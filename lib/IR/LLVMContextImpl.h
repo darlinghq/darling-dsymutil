@@ -528,6 +528,7 @@ template <> struct MDNodeKeyImpl<DISubprogram> {
   Metadata *ContainingType;
   unsigned Virtuality;
   unsigned VirtualIndex;
+  int ThisAdjustment;
   unsigned Flags;
   bool IsOptimized;
   Metadata *Unit;
@@ -539,15 +540,16 @@ template <> struct MDNodeKeyImpl<DISubprogram> {
                 Metadata *File, unsigned Line, Metadata *Type,
                 bool IsLocalToUnit, bool IsDefinition, unsigned ScopeLine,
                 Metadata *ContainingType, unsigned Virtuality,
-                unsigned VirtualIndex, unsigned Flags, bool IsOptimized,
-                Metadata *Unit, Metadata *TemplateParams, Metadata *Declaration,
-                Metadata *Variables)
+                unsigned VirtualIndex, int ThisAdjustment, unsigned Flags,
+                bool IsOptimized, Metadata *Unit, Metadata *TemplateParams,
+                Metadata *Declaration, Metadata *Variables)
       : Scope(Scope), Name(Name), LinkageName(LinkageName), File(File),
         Line(Line), Type(Type), IsLocalToUnit(IsLocalToUnit),
         IsDefinition(IsDefinition), ScopeLine(ScopeLine),
         ContainingType(ContainingType), Virtuality(Virtuality),
-        VirtualIndex(VirtualIndex), Flags(Flags), IsOptimized(IsOptimized),
-        Unit(Unit), TemplateParams(TemplateParams), Declaration(Declaration),
+        VirtualIndex(VirtualIndex), ThisAdjustment(ThisAdjustment),
+        Flags(Flags), IsOptimized(IsOptimized), Unit(Unit),
+        TemplateParams(TemplateParams), Declaration(Declaration),
         Variables(Variables) {}
   MDNodeKeyImpl(const DISubprogram *N)
       : Scope(N->getRawScope()), Name(N->getRawName()),
@@ -556,8 +558,9 @@ template <> struct MDNodeKeyImpl<DISubprogram> {
         IsLocalToUnit(N->isLocalToUnit()), IsDefinition(N->isDefinition()),
         ScopeLine(N->getScopeLine()), ContainingType(N->getRawContainingType()),
         Virtuality(N->getVirtuality()), VirtualIndex(N->getVirtualIndex()),
-        Flags(N->getFlags()), IsOptimized(N->isOptimized()),
-        Unit(N->getRawUnit()), TemplateParams(N->getRawTemplateParams()),
+        ThisAdjustment(N->getThisAdjustment()), Flags(N->getFlags()),
+        IsOptimized(N->isOptimized()), Unit(N->getRawUnit()),
+        TemplateParams(N->getRawTemplateParams()),
         Declaration(N->getRawDeclaration()), Variables(N->getRawVariables()) {}
 
   bool isKeyOf(const DISubprogram *RHS) const {
@@ -569,8 +572,10 @@ template <> struct MDNodeKeyImpl<DISubprogram> {
            ScopeLine == RHS->getScopeLine() &&
            ContainingType == RHS->getRawContainingType() &&
            Virtuality == RHS->getVirtuality() &&
-           VirtualIndex == RHS->getVirtualIndex() && Flags == RHS->getFlags() &&
-           IsOptimized == RHS->isOptimized() && Unit == RHS->getUnit() &&
+           VirtualIndex == RHS->getVirtualIndex() &&
+           ThisAdjustment == RHS->getThisAdjustment() &&
+           Flags == RHS->getFlags() && IsOptimized == RHS->isOptimized() &&
+           Unit == RHS->getUnit() &&
            TemplateParams == RHS->getRawTemplateParams() &&
            Declaration == RHS->getRawDeclaration() &&
            Variables == RHS->getRawVariables();
@@ -753,23 +758,23 @@ template <> struct MDNodeKeyImpl<DIGlobalVariable> {
   Metadata *Type;
   bool IsLocalToUnit;
   bool IsDefinition;
-  Metadata *Variable;
+  Metadata *Expr;
   Metadata *StaticDataMemberDeclaration;
 
   MDNodeKeyImpl(Metadata *Scope, MDString *Name, MDString *LinkageName,
                 Metadata *File, unsigned Line, Metadata *Type,
-                bool IsLocalToUnit, bool IsDefinition, Metadata *Variable,
+                bool IsLocalToUnit, bool IsDefinition, Metadata *Expr,
                 Metadata *StaticDataMemberDeclaration)
       : Scope(Scope), Name(Name), LinkageName(LinkageName), File(File),
         Line(Line), Type(Type), IsLocalToUnit(IsLocalToUnit),
-        IsDefinition(IsDefinition), Variable(Variable),
+        IsDefinition(IsDefinition), Expr(Expr),
         StaticDataMemberDeclaration(StaticDataMemberDeclaration) {}
   MDNodeKeyImpl(const DIGlobalVariable *N)
       : Scope(N->getRawScope()), Name(N->getRawName()),
         LinkageName(N->getRawLinkageName()), File(N->getRawFile()),
         Line(N->getLine()), Type(N->getRawType()),
         IsLocalToUnit(N->isLocalToUnit()), IsDefinition(N->isDefinition()),
-        Variable(N->getRawVariable()),
+        Expr(N->getRawExpr()),
         StaticDataMemberDeclaration(N->getRawStaticDataMemberDeclaration()) {}
 
   bool isKeyOf(const DIGlobalVariable *RHS) const {
@@ -778,13 +783,13 @@ template <> struct MDNodeKeyImpl<DIGlobalVariable> {
            File == RHS->getRawFile() && Line == RHS->getLine() &&
            Type == RHS->getRawType() && IsLocalToUnit == RHS->isLocalToUnit() &&
            IsDefinition == RHS->isDefinition() &&
-           Variable == RHS->getRawVariable() &&
+           Expr == RHS->getRawExpr() &&
            StaticDataMemberDeclaration ==
                RHS->getRawStaticDataMemberDeclaration();
   }
   unsigned getHashValue() const {
     return hash_combine(Scope, Name, LinkageName, File, Line, Type,
-                        IsLocalToUnit, IsDefinition, Variable,
+                        IsLocalToUnit, IsDefinition, Expr,
                         StaticDataMemberDeclaration);
   }
 };
@@ -923,7 +928,7 @@ template <> struct MDNodeKeyImpl<DIMacroFile> {
 
   bool isKeyOf(const DIMacroFile *RHS) const {
     return MIType == RHS->getMacinfoType() && Line == RHS->getLine() &&
-           File == RHS->getRawFile() && File == RHS->getRawElements();
+           File == RHS->getRawFile() && Elements == RHS->getRawElements();
   }
   unsigned getHashValue() const {
     return hash_combine(MIType, Line, File, Elements);
@@ -993,9 +998,8 @@ public:
   ///
   /// Erases all attachments matching the \c shouldRemove predicate.
   template <class PredTy> void remove_if(PredTy shouldRemove) {
-    Attachments.erase(
-        std::remove_if(Attachments.begin(), Attachments.end(), shouldRemove),
-        Attachments.end());
+    Attachments.erase(llvm::remove_if(Attachments, shouldRemove),
+                      Attachments.end());
   }
 };
 
@@ -1038,6 +1042,7 @@ public:
   LLVMContext::DiagnosticHandlerTy DiagnosticHandler;
   void *DiagnosticContext;
   bool RespectDiagnosticFilters;
+  bool DiagnosticHotnessRequested;
 
   LLVMContext::YieldCallbackTy YieldCallback;
   void *YieldOpaqueHandle;

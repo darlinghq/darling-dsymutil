@@ -19,9 +19,9 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
-#include "llvm/LTO/LTOCodeGenerator.h"
-#include "llvm/LTO/LTOModule.h"
-#include "llvm/LTO/ThinLTOCodeGenerator.h"
+#include "llvm/LTO/legacy/LTOCodeGenerator.h"
+#include "llvm/LTO/legacy/LTOModule.h"
+#include "llvm/LTO/legacy/ThinLTOCodeGenerator.h"
 #include "llvm/Object/ModuleSummaryIndexObjectFile.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
@@ -41,6 +41,11 @@ static cl::opt<char>
     OptLevel("O", cl::desc("Optimization level. [-O0, -O1, -O2, or -O3] "
                            "(default = '-O2')"),
              cl::Prefix, cl::ZeroOrMore, cl::init('2'));
+
+static cl::opt<bool>
+    IndexStats("thinlto-index-stats",
+               cl::desc("Print statistic for the index in every input files"),
+               cl::init(false));
 
 static cl::opt<bool> DisableVerify(
     "disable-verify", cl::init(false),
@@ -120,6 +125,11 @@ static cl::opt<std::string> ThinLTOModuleId(
 static cl::opt<std::string>
     ThinLTOCacheDir("thinlto-cache-dir", cl::desc("Enable ThinLTO caching."));
 
+static cl::opt<std::string> ThinLTOSaveTempsPrefix(
+    "thinlto-save-temps",
+    cl::desc("Save ThinLTO temp files using filenames created by adding "
+             "suffixes to the given file path prefix."));
+
 static cl::opt<bool>
     SaveModuleFile("save-merged-module", cl::init(false),
                    cl::desc("Write merged LTO module to file before CodeGen"));
@@ -155,6 +165,10 @@ static cl::opt<unsigned> Parallelism("j", cl::Prefix, cl::init(1),
 static cl::opt<bool> RestoreGlobalsLinkage(
     "restore-linkage", cl::init(false),
     cl::desc("Restore original linkage of globals prior to CodeGen"));
+
+static cl::opt<bool> CheckHasObjC(
+    "check-for-objc", cl::init(false),
+    cl::desc("Only check if the module has objective-C defined in it"));
 
 namespace {
 struct ModuleInfo {
@@ -253,6 +267,40 @@ getLocalLTOModule(StringRef Path, std::unique_ptr<MemoryBuffer> &Buffer,
   CurrentActivity = "";
   maybeVerifyModule((*Ret)->getModule());
   return std::move(*Ret);
+}
+
+/// Print some statistics on the index for each input files.
+void printIndexStats() {
+  for (auto &Filename : InputFilenames) {
+    CurrentActivity = "loading file '" + Filename + "'";
+    ErrorOr<std::unique_ptr<ModuleSummaryIndex>> IndexOrErr =
+        llvm::getModuleSummaryIndexForFile(Filename, diagnosticHandler);
+    error(IndexOrErr, "error " + CurrentActivity);
+    std::unique_ptr<ModuleSummaryIndex> Index = std::move(IndexOrErr.get());
+    CurrentActivity = "";
+    // Skip files without a module summary.
+    if (!Index)
+      report_fatal_error(Filename + " does not contain an index");
+
+    unsigned Calls = 0, Refs = 0, Functions = 0, Alias = 0, Globals = 0;
+    for (auto &Summaries : *Index) {
+      for (auto &Summary : Summaries.second) {
+        Refs += Summary->refs().size();
+        if (auto *FuncSummary = dyn_cast<FunctionSummary>(Summary.get())) {
+          Functions++;
+          Calls += FuncSummary->calls().size();
+        } else if (isa<AliasSummary>(Summary.get()))
+          Alias++;
+        else
+          Globals++;
+      }
+    }
+    outs() << "Index " << Filename << " contains "
+           << (Alias + Globals + Functions) << " nodes (" << Functions
+           << " functions, " << Alias << " alias, " << Globals
+           << " globals) and " << (Calls + Refs) << " edges (" << Refs
+           << " refs and " << Calls << " calls)\n";
+  }
 }
 
 /// \brief List symbols in each IR file.
@@ -668,6 +716,8 @@ private:
       ThinGenerator.addModule(Filename, InputBuffers.back()->getBuffer());
     }
 
+    if (!ThinLTOSaveTempsPrefix.empty())
+      ThinGenerator.setSaveTempsDir(ThinLTOSaveTempsPrefix);
     ThinGenerator.run();
 
     auto &Binaries = ThinGenerator.getProducedBinaries();
@@ -711,6 +761,26 @@ int main(int argc, char **argv) {
 
   if (ListSymbolsOnly) {
     listSymbols(Options);
+    return 0;
+  }
+
+  if (IndexStats) {
+    printIndexStats();
+    return 0;
+  }
+
+  if (CheckHasObjC) {
+    for (auto &Filename : InputFilenames) {
+      ErrorOr<std::unique_ptr<MemoryBuffer>> BufferOrErr =
+          MemoryBuffer::getFile(Filename);
+      error(BufferOrErr, "error loading file '" + Filename + "'");
+      auto Buffer = std::move(BufferOrErr.get());
+      LLVMContext Ctx;
+      if (llvm::isBitcodeContainingObjCCategory(*Buffer, Ctx))
+        outs() << "Bitcode " << Filename << " contains ObjC\n";
+      else
+        outs() << "Bitcode " << Filename << " does not contain ObjC\n";
+    }
     return 0;
   }
 

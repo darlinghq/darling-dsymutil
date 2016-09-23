@@ -92,6 +92,10 @@ namespace opts {
     cl::desc("Alias for --relocations"),
     cl::aliasopt(Relocations));
 
+  // -notes, -n
+  cl::opt<bool> Notes("notes", cl::desc("Display the ELF notes in the file"));
+  cl::alias NotesShort("n", cl::desc("Alias for --notes"), cl::aliasopt(Notes));
+
   // -dyn-relocations
   cl::opt<bool> DynRelocs("dyn-relocations",
     cl::desc("Display the dynamic relocation entries in the file"));
@@ -120,6 +124,8 @@ namespace opts {
   // -dynamic-table
   cl::opt<bool> DynamicTable("dynamic-table",
     cl::desc("Display the ELF .dynamic section table"));
+  cl::alias DynamicTableShort("d", cl::desc("Alias for --dynamic-table"),
+                              cl::aliasopt(DynamicTable));
 
   // -needed-libs
   cl::opt<bool> NeededLibraries("needed-libs",
@@ -128,6 +134,8 @@ namespace opts {
   // -program-headers
   cl::opt<bool> ProgramHeaders("program-headers",
     cl::desc("Display ELF program headers"));
+  cl::alias ProgramHeadersShort("l", cl::desc("Alias for --program-headers"),
+                                cl::aliasopt(ProgramHeaders));
 
   // -hash-table
   cl::opt<bool> HashTable("hash-table",
@@ -268,10 +276,16 @@ LLVM_ATTRIBUTE_NORETURN void reportError(Twine Msg) {
   exit(1);
 }
 
+void error(Error EC) {
+  if (!EC)
+    return;
+  handleAllErrors(std::move(EC),
+                  [&](const ErrorInfoBase &EI) { reportError(EI.message()); });
+}
+
 void error(std::error_code EC) {
   if (!EC)
     return;
-
   reportError(EC.message());
 }
 
@@ -295,6 +309,17 @@ static void reportError(StringRef Input, StringRef Message) {
   reportError(Twine(Input) + ": " + Message);
 }
 
+static void reportError(StringRef Input, Error Err) {
+  if (Input == "-")
+    Input = "<stdin>";
+  std::string ErrMsg;
+  {
+    raw_string_ostream ErrStream(ErrMsg);
+    logAllUnhandledErrors(std::move(Err), ErrStream, Input + ": ");
+  }
+  reportError(ErrMsg);
+}
+
 static bool isMipsArch(unsigned Arch) {
   switch (Arch) {
   case llvm::Triple::mips:
@@ -306,8 +331,15 @@ static bool isMipsArch(unsigned Arch) {
     return false;
   }
 }
+namespace {
+struct TypeTableBuilder {
+  TypeTableBuilder() : Allocator(), Builder(Allocator) {}
 
-static llvm::codeview::MemoryTypeTableBuilder CVTypes;
+  llvm::BumpPtrAllocator Allocator;
+  llvm::codeview::MemoryTypeTableBuilder Builder;
+};
+}
+static TypeTableBuilder CVTypes;
 
 /// @brief Creates an format-specific object file dumper.
 static std::error_code createDumper(const ObjectFile *Obj,
@@ -387,6 +419,8 @@ static void dumpObject(const ObjectFile *Obj) {
       Dumper->printGroupSections();
     if (opts::HashHistogram)
       Dumper->printHashHistogram();
+    if (opts::Notes)
+      Dumper->printNotes();
   }
   if (Obj->isCOFF()) {
     if (opts::COFFImports)
@@ -402,7 +436,7 @@ static void dumpObject(const ObjectFile *Obj) {
     if (opts::CodeView)
       Dumper->printCodeViewDebugInfo();
     if (opts::CodeViewMergedTypes)
-      Dumper->mergeCodeViewTypes(CVTypes);
+      Dumper->mergeCodeViewTypes(CVTypes.Builder);
   }
   if (Obj->isMachO()) {
     if (opts::MachODataInCode)
@@ -424,10 +458,8 @@ static void dumpObject(const ObjectFile *Obj) {
 
 /// @brief Dumps each object file in \a Arc;
 static void dumpArchive(const Archive *Arc) {
-  for (auto &ErrorOrChild : Arc->children()) {
-    if (std::error_code EC = ErrorOrChild.getError())
-      reportError(Arc->getFileName(), EC.message());
-    const auto &Child = *ErrorOrChild;
+  Error Err;
+  for (auto &Child : Arc->children(Err)) {
     Expected<std::unique_ptr<Binary>> ChildOrErr = Child.getAsBinary();
     if (!ChildOrErr) {
       if (auto E = isNotObjectErrorInvalidFileType(ChildOrErr.takeError())) {
@@ -441,9 +473,13 @@ static void dumpArchive(const Archive *Arc) {
     }
     if (ObjectFile *Obj = dyn_cast<ObjectFile>(&*ChildOrErr.get()))
       dumpObject(Obj);
+    else if (COFFImportFile *Imp = dyn_cast<COFFImportFile>(&*ChildOrErr.get()))
+      dumpCOFFImportFile(Imp);
     else
       reportError(Arc->getFileName(), readobj_error::unrecognized_file_format);
   }
+  if (Err)
+    reportError(Arc->getFileName(), std::move(Err));
 }
 
 /// @brief Dumps each object file in \a MachO Universal Binary;
@@ -459,7 +495,7 @@ static void dumpMachOUniversalBinary(const MachOUniversalBinary *UBinary) {
       OS.flush();
       reportError(UBinary->getFileName(), Buf);
     }
-    else if (ErrorOr<std::unique_ptr<Archive>> AOrErr = Obj.getAsArchive())
+    else if (Expected<std::unique_ptr<Archive>> AOrErr = Obj.getAsArchive())
       dumpArchive(&*AOrErr.get());
   }
 }
@@ -505,7 +541,7 @@ int main(int argc, const char *argv[]) {
 
   if (opts::CodeViewMergedTypes) {
     ScopedPrinter W(outs());
-    dumpCodeViewMergedTypes(W, CVTypes);
+    dumpCodeViewMergedTypes(W, CVTypes.Builder);
   }
 
   return 0;

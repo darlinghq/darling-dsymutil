@@ -91,7 +91,7 @@ int llvm::getNextAvailablePluginDiagnosticKind() {
   return ++PluginKindID;
 }
 
-const char *DiagnosticInfo::AlwaysPrint = "";
+const char *DiagnosticInfoOptimizationRemarkAnalysis::AlwaysPrint = "";
 
 DiagnosticInfoInlineAsm::DiagnosticInfoInlineAsm(const Instruction &I,
                                                  const Twine &MsgStr,
@@ -172,6 +172,8 @@ const std::string DiagnosticInfoWithDebugLocBase::getLocationStr() const {
 
 void DiagnosticInfoOptimizationBase::print(DiagnosticPrinter &DP) const {
   DP << getLocationStr() << ": " << getMsg();
+  if (Hotness)
+    DP << " (hotness: " << *Hotness << ")";
 }
 
 bool DiagnosticInfoOptimizationRemark::isEnabled() const {
@@ -185,7 +187,7 @@ bool DiagnosticInfoOptimizationRemarkMissed::isEnabled() const {
 }
 
 bool DiagnosticInfoOptimizationRemarkAnalysis::isEnabled() const {
-  return getPassName() == DiagnosticInfo::AlwaysPrint ||
+  return shouldAlwaysPrint() ||
          (PassRemarksAnalysisOptLoc.Pattern &&
           PassRemarksAnalysisOptLoc.Pattern->match(getPassName()));
 }
@@ -259,4 +261,8 @@ void llvm::emitLoopInterleaveWarning(LLVMContext &Ctx, const Function &Fn,
                                      const DebugLoc &DLoc, const Twine &Msg) {
   Ctx.diagnose(DiagnosticInfoOptimizationFailure(
       Fn, DLoc, Twine("loop not interleaved: " + Msg)));
+}
+
+void DiagnosticInfoISelFallback::print(DiagnosticPrinter &DP) const {
+  DP << "Instruction selection used fallback path for " << getFunction();
 }

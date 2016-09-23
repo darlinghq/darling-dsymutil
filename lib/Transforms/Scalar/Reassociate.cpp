@@ -145,8 +145,7 @@ static BinaryOperator *isReassociableOp(Value *V, unsigned Opcode1,
   return nullptr;
 }
 
-void ReassociatePass::BuildRankMap(
-    Function &F, ReversePostOrderTraversal<Function *> &RPOT) {
+void ReassociatePass::BuildRankMap(Function &F) {
   unsigned i = 2;
 
   // Assign distinct ranks to function arguments.
@@ -155,17 +154,16 @@ void ReassociatePass::BuildRankMap(
     DEBUG(dbgs() << "Calculated Rank[" << I->getName() << "] = " << i << "\n");
   }
 
-  for (ReversePostOrderTraversal<Function*>::rpo_iterator I = RPOT.begin(),
-         E = RPOT.end(); I != E; ++I) {
-    BasicBlock *BB = *I;
+  ReversePostOrderTraversal<Function *> RPOT(&F);
+  for (BasicBlock *BB : RPOT) {
     unsigned BBRank = RankMap[BB] = ++i << 16;
 
     // Walk the basic block, adding precomputed ranks for any instructions that
     // we cannot move.  This ensures that the ranks for these instructions are
     // all different in the block.
-    for (BasicBlock::iterator I = BB->begin(), E = BB->end(); I != E; ++I)
-      if (mayBeMemoryDependent(*I))
-        ValueRankMap[&*I] = ++BBRank;
+    for (Instruction &I : *BB)
+      if (mayBeMemoryDependent(I))
+        ValueRankMap[&I] = ++BBRank;
   }
 }
 
@@ -1865,6 +1863,8 @@ void ReassociatePass::RecursivelyEraseDeadInsts(
 /// Zap the given instruction, adding interesting operands to the work list.
 void ReassociatePass::EraseInst(Instruction *I) {
   assert(isInstructionTriviallyDead(I) && "Trivially dead instructions only!");
+  DEBUG(dbgs() << "Erasing dead inst: "; I->dump());
+
   SmallVector<Value*, 8> Ops(I->op_begin(), I->op_end());
   // Erase the dead instruction.
   ValueRankMap.erase(I);
@@ -2174,28 +2174,13 @@ void ReassociatePass::ReassociateExpression(BinaryOperator *I) {
 }
 
 PreservedAnalyses ReassociatePass::run(Function &F, FunctionAnalysisManager &) {
-  // Reassociate needs for each instruction to have its operands already
-  // processed, so we first perform a RPOT of the basic blocks so that
-  // when we process a basic block, all its dominators have been processed
-  // before.
-  ReversePostOrderTraversal<Function *> RPOT(&F);
-  BuildRankMap(F, RPOT);
+  // Calculate the rank map for F.
+  BuildRankMap(F);
 
   MadeChange = false;
-  for (BasicBlock *BI : RPOT) {
-    // Use a worklist to keep track of which instructions have been processed
-    // (and which insts won't be optimized again) so when redoing insts,
-    // optimize insts rightaway which won't be processed later.
-    SmallSet<Instruction *, 8> Worklist;
-
-    // Insert all instructions in the BB
-    for (Instruction &I : *BI)
-      Worklist.insert(&I);
-
+  for (Function::iterator BI = F.begin(), BE = F.end(); BI != BE; ++BI) {
     // Optimize every instruction in the basic block.
-    for (BasicBlock::iterator II = BI->begin(), IE = BI->end(); II != IE;) {
-      // This instruction has been processed.
-      Worklist.erase(&*II);
+    for (BasicBlock::iterator II = BI->begin(), IE = BI->end(); II != IE;)
       if (isInstructionTriviallyDead(&*II)) {
         EraseInst(&*II++);
       } else {
@@ -2204,22 +2189,27 @@ PreservedAnalyses ReassociatePass::run(Function &F, FunctionAnalysisManager &) {
         ++II;
       }
 
-      // If the above optimizations produced new instructions to optimize or
-      // made modifications which need to be redone, do them now if they won't
-      // be handled later.
-      while (!RedoInsts.empty()) {
-        Instruction *I = RedoInsts.pop_back_val();
-        // Process instructions that won't be processed later, either
-        // inside the block itself or in another basic block (based on rank),
-        // since these will be processed later.
-        if ((I->getParent() != BI || !Worklist.count(I)) &&
-            RankMap[I->getParent()] <= RankMap[BI]) {
-          if (isInstructionTriviallyDead(I))
-            EraseInst(I);
-          else
-            OptimizeInst(I);
-        }
-      }
+    // Make a copy of all the instructions to be redone so we can remove dead
+    // instructions.
+    SetVector<AssertingVH<Instruction>> ToRedo(RedoInsts);
+    // Iterate over all instructions to be reevaluated and remove trivially dead
+    // instructions. If any operand of the trivially dead instruction becomes
+    // dead mark it for deletion as well. Continue this process until all
+    // trivially dead instructions have been removed.
+    while (!ToRedo.empty()) {
+      Instruction *I = ToRedo.pop_back_val();
+      if (isInstructionTriviallyDead(I))
+        RecursivelyEraseDeadInsts(I, ToRedo);
+    }
+
+    // Now that we have removed dead instructions, we can reoptimize the
+    // remaining instructions.
+    while (!RedoInsts.empty()) {
+      Instruction *I = RedoInsts.pop_back_val();
+      if (isInstructionTriviallyDead(I))
+        EraseInst(I);
+      else
+        OptimizeInst(I);
     }
   }
 
@@ -2228,8 +2218,7 @@ PreservedAnalyses ReassociatePass::run(Function &F, FunctionAnalysisManager &) {
   ValueRankMap.clear();
 
   if (MadeChange) {
-    // FIXME: Reassociate should also 'preserve the CFG'.
-    // The new pass manager has currently no way to do it.
+    // FIXME: This should also 'preserve the CFG'.
     auto PA = PreservedAnalyses();
     PA.preserve<GlobalsAA>();
     return PA;

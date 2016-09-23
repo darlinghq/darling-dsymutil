@@ -675,7 +675,7 @@ class TEQI_FM_MM<bits<5> funct> : MMArch {
   let Inst{15-0}  = imm16;
 }
 
-class LL_FM_MM<bits<4> funct> {
+class LL_FM_MM<bits<4> funct> : MMArch {
   bits<5> rt;
   bits<21> addr;
 
@@ -1022,4 +1022,17 @@ class ADDIUPC_FM_MM {
   let Inst{31-26} = 0x1e;
   let Inst{25-23} = rs;
   let Inst{22-0} = imm;
+}
+
+class POOL32A_CFTC2_FM_MM<bits<10> funct> : MMArch {
+  bits<5> rt;
+  bits<5> impl;
+
+  bits<32> Inst;
+
+  let Inst{31-26} = 0b000000;
+  let Inst{25-21} = rt;
+  let Inst{20-16} = impl;
+  let Inst{15-6}  = funct;
+  let Inst{5-0}   = 0b111100;
 }

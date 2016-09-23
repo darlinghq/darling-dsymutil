@@ -49,6 +49,7 @@ static cl::opt<unsigned> DefaultRotationThreshold(
 
 STATISTIC(NumRotated, "Number of loops rotated");
 
+namespace {
 /// A simple loop rotation transformation.
 class LoopRotate {
   const unsigned MaxHeaderSize;
@@ -70,6 +71,7 @@ private:
   bool rotateLoop(Loop *L, bool SimplifiedLatch);
   bool simplifyLoopLatch(Loop *L);
 };
+} // end anonymous namespace
 
 /// RewriteUsesOfClonedInstructions - We just cloned the instructions from the
 /// old header into the preheader.  If there were uses of the values produced by
@@ -397,18 +399,17 @@ bool LoopRotate::rotateLoop(Loop *L, bool SimplifiedLatch) {
     // be split.
     SmallVector<BasicBlock *, 4> ExitPreds(pred_begin(Exit), pred_end(Exit));
     bool SplitLatchEdge = false;
-    for (SmallVectorImpl<BasicBlock *>::iterator PI = ExitPreds.begin(),
-                                                 PE = ExitPreds.end();
-         PI != PE; ++PI) {
+    for (BasicBlock *ExitPred : ExitPreds) {
       // We only need to split loop exit edges.
-      Loop *PredLoop = LI->getLoopFor(*PI);
+      Loop *PredLoop = LI->getLoopFor(ExitPred);
       if (!PredLoop || PredLoop->contains(Exit))
         continue;
-      if (isa<IndirectBrInst>((*PI)->getTerminator()))
+      if (isa<IndirectBrInst>(ExitPred->getTerminator()))
         continue;
-      SplitLatchEdge |= L->getLoopLatch() == *PI;
+      SplitLatchEdge |= L->getLoopLatch() == ExitPred;
       BasicBlock *ExitSplit = SplitCriticalEdge(
-          *PI, Exit, CriticalEdgeSplittingOptions(DT, LI).setPreserveLCSSA());
+          ExitPred, Exit,
+          CriticalEdgeSplittingOptions(DT, LI).setPreserveLCSSA());
       ExitSplit->moveBefore(Exit);
     }
     assert(SplitLatchEdge &&
@@ -500,7 +501,8 @@ static bool shouldSpeculateInstrs(BasicBlock::iterator Begin,
       // GEPs are cheap if all indices are constant.
       if (!cast<GEPOperator>(I)->hasAllConstantIndices())
         return false;
-    // fall-thru to increment case
+      // fall-thru to increment case
+      LLVM_FALLTHROUGH;
     case Instruction::Add:
     case Instruction::Sub:
     case Instruction::And:
@@ -618,7 +620,7 @@ bool LoopRotate::processLoop(Loop *L) {
 
 LoopRotatePass::LoopRotatePass() {}
 
-PreservedAnalyses LoopRotatePass::run(Loop &L, AnalysisManager<Loop> &AM) {
+PreservedAnalyses LoopRotatePass::run(Loop &L, LoopAnalysisManager &AM) {
   auto &FAM = AM.getResult<FunctionAnalysisManagerLoopProxy>(L).getManager();
   Function *F = L.getHeader()->getParent();
 

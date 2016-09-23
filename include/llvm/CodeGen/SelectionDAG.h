@@ -81,24 +81,10 @@ template<> struct FoldingSetTrait<SDVTListNode> : DefaultFoldingSetTrait<SDVTLis
   }
 };
 
-template<> struct ilist_traits<SDNode> : public ilist_default_traits<SDNode> {
-private:
-  mutable ilist_half_node<SDNode> Sentinel;
-public:
-  SDNode *createSentinel() const {
-    return static_cast<SDNode*>(&Sentinel);
-  }
-  static void destroySentinel(SDNode *) {}
-
-  SDNode *provideInitialHead() const { return createSentinel(); }
-  SDNode *ensureHead(SDNode*) const { return createSentinel(); }
-  static void noteHead(SDNode*, SDNode*) {}
-
+template <> struct ilist_alloc_traits<SDNode> {
   static void deleteNode(SDNode *) {
     llvm_unreachable("ilist_traits<SDNode> shouldn't see a deleteNode call!");
   }
-private:
-  static void createNode(const SDNode &);
 };
 
 /// Keeps track of dbg_value information through SDISel.  We do
@@ -282,6 +268,22 @@ private:
   SDNodeT *newSDNode(ArgTypes &&... Args) {
     return new (NodeAllocator.template Allocate<SDNodeT>())
         SDNodeT(std::forward<ArgTypes>(Args)...);
+  }
+
+  /// Build a synthetic SDNodeT with the given args and extract its subclass
+  /// data as an integer (e.g. for use in a folding set).
+  ///
+  /// The args to this function are the same as the args to SDNodeT's
+  /// constructor, except the second arg (assumed to be a const DebugLoc&) is
+  /// omitted.
+  template <typename SDNodeT, typename... ArgTypes>
+  static uint16_t getSyntheticNodeSubclassData(unsigned IROrder,
+                                               ArgTypes &&... Args) {
+    // The compiler can reduce this expression to a constant iff we pass an
+    // empty DebugLoc.  Thankfully, the debug location doesn't have any bearing
+    // on the subclass data.
+    return SDNodeT(IROrder, DebugLoc(), std::forward<ArgTypes>(Args)...)
+        .getRawSubclassData();
   }
 
   void createOperands(SDNode *Node, ArrayRef<SDValue> Vals) {
@@ -634,13 +636,7 @@ public:
   /// which must be a vector type, must match the number of mask elements
   /// NumElts. An integer mask element equal to -1 is treated as undefined.
   SDValue getVectorShuffle(EVT VT, const SDLoc &dl, SDValue N1, SDValue N2,
-                           const int *MaskElts);
-  SDValue getVectorShuffle(EVT VT, const SDLoc &dl, SDValue N1, SDValue N2,
-                           ArrayRef<int> MaskElts) {
-    assert(VT.getVectorNumElements() == MaskElts.size() &&
-           "Must have the same number of vector elements as mask elements!");
-    return getVectorShuffle(VT, dl, N1, N2, MaskElts.data());
-  }
+                           ArrayRef<int> Mask);
 
   /// Return an ISD::BUILD_VECTOR node. The number of elements in VT,
   /// which must be a vector type, must match the number of operands in Ops.
@@ -667,11 +663,6 @@ public:
 
     SmallVector<SDValue, 16> Ops(VT.getVectorNumElements(), Op);
     return getNode(ISD::BUILD_VECTOR, DL, VT, Ops);
-  }
-
-  /// Return a splat ISD::BUILD_VECTOR node, but with Op's SDLoc.
-  SDValue getSplatBuildVector(EVT VT, SDValue Op) {
-    return getSplatBuildVector(VT, SDLoc(Op), Op);
   }
 
   /// \brief Returns an ISD::VECTOR_SHUFFLE node semantically equivalent to
@@ -918,18 +909,21 @@ public:
   /// Loads are not normal binary operators: their result type is not
   /// determined by their operands, and they produce a value AND a token chain.
   ///
+  /// This function will set the MOLoad flag on MMOFlags, but you can set it if
+  /// you want.  The MOStore flag must not be set.
   SDValue getLoad(EVT VT, const SDLoc &dl, SDValue Chain, SDValue Ptr,
-                  MachinePointerInfo PtrInfo, bool isVolatile,
-                  bool isNonTemporal, bool isInvariant, unsigned Alignment,
+                  MachinePointerInfo PtrInfo, unsigned Alignment = 0,
+                  MachineMemOperand::Flags MMOFlags = MachineMemOperand::MONone,
                   const AAMDNodes &AAInfo = AAMDNodes(),
                   const MDNode *Ranges = nullptr);
   SDValue getLoad(EVT VT, const SDLoc &dl, SDValue Chain, SDValue Ptr,
                   MachineMemOperand *MMO);
-  SDValue getExtLoad(ISD::LoadExtType ExtType, const SDLoc &dl, EVT VT,
-                     SDValue Chain, SDValue Ptr, MachinePointerInfo PtrInfo,
-                     EVT MemVT, bool isVolatile, bool isNonTemporal,
-                     bool isInvariant, unsigned Alignment,
-                     const AAMDNodes &AAInfo = AAMDNodes());
+  SDValue
+  getExtLoad(ISD::LoadExtType ExtType, const SDLoc &dl, EVT VT, SDValue Chain,
+             SDValue Ptr, MachinePointerInfo PtrInfo, EVT MemVT,
+             unsigned Alignment = 0,
+             MachineMemOperand::Flags MMOFlags = MachineMemOperand::MONone,
+             const AAMDNodes &AAInfo = AAMDNodes());
   SDValue getExtLoad(ISD::LoadExtType ExtType, const SDLoc &dl, EVT VT,
                      SDValue Chain, SDValue Ptr, EVT MemVT,
                      MachineMemOperand *MMO);
@@ -937,8 +931,8 @@ public:
                          SDValue Offset, ISD::MemIndexedMode AM);
   SDValue getLoad(ISD::MemIndexedMode AM, ISD::LoadExtType ExtType, EVT VT,
                   const SDLoc &dl, SDValue Chain, SDValue Ptr, SDValue Offset,
-                  MachinePointerInfo PtrInfo, EVT MemVT, bool isVolatile,
-                  bool isNonTemporal, bool isInvariant, unsigned Alignment,
+                  MachinePointerInfo PtrInfo, EVT MemVT, unsigned Alignment = 0,
+                  MachineMemOperand::Flags MMOFlags = MachineMemOperand::MONone,
                   const AAMDNodes &AAInfo = AAMDNodes(),
                   const MDNode *Ranges = nullptr);
   SDValue getLoad(ISD::MemIndexedMode AM, ISD::LoadExtType ExtType, EVT VT,
@@ -946,16 +940,21 @@ public:
                   EVT MemVT, MachineMemOperand *MMO);
 
   /// Helper function to build ISD::STORE nodes.
-  SDValue getStore(SDValue Chain, const SDLoc &dl, SDValue Val, SDValue Ptr,
-                   MachinePointerInfo PtrInfo, bool isVolatile,
-                   bool isNonTemporal, unsigned Alignment,
-                   const AAMDNodes &AAInfo = AAMDNodes());
+  ///
+  /// This function will set the MOStore flag on MMOFlags, but you can set it if
+  /// you want.  The MOLoad and MOInvariant flags must not be set.
+  SDValue
+  getStore(SDValue Chain, const SDLoc &dl, SDValue Val, SDValue Ptr,
+           MachinePointerInfo PtrInfo, unsigned Alignment = 0,
+           MachineMemOperand::Flags MMOFlags = MachineMemOperand::MONone,
+           const AAMDNodes &AAInfo = AAMDNodes());
   SDValue getStore(SDValue Chain, const SDLoc &dl, SDValue Val, SDValue Ptr,
                    MachineMemOperand *MMO);
-  SDValue getTruncStore(SDValue Chain, const SDLoc &dl, SDValue Val,
-                        SDValue Ptr, MachinePointerInfo PtrInfo, EVT TVT,
-                        bool isNonTemporal, bool isVolatile, unsigned Alignment,
-                        const AAMDNodes &AAInfo = AAMDNodes());
+  SDValue
+  getTruncStore(SDValue Chain, const SDLoc &dl, SDValue Val, SDValue Ptr,
+                MachinePointerInfo PtrInfo, EVT TVT, unsigned Alignment = 0,
+                MachineMemOperand::Flags MMOFlags = MachineMemOperand::MONone,
+                const AAMDNodes &AAInfo = AAMDNodes());
   SDValue getTruncStore(SDValue Chain, const SDLoc &dl, SDValue Val,
                         SDValue Ptr, EVT TVT, MachineMemOperand *MMO);
   SDValue getIndexedStore(SDValue OrigStoe, const SDLoc &dl, SDValue Base,
@@ -1241,13 +1240,12 @@ public:
 
   void dump() const;
 
-  /// Create a stack temporary, suitable for holding the
-  /// specified value type.  If minAlign is specified, the slot size will have
-  /// at least that alignment.
+  /// Create a stack temporary, suitable for holding the specified value type.
+  /// If minAlign is specified, the slot size will have at least that alignment.
   SDValue CreateStackTemporary(EVT VT, unsigned minAlign = 1);
 
-  /// Create a stack temporary suitable for holding
-  /// either of the specified value types.
+  /// Create a stack temporary suitable for holding either of the specified
+  /// value types.
   SDValue CreateStackTemporary(EVT VT1, EVT VT2);
 
   SDValue FoldSymbolOffset(unsigned Opcode, EVT VT,
@@ -1291,27 +1289,27 @@ public:
   /// is set.
   bool isKnownToBeAPowerOfTwo(SDValue Val) const;
 
-  /// Return the number of times the sign bit of the
-  /// register is replicated into the other bits.  We know that at least 1 bit
-  /// is always equal to the sign bit (itself), but other cases can give us
-  /// information.  For example, immediately after an "SRA X, 2", we know that
-  /// the top 3 bits are all equal to each other, so we return 3.  Targets can
-  /// implement the ComputeNumSignBitsForTarget method in the TargetLowering
-  /// class to allow target nodes to be understood.
+  /// Return the number of times the sign bit of the register is replicated into
+  /// the other bits. We know that at least 1 bit is always equal to the sign
+  /// bit (itself), but other cases can give us information. For example,
+  /// immediately after an "SRA X, 2", we know that the top 3 bits are all equal
+  /// to each other, so we return 3. Targets can implement the
+  /// ComputeNumSignBitsForTarget method in the TargetLowering class to allow
+  /// target nodes to be understood.
   unsigned ComputeNumSignBits(SDValue Op, unsigned Depth = 0) const;
 
-  /// Return true if the specified operand is an
-  /// ISD::ADD with a ConstantSDNode on the right-hand side, or if it is an
-  /// ISD::OR with a ConstantSDNode that is guaranteed to have the same
-  /// semantics as an ADD.  This handles the equivalence:
+  /// Return true if the specified operand is an ISD::ADD with a ConstantSDNode
+  /// on the right-hand side, or if it is an ISD::OR with a ConstantSDNode that
+  /// is guaranteed to have the same semantics as an ADD. This handles the
+  /// equivalence:
   ///     X|Cst == X+Cst iff X&Cst = 0.
   bool isBaseWithConstantOffset(SDValue Op) const;
 
   /// Test whether the given SDValue is known to never be NaN.
   bool isKnownNeverNaN(SDValue Op) const;
 
-  /// Test whether the given SDValue is known to never be
-  /// positive or negative Zero.
+  /// Test whether the given SDValue is known to never be positive or negative
+  /// zero.
   bool isKnownNeverZero(SDValue Op) const;
 
   /// Test whether two SDValues are known to compare equal. This
@@ -1370,6 +1368,7 @@ public:
   void ExtractVectorElements(SDValue Op, SmallVectorImpl<SDValue> &Args,
                              unsigned Start = 0, unsigned Count = 0);
 
+  /// Compute the default alignment value for the given type.
   unsigned getEVTAlignment(EVT MemoryVT) const;
 
   /// Test whether the given value is a constant int or similar node.
@@ -1422,12 +1421,12 @@ private:
 };
 
 template <> struct GraphTraits<SelectionDAG*> : public GraphTraits<SDNode*> {
-  typedef SelectionDAG::allnodes_iterator nodes_iterator;
+  typedef pointer_iterator<SelectionDAG::allnodes_iterator> nodes_iterator;
   static nodes_iterator nodes_begin(SelectionDAG *G) {
-    return G->allnodes_begin();
+    return nodes_iterator(G->allnodes_begin());
   }
   static nodes_iterator nodes_end(SelectionDAG *G) {
-    return G->allnodes_end();
+    return nodes_iterator(G->allnodes_end());
   }
 };
 

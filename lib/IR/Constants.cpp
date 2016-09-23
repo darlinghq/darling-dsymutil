@@ -347,10 +347,8 @@ static bool canTrapImpl(const Constant *C,
     return false;
   case Instruction::UDiv:
   case Instruction::SDiv:
-  case Instruction::FDiv:
   case Instruction::URem:
   case Instruction::SRem:
-  case Instruction::FRem:
     // Div and rem can trap if the RHS is not known to be non-zero.
     if (!isa<ConstantInt>(CE->getOperand(1)) ||CE->getOperand(1)->isNullValue())
       return true;
@@ -2331,8 +2329,8 @@ const char *ConstantDataSequential::getElementPointer(unsigned Elt) const {
 
 /// Return true if the array is empty or all zeros.
 static bool isAllZeros(StringRef Arr) {
-  for (StringRef::iterator I = Arr.begin(), E = Arr.end(); I != E; ++I)
-    if (*I != 0)
+  for (char I : Arr)
+    if (I != 0)
       return false;
   return true;
 }

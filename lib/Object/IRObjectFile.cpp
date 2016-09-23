@@ -38,20 +38,17 @@ using namespace object;
 IRObjectFile::IRObjectFile(MemoryBufferRef Object, std::unique_ptr<Module> Mod)
     : SymbolicFile(Binary::ID_IR, Object), M(std::move(Mod)) {
   Mang.reset(new Mangler());
-  CollectAsmUndefinedRefs(
-      Triple(M->getTargetTriple()), M->getModuleInlineAsm(),
-      [this](StringRef Name, BasicSymbolRef::Flags Flags) {
-        AsmSymbols.push_back(
-            std::make_pair<std::string, uint32_t>(Name, std::move(Flags)));
-      });
+  CollectAsmUndefinedRefs(Triple(M->getTargetTriple()), M->getModuleInlineAsm(),
+                          [this](StringRef Name, BasicSymbolRef::Flags Flags) {
+                            AsmSymbols.emplace_back(Name, std::move(Flags));
+                          });
 }
 
 // Parse inline ASM and collect the list of symbols that are not defined in
 // the current module. This is inspired from IRObjectFile.
 void IRObjectFile::CollectAsmUndefinedRefs(
     const Triple &TT, StringRef InlineAsm,
-    const std::function<void(StringRef, BasicSymbolRef::Flags)> &
-        AsmUndefinedRefs) {
+    function_ref<void(StringRef, BasicSymbolRef::Flags)> AsmUndefinedRefs) {
   if (InlineAsm.empty())
     return;
 
@@ -105,7 +102,7 @@ void IRObjectFile::CollectAsmUndefinedRefs(
     uint32_t Res = BasicSymbolRef::SF_None;
     switch (Value) {
     case RecordStreamer::NeverSeen:
-      llvm_unreachable("foo");
+      llvm_unreachable("NeverSeen should have been replaced earlier");
     case RecordStreamer::DefinedGlobal:
       Res |= BasicSymbolRef::SF_Global;
       break;
@@ -116,10 +113,13 @@ void IRObjectFile::CollectAsmUndefinedRefs(
       Res |= BasicSymbolRef::SF_Undefined;
       Res |= BasicSymbolRef::SF_Global;
       break;
-    case RecordStreamer::GlobalWeak:
+    case RecordStreamer::DefinedWeak:
       Res |= BasicSymbolRef::SF_Weak;
       Res |= BasicSymbolRef::SF_Global;
       break;
+    case RecordStreamer::UndefinedWeak:
+      Res |= BasicSymbolRef::SF_Weak;
+      Res |= BasicSymbolRef::SF_Undefined;
     }
     AsmUndefinedRefs(Key, BasicSymbolRef::Flags(Res));
   }
@@ -327,5 +327,5 @@ llvm::object::IRObjectFile::create(MemoryBufferRef Object,
     return EC;
 
   std::unique_ptr<Module> &M = MOrErr.get();
-  return llvm::make_unique<IRObjectFile>(Object, std::move(M));
+  return llvm::make_unique<IRObjectFile>(BCOrErr.get(), std::move(M));
 }

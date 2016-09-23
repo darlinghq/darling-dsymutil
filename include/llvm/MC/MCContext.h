@@ -16,7 +16,6 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/Twine.h"
-#include "llvm/MC/MCCodeView.h"
 #include "llvm/MC/MCDwarf.h"
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/SectionKind.h"
@@ -140,10 +139,6 @@ namespace llvm {
     /// The current dwarf line information from the last dwarf .loc directive.
     MCDwarfLoc CurrentDwarfLoc;
     bool DwarfLocSeen;
-
-    /// The current CodeView line information from the last .cv_loc directive.
-    MCCVLoc CurrentCVLoc = MCCVLoc(0, 0, 0, 0, false, true);
-    bool CVLocSeen = false;
 
     /// Generate dwarf debugging info for assembly source files.
     bool GenDwarfForAssembly;
@@ -339,48 +334,56 @@ namespace llvm {
                              BeginSymName);
     }
 
-    MCSectionELF *getELFSection(StringRef Section, unsigned Type,
+    MCSectionELF *getELFSection(const Twine &Section, unsigned Type,
                                 unsigned Flags) {
       return getELFSection(Section, Type, Flags, nullptr);
     }
 
-    MCSectionELF *getELFSection(StringRef Section, unsigned Type,
+    MCSectionELF *getELFSection(const Twine &Section, unsigned Type,
                                 unsigned Flags, const char *BeginSymName) {
       return getELFSection(Section, Type, Flags, 0, "", BeginSymName);
     }
 
-    MCSectionELF *getELFSection(StringRef Section, unsigned Type,
+    MCSectionELF *getELFSection(const Twine &Section, unsigned Type,
                                 unsigned Flags, unsigned EntrySize,
-                                StringRef Group) {
+                                const Twine &Group) {
       return getELFSection(Section, Type, Flags, EntrySize, Group, nullptr);
     }
 
-    MCSectionELF *getELFSection(StringRef Section, unsigned Type,
+    MCSectionELF *getELFSection(const Twine &Section, unsigned Type,
                                 unsigned Flags, unsigned EntrySize,
-                                StringRef Group, const char *BeginSymName) {
+                                const Twine &Group, const char *BeginSymName) {
       return getELFSection(Section, Type, Flags, EntrySize, Group, ~0,
                            BeginSymName);
     }
 
-    MCSectionELF *getELFSection(StringRef Section, unsigned Type,
+    MCSectionELF *getELFSection(const Twine &Section, unsigned Type,
                                 unsigned Flags, unsigned EntrySize,
-                                StringRef Group, unsigned UniqueID) {
+                                const Twine &Group, unsigned UniqueID) {
       return getELFSection(Section, Type, Flags, EntrySize, Group, UniqueID,
                            nullptr);
     }
 
-    MCSectionELF *getELFSection(StringRef Section, unsigned Type,
+    MCSectionELF *getELFSection(const Twine &Section, unsigned Type,
                                 unsigned Flags, unsigned EntrySize,
-                                StringRef Group, unsigned UniqueID,
+                                const Twine &Group, unsigned UniqueID,
                                 const char *BeginSymName);
 
-    MCSectionELF *getELFSection(StringRef Section, unsigned Type,
+    MCSectionELF *getELFSection(const Twine &Section, unsigned Type,
                                 unsigned Flags, unsigned EntrySize,
                                 const MCSymbolELF *Group, unsigned UniqueID,
                                 const char *BeginSymName,
                                 const MCSectionELF *Associated);
 
-    MCSectionELF *createELFRelSection(StringRef Name, unsigned Type,
+    /// Get a section with the provided group identifier. This section is
+    /// named by concatenating \p Prefix with '.' then \p Suffix. The \p Type
+    /// describes the type of the section and \p Flags are used to further
+    /// configure this named section.
+    MCSectionELF *getELFNamedSection(const Twine &Prefix, const Twine &Suffix,
+                                     unsigned Type, unsigned Flags,
+                                     unsigned EntrySize = 0);
+
+    MCSectionELF *createELFRelSection(const Twine &Name, unsigned Type,
                                       unsigned Flags, unsigned EntrySize,
                                       const MCSymbolELF *Group,
                                       const MCSectionELF *Associated);
@@ -524,35 +527,6 @@ namespace llvm {
     void setDwarfVersion(uint16_t v) { DwarfVersion = v; }
     uint16_t getDwarfVersion() const { return DwarfVersion; }
 
-    /// @}
-
-
-    /// \name CodeView Management
-    /// @{
-
-    /// Creates an entry in the cv file table.
-    unsigned getCVFile(StringRef FileName, unsigned FileNumber);
-
-    /// Saves the information from the currently parsed .cv_loc directive
-    /// and sets CVLocSeen.  When the next instruction is assembled an entry
-    /// in the line number table with this information and the address of the
-    /// instruction will be created.
-    void setCurrentCVLoc(unsigned FunctionId, unsigned FileNo, unsigned Line,
-                         unsigned Column, bool PrologueEnd, bool IsStmt) {
-      CurrentCVLoc.setFunctionId(FunctionId);
-      CurrentCVLoc.setFileNum(FileNo);
-      CurrentCVLoc.setLine(Line);
-      CurrentCVLoc.setColumn(Column);
-      CurrentCVLoc.setPrologueEnd(PrologueEnd);
-      CurrentCVLoc.setIsStmt(IsStmt);
-      CVLocSeen = true;
-    }
-    void clearCVLocSeen() { CVLocSeen = false; }
-
-    bool getCVLocSeen() { return CVLocSeen; }
-    const MCCVLoc &getCurrentCVLoc() { return CurrentCVLoc; }
-
-    bool isValidCVFileNumber(unsigned FileNumber);
     /// @}
 
     char *getSecureLogFile() { return SecureLogFile; }

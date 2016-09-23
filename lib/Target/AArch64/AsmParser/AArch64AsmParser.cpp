@@ -14,6 +14,7 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/MC/MCContext.h"
@@ -28,6 +29,7 @@
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/MCSymbol.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetParser.h"
@@ -208,9 +210,9 @@ private:
   };
 
   struct BarrierOp {
-    unsigned Val; // Not the enum since not all values have names.
     const char *Data;
     unsigned Length;
+    unsigned Val; // Not the enum since not all values have names.
   };
 
   struct SysRegOp {
@@ -226,15 +228,15 @@ private:
   };
 
   struct PrefetchOp {
-    unsigned Val;
     const char *Data;
     unsigned Length;
+    unsigned Val;
   };
 
   struct PSBHintOp {
-    unsigned Val;
     const char *Data;
     unsigned Length;
+    unsigned Val;
   };
 
   struct ShiftExtendOp {
@@ -2073,12 +2075,9 @@ AArch64AsmParser::tryParsePrefetch(OperandVector &Operands) {
       return MatchOperand_ParseFail;
     }
 
-    bool Valid;
-    auto Mapper = AArch64PRFM::PRFMMapper();
-    StringRef Name = 
-        Mapper.toString(MCE->getValue(), getSTI().getFeatureBits(), Valid);
-    Operands.push_back(AArch64Operand::CreatePrefetch(prfop, Name,
-                                                      S, getContext()));
+    auto PRFM = AArch64PRFM::lookupPRFMByEncoding(MCE->getValue());
+    Operands.push_back(AArch64Operand::CreatePrefetch(
+        prfop, PRFM ? PRFM->Name : "", S, getContext()));
     return MatchOperand_Success;
   }
 
@@ -2087,18 +2086,15 @@ AArch64AsmParser::tryParsePrefetch(OperandVector &Operands) {
     return MatchOperand_ParseFail;
   }
 
-  bool Valid;
-  auto Mapper = AArch64PRFM::PRFMMapper();
-  unsigned prfop = 
-      Mapper.fromString(Tok.getString(), getSTI().getFeatureBits(), Valid);
-  if (!Valid) {
+  auto PRFM = AArch64PRFM::lookupPRFMByName(Tok.getString());
+  if (!PRFM) {
     TokError("pre-fetch hint expected");
     return MatchOperand_ParseFail;
   }
 
   Parser.Lex(); // Eat identifier token.
-  Operands.push_back(AArch64Operand::CreatePrefetch(prfop, Tok.getString(),
-                                                    S, getContext()));
+  Operands.push_back(AArch64Operand::CreatePrefetch(
+      PRFM->Encoding, Tok.getString(), S, getContext()));
   return MatchOperand_Success;
 }
 
@@ -2113,18 +2109,15 @@ AArch64AsmParser::tryParsePSBHint(OperandVector &Operands) {
     return MatchOperand_ParseFail;
   }
 
-  bool Valid;
-  auto Mapper = AArch64PSBHint::PSBHintMapper();
-  unsigned psbhint =
-      Mapper.fromString(Tok.getString(), getSTI().getFeatureBits(), Valid);
-  if (!Valid) {
+  auto PSB = AArch64PSBHint::lookupPSBByName(Tok.getString());
+  if (!PSB) {
     TokError("invalid operand for instruction");
     return MatchOperand_ParseFail;
   }
 
   Parser.Lex(); // Eat identifier token.
-  Operands.push_back(AArch64Operand::CreatePSBHint(psbhint, Tok.getString(),
-                                                   S, getContext()));
+  Operands.push_back(AArch64Operand::CreatePSBHint(
+      PSB->Encoding, Tok.getString(), S, getContext()));
   return MatchOperand_Success;
 }
 
@@ -2709,7 +2702,6 @@ bool AArch64AsmParser::parseSysAlias(StringRef Name, SMLoc NameLoc,
   }
 
   if (getLexer().isNot(AsmToken::EndOfStatement)) {
-    Parser.eatToEndOfStatement();
     return TokError("unexpected token in argument list");
   }
 
@@ -2748,12 +2740,9 @@ AArch64AsmParser::tryParseBarrierOperand(OperandVector &Operands) {
       Error(ExprLoc, "barrier operand out of range");
       return MatchOperand_ParseFail;
     }
-    bool Valid;
-    auto Mapper = AArch64DB::DBarrierMapper();
-    StringRef Name = 
-        Mapper.toString(MCE->getValue(), getSTI().getFeatureBits(), Valid);
-    Operands.push_back( AArch64Operand::CreateBarrier(MCE->getValue(), Name,
-                                                      ExprLoc, getContext()));
+    auto DB = AArch64DB::lookupDBByEncoding(MCE->getValue());
+    Operands.push_back(AArch64Operand::CreateBarrier(
+        MCE->getValue(), DB ? DB->Name : "", ExprLoc, getContext()));
     return MatchOperand_Success;
   }
 
@@ -2762,23 +2751,20 @@ AArch64AsmParser::tryParseBarrierOperand(OperandVector &Operands) {
     return MatchOperand_ParseFail;
   }
 
-  bool Valid;
-  auto Mapper = AArch64DB::DBarrierMapper();
-  unsigned Opt = 
-      Mapper.fromString(Tok.getString(), getSTI().getFeatureBits(), Valid);
-  if (!Valid) {
+  auto DB = AArch64DB::lookupDBByName(Tok.getString());
+  if (!DB) {
     TokError("invalid barrier option name");
     return MatchOperand_ParseFail;
   }
 
   // The only valid named option for ISB is 'sy'
-  if (Mnemonic == "isb" && Opt != AArch64DB::SY) {
+  if (Mnemonic == "isb" && DB->Encoding != AArch64DB::sy) {
     TokError("'sy' or #imm operand expected");
     return MatchOperand_ParseFail;
   }
 
-  Operands.push_back( AArch64Operand::CreateBarrier(Opt, Tok.getString(),
-                                                    getLoc(), getContext()));
+  Operands.push_back(AArch64Operand::CreateBarrier(
+      DB->Encoding, Tok.getString(), getLoc(), getContext()));
   Parser.Lex(); // Consume the option
 
   return MatchOperand_Success;
@@ -2792,28 +2778,22 @@ AArch64AsmParser::tryParseSysReg(OperandVector &Operands) {
   if (Tok.isNot(AsmToken::Identifier))
     return MatchOperand_NoMatch;
 
-  bool IsKnown;
-  auto MRSMapper = AArch64SysReg::MRSMapper();
-  uint32_t MRSReg = MRSMapper.fromString(Tok.getString(),
-                                         getSTI().getFeatureBits(), IsKnown);
-  assert(IsKnown == (MRSReg != -1U) &&
-         "register should be -1 if and only if it's unknown");
+  int MRSReg, MSRReg;
+  auto SysReg = AArch64SysReg::lookupSysRegByName(Tok.getString());
+  if (SysReg && SysReg->haveFeatures(getSTI().getFeatureBits())) {
+    MRSReg = SysReg->Readable ? SysReg->Encoding : -1;
+    MSRReg = SysReg->Writeable ? SysReg->Encoding : -1;
+  } else
+    MRSReg = MSRReg = AArch64SysReg::parseGenericRegister(Tok.getString());
 
-  auto MSRMapper = AArch64SysReg::MSRMapper();
-  uint32_t MSRReg = MSRMapper.fromString(Tok.getString(),
-                                         getSTI().getFeatureBits(), IsKnown);
-  assert(IsKnown == (MSRReg != -1U) &&
-         "register should be -1 if and only if it's unknown");
+  auto PState = AArch64PState::lookupPStateByName(Tok.getString());
+  unsigned PStateImm = -1;
+  if (PState && PState->haveFeatures(getSTI().getFeatureBits()))
+    PStateImm = PState->Encoding;
 
-  auto PStateMapper = AArch64PState::PStateMapper();
-  uint32_t PStateField = 
-      PStateMapper.fromString(Tok.getString(),
-                              getSTI().getFeatureBits(), IsKnown);
-  assert(IsKnown == (PStateField != -1U) &&
-         "register should be -1 if and only if it's unknown");
-
-  Operands.push_back(AArch64Operand::CreateSysReg(
-      Tok.getString(), getLoc(), MRSReg, MSRReg, PStateField, getContext()));
+  Operands.push_back(
+      AArch64Operand::CreateSysReg(Tok.getString(), getLoc(), MRSReg, MSRReg,
+                                   PStateImm, getContext()));
   Parser.Lex(); // Eat identifier
 
   return MatchOperand_Success;
@@ -3341,8 +3321,6 @@ bool AArch64AsmParser::ParseInstruction(ParseInstructionInfo &Info,
   // IC, DC, AT, and TLBI instructions are aliases for the SYS instruction.
   if (Head == "ic" || Head == "dc" || Head == "at" || Head == "tlbi") {
     bool IsError = parseSysAlias(Head, NameLoc, Operands);
-    if (IsError && getLexer().isNot(AsmToken::EndOfStatement))
-      Parser.eatToEndOfStatement();
     return IsError;
   }
 
@@ -3399,7 +3377,6 @@ bool AArch64AsmParser::ParseInstruction(ParseInstructionInfo &Info,
   if (getLexer().isNot(AsmToken::EndOfStatement)) {
     // Read the first operand.
     if (parseOperand(Operands, false, false)) {
-      Parser.eatToEndOfStatement();
       return true;
     }
 
@@ -3412,7 +3389,6 @@ bool AArch64AsmParser::ParseInstruction(ParseInstructionInfo &Info,
                                      (N == 3 && condCodeThirdOperand) ||
                                      (N == 2 && condCodeSecondOperand),
                        condCodeSecondOperand || condCodeThirdOperand)) {
-        Parser.eatToEndOfStatement();
         return true;
       }
 
@@ -3444,7 +3420,6 @@ bool AArch64AsmParser::ParseInstruction(ParseInstructionInfo &Info,
 
   if (getLexer().isNot(AsmToken::EndOfStatement)) {
     SMLoc Loc = Parser.getTok().getLoc();
-    Parser.eatToEndOfStatement();
     return Error(Loc, "unexpected token in argument list");
   }
 
@@ -3476,7 +3451,7 @@ bool AArch64AsmParser::validateInstruction(MCInst &Inst,
     if (RI->isSubRegisterEq(Rn, Rt2))
       return Error(Loc[1], "unpredictable LDP instruction, writeback base "
                            "is also a destination");
-    // FALLTHROUGH
+    LLVM_FALLTHROUGH;
   }
   case AArch64::LDPDi:
   case AArch64::LDPQi:
@@ -4202,8 +4177,10 @@ bool AArch64AsmParser::ParseDirective(AsmToken DirectiveID) {
     if (IDVal == ".inst")
       return parseDirectiveInst(Loc);
   }
+  if (IDVal == MCLOHDirectiveName())
+    return parseDirectiveLOH(IDVal, Loc);
 
-  return parseDirectiveLOH(IDVal, Loc);
+  return true;
 }
 
 static const struct {
@@ -4214,6 +4191,7 @@ static const struct {
   { "crypto", {AArch64::FeatureCrypto} },
   { "fp", {AArch64::FeatureFPARMv8} },
   { "simd", {AArch64::FeatureNEON} },
+  { "ras", {AArch64::FeatureRAS} },
 
   // FIXME: Unsupported extensions
   { "lse", {} },
@@ -4233,17 +4211,50 @@ bool AArch64AsmParser::parseDirectiveArch(SMLoc L) {
       getParser().parseStringToEndOfStatement().trim().split('+');
 
   unsigned ID = AArch64::parseArch(Arch);
-  if (ID == ARM::AK_INVALID) {
+  if (ID == static_cast<unsigned>(AArch64::ArchKind::AK_INVALID)) {
     Error(ArchLoc, "unknown arch name");
     return false;
   }
 
-  MCSubtargetInfo &STI = copySTI();
-  STI.setDefaultFeatures("", "");
-  if (!ExtensionString.empty())
-    STI.setDefaultFeatures("", ("+" + ExtensionString).str());
-  setAvailableFeatures(ComputeAvailableFeatures(STI.getFeatureBits()));
+  // Get the architecture and extension features.
+  std::vector<const char *> AArch64Features;
+  AArch64::getArchFeatures(ID, AArch64Features);
+  AArch64::getExtensionFeatures(AArch64::getDefaultExtensions("generic", ID),
+                                AArch64Features);
 
+  MCSubtargetInfo &STI = copySTI();
+  std::vector<std::string> ArchFeatures(AArch64Features.begin(), AArch64Features.end());
+  STI.setDefaultFeatures("generic", join(ArchFeatures.begin(), ArchFeatures.end(), ","));
+
+  SmallVector<StringRef, 4> RequestedExtensions;
+  if (!ExtensionString.empty())
+    ExtensionString.split(RequestedExtensions, '+');
+
+  FeatureBitset Features = STI.getFeatureBits();
+  for (auto Name : RequestedExtensions) {
+    bool EnableFeature = true;
+
+    if (Name.startswith_lower("no")) {
+      EnableFeature = false;
+      Name = Name.substr(2);
+    }
+
+    for (const auto &Extension : ExtensionMap) {
+      if (Extension.Name != Name)
+        continue;
+
+      if (Extension.Features.none())
+        report_fatal_error("unsupported architectural extension: " + Name);
+
+      FeatureBitset ToggleFeatures = EnableFeature
+                                         ? (~Features & Extension.Features)
+                                         : ( Features & Extension.Features);
+      uint64_t Features =
+          ComputeAvailableFeatures(STI.ToggleFeature(ToggleFeatures));
+      setAvailableFeatures(Features);
+      break;
+    }
+  }
   return false;
 }
 
@@ -4330,7 +4341,6 @@ bool AArch64AsmParser::parseDirectiveWord(unsigned Size, SMLoc L) {
 bool AArch64AsmParser::parseDirectiveInst(SMLoc Loc) {
   MCAsmParser &Parser = getParser();
   if (getLexer().is(AsmToken::EndOfStatement)) {
-    Parser.eatToEndOfStatement();
     Error(Loc, "expected expression following directive");
     return false;
   }
@@ -4388,8 +4398,6 @@ bool AArch64AsmParser::parseDirectiveTLSDescCall(SMLoc L) {
 /// ::= .loh <lohName | lohId> label1, ..., labelN
 /// The number of arguments depends on the loh identifier.
 bool AArch64AsmParser::parseDirectiveLOH(StringRef IDVal, SMLoc Loc) {
-  if (IDVal != MCLOHDirectiveName())
-    return true;
   MCLOHType Kind;
   if (getParser().getTok().isNot(AsmToken::Identifier)) {
     if (getParser().getTok().isNot(AsmToken::Integer))
@@ -4397,8 +4405,10 @@ bool AArch64AsmParser::parseDirectiveLOH(StringRef IDVal, SMLoc Loc) {
     // We successfully get a numeric value for the identifier.
     // Check if it is valid.
     int64_t Id = getParser().getTok().getIntVal();
-    if (Id <= -1U && !isValidMCLOHType(Id))
-      return TokError("invalid numeric identifier in directive");
+    if (Id <= -1U && !isValidMCLOHType(Id)) {
+      TokError("invalid numeric identifier in directive");
+      return false;
+    }
     Kind = (MCLOHType)Id;
   } else {
     StringRef Name = getTok().getIdentifier();
@@ -4456,25 +4466,18 @@ bool AArch64AsmParser::parseDirectiveReq(StringRef Name, SMLoc L) {
   if (RegNum == static_cast<unsigned>(-1)) {
     StringRef Kind;
     RegNum = tryMatchVectorRegister(Kind, false);
-    if (!Kind.empty()) {
-      Error(SRegLoc, "vector register without type specifier expected");
-      return false;
-    }
+    if (!Kind.empty())
+      return Error(SRegLoc, "vector register without type specifier expected");
     IsVector = true;
   }
 
-  if (RegNum == static_cast<unsigned>(-1)) {
-    Parser.eatToEndOfStatement();
-    Error(SRegLoc, "register name or alias expected");
-    return false;
-  }
+  if (RegNum == static_cast<unsigned>(-1))
+    return Error(SRegLoc, "register name or alias expected");
 
   // Shouldn't be anything else.
-  if (Parser.getTok().isNot(AsmToken::EndOfStatement)) {
-    Error(Parser.getTok().getLoc(), "unexpected input in .req directive");
-    Parser.eatToEndOfStatement();
-    return false;
-  }
+  if (Parser.getTok().isNot(AsmToken::EndOfStatement))
+    return Error(Parser.getTok().getLoc(),
+                 "unexpected input in .req directive");
 
   Parser.Lex(); // Consume the EndOfStatement
 
@@ -4482,7 +4485,7 @@ bool AArch64AsmParser::parseDirectiveReq(StringRef Name, SMLoc L) {
   if (RegisterReqs.insert(std::make_pair(Name, pair)).first->second != pair)
     Warning(L, "ignoring redefinition of register alias '" + Name + "'");
 
-  return true;
+  return false;
 }
 
 /// parseDirectiveUneq
@@ -4491,7 +4494,6 @@ bool AArch64AsmParser::parseDirectiveUnreq(SMLoc L) {
   MCAsmParser &Parser = getParser();
   if (Parser.getTok().isNot(AsmToken::Identifier)) {
     Error(Parser.getTok().getLoc(), "unexpected input in .unreq directive.");
-    Parser.eatToEndOfStatement();
     return false;
   }
   RegisterReqs.erase(Parser.getTok().getIdentifier().lower());

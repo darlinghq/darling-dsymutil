@@ -16,6 +16,7 @@
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/BlockFrequencyInfoImpl.h"
 #include "llvm/Analysis/BranchProbabilityInfo.h"
+#include "llvm/Analysis/IndirectCallPromotionAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/CallSite.h"
 #include "llvm/IR/Dominators.h"
@@ -62,8 +63,8 @@ static void findRefEdges(const User *CurUser, DenseSet<const Value *> &RefEdges,
   }
 }
 
-void ModuleSummaryIndexBuilder::computeFunctionSummary(
-    const Function &F, BlockFrequencyInfo *BFI) {
+static void computeFunctionSummary(ModuleSummaryIndex &Index, const Module &M,
+                                   const Function &F, BlockFrequencyInfo *BFI) {
   // Summary not currently supported for anonymous functions, they must
   // be renamed.
   if (!F.hasName())
@@ -73,39 +74,60 @@ void ModuleSummaryIndexBuilder::computeFunctionSummary(
   // Map from callee ValueId to profile count. Used to accumulate profile
   // counts for all static calls to a given callee.
   DenseMap<const Value *, CalleeInfo> CallGraphEdges;
+  DenseMap<GlobalValue::GUID, CalleeInfo> IndirectCallEdges;
   DenseSet<const Value *> RefEdges;
+  ICallPromotionAnalysis ICallAnalysis;
 
   SmallPtrSet<const User *, 8> Visited;
-  for (Function::const_iterator BB = F.begin(), E = F.end(); BB != E; ++BB)
-    for (BasicBlock::const_iterator I = BB->begin(), E = BB->end(); I != E;
-         ++I) {
-      if (!isa<DbgInfoIntrinsic>(I))
-        ++NumInsts;
+  for (const BasicBlock &BB : F)
+    for (const Instruction &I : BB) {
+      if (isa<DbgInfoIntrinsic>(I))
+        continue;
+      ++NumInsts;
+      findRefEdges(&I, RefEdges, Visited);
+      auto CS = ImmutableCallSite(&I);
+      if (!CS)
+        continue;
+      auto *CalledFunction = CS.getCalledFunction();
+      // Check if this is a direct call to a known function.
+      if (CalledFunction) {
+        // Skip nameless and intrinsics.
+        if (!CalledFunction->hasName() || CalledFunction->isIntrinsic())
+          continue;
+        auto ScaledCount = BFI ? BFI->getBlockProfileCount(&BB) : None;
+        auto *CalleeId =
+            M.getValueSymbolTable().lookup(CalledFunction->getName());
+        CallGraphEdges[CalleeId] += (ScaledCount ? ScaledCount.getValue() : 0);
+      } else {
+        const auto *CI = dyn_cast<CallInst>(&I);
+        // Skip inline assembly calls.
+        if (CI && CI->isInlineAsm())
+          continue;
+        // Skip direct calls.
+        if (!CS.getCalledValue() || isa<Constant>(CS.getCalledValue()))
+          continue;
 
-      if (auto CS = ImmutableCallSite(&*I)) {
-        auto *CalledFunction = CS.getCalledFunction();
-        if (CalledFunction && CalledFunction->hasName() &&
-            !CalledFunction->isIntrinsic()) {
-          auto ScaledCount = BFI ? BFI->getBlockProfileCount(&*BB) : None;
-          auto *CalleeId =
-              M->getValueSymbolTable().lookup(CalledFunction->getName());
-          CallGraphEdges[CalleeId] +=
-              (ScaledCount ? ScaledCount.getValue() : 0);
-        }
+        uint32_t NumVals, NumCandidates;
+        uint64_t TotalCount;
+        auto CandidateProfileData =
+            ICallAnalysis.getPromotionCandidatesForInstruction(
+                &I, NumVals, TotalCount, NumCandidates);
+        for (auto &Candidate : CandidateProfileData)
+          IndirectCallEdges[Candidate.Value] += Candidate.Count;
       }
-      findRefEdges(&*I, RefEdges, Visited);
     }
 
   GlobalValueSummary::GVFlags Flags(F);
   std::unique_ptr<FunctionSummary> FuncSummary =
       llvm::make_unique<FunctionSummary>(Flags, NumInsts);
   FuncSummary->addCallGraphEdges(CallGraphEdges);
+  FuncSummary->addCallGraphEdges(IndirectCallEdges);
   FuncSummary->addRefEdges(RefEdges);
-  Index->addGlobalValueSummary(F.getName(), std::move(FuncSummary));
+  Index.addGlobalValueSummary(F.getName(), std::move(FuncSummary));
 }
 
-void ModuleSummaryIndexBuilder::computeVariableSummary(
-    const GlobalVariable &V) {
+static void computeVariableSummary(ModuleSummaryIndex &Index,
+                                   const GlobalVariable &V) {
   DenseSet<const Value *> RefEdges;
   SmallPtrSet<const User *, 8> Visited;
   findRefEdges(&V, RefEdges, Visited);
@@ -113,29 +135,29 @@ void ModuleSummaryIndexBuilder::computeVariableSummary(
   std::unique_ptr<GlobalVarSummary> GVarSummary =
       llvm::make_unique<GlobalVarSummary>(Flags);
   GVarSummary->addRefEdges(RefEdges);
-  Index->addGlobalValueSummary(V.getName(), std::move(GVarSummary));
+  Index.addGlobalValueSummary(V.getName(), std::move(GVarSummary));
 }
 
-ModuleSummaryIndexBuilder::ModuleSummaryIndexBuilder(
-    const Module *M,
-    std::function<BlockFrequencyInfo *(const Function &F)> Ftor)
-    : Index(llvm::make_unique<ModuleSummaryIndex>()), M(M) {
+ModuleSummaryIndex llvm::buildModuleSummaryIndex(
+    const Module &M,
+    std::function<BlockFrequencyInfo *(const Function &F)> GetBFICallback) {
+  ModuleSummaryIndex Index;
   // Check if the module can be promoted, otherwise just disable importing from
   // it by not emitting any summary.
   // FIXME: we could still import *into* it most of the time.
-  if (!moduleCanBeRenamedForThinLTO(*M))
-    return;
+  if (!moduleCanBeRenamedForThinLTO(M))
+    return Index;
 
   // Compute summaries for all functions defined in module, and save in the
   // index.
-  for (auto &F : *M) {
+  for (auto &F : M) {
     if (F.isDeclaration())
       continue;
 
     BlockFrequencyInfo *BFI = nullptr;
     std::unique_ptr<BlockFrequencyInfo> BFIPtr;
-    if (Ftor)
-      BFI = Ftor(F);
+    if (GetBFICallback)
+      BFI = GetBFICallback(F);
     else if (F.getEntryCount().hasValue()) {
       LoopInfo LI{DominatorTree(const_cast<Function &>(F))};
       BranchProbabilityInfo BPI{F, LI};
@@ -143,16 +165,27 @@ ModuleSummaryIndexBuilder::ModuleSummaryIndexBuilder(
       BFI = BFIPtr.get();
     }
 
-    computeFunctionSummary(F, BFI);
+    computeFunctionSummary(Index, M, F, BFI);
   }
 
   // Compute summaries for all variables defined in module, and save in the
   // index.
-  for (const GlobalVariable &G : M->globals()) {
+  for (const GlobalVariable &G : M.globals()) {
     if (G.isDeclaration())
       continue;
-    computeVariableSummary(G);
+    computeVariableSummary(Index, G);
   }
+  return Index;
+}
+
+char ModuleSummaryIndexAnalysis::PassID;
+
+ModuleSummaryIndex
+ModuleSummaryIndexAnalysis::run(Module &M, ModuleAnalysisManager &AM) {
+  auto &FAM = AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+  return buildModuleSummaryIndex(M, [&FAM](const Function &F) {
+    return &FAM.getResult<BlockFrequencyAnalysis>(*const_cast<Function *>(&F));
+  });
 }
 
 char ModuleSummaryIndexWrapperPass::ID = 0;
@@ -172,17 +205,16 @@ ModuleSummaryIndexWrapperPass::ModuleSummaryIndexWrapperPass()
 }
 
 bool ModuleSummaryIndexWrapperPass::runOnModule(Module &M) {
-  IndexBuilder = llvm::make_unique<ModuleSummaryIndexBuilder>(
-      &M, [this](const Function &F) {
-        return &(this->getAnalysis<BlockFrequencyInfoWrapperPass>(
-                         *const_cast<Function *>(&F))
-                     .getBFI());
-      });
+  Index = buildModuleSummaryIndex(M, [this](const Function &F) {
+    return &(this->getAnalysis<BlockFrequencyInfoWrapperPass>(
+                     *const_cast<Function *>(&F))
+                 .getBFI());
+  });
   return false;
 }
 
 bool ModuleSummaryIndexWrapperPass::doFinalization(Module &M) {
-  IndexBuilder.reset();
+  Index.reset();
   return false;
 }
 
@@ -213,13 +245,13 @@ bool llvm::moduleCanBeRenamedForThinLTO(const Module &M) {
   SmallPtrSet<GlobalValue *, 8> Used;
   collectUsedGlobalVariables(M, Used, /*CompilerUsed*/ false);
   bool LocalIsUsed =
-      llvm::any_of(Used, [](GlobalValue *V) { return V->hasLocalLinkage(); });
+      any_of(Used, [](GlobalValue *V) { return V->hasLocalLinkage(); });
   if (!LocalIsUsed)
     return true;
 
   // Walk all the instructions in the module and find if one is inline ASM
-  auto HasInlineAsm = llvm::any_of(M, [](const Function &F) {
-    return llvm::any_of(instructions(F), [](const Instruction &I) {
+  auto HasInlineAsm = any_of(M, [](const Function &F) {
+    return any_of(instructions(F), [](const Instruction &I) {
       const CallInst *CallI = dyn_cast<CallInst>(&I);
       if (!CallI)
         return false;

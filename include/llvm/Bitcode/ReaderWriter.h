@@ -60,6 +60,11 @@ namespace llvm {
   std::string getBitcodeTargetTriple(MemoryBufferRef Buffer,
                                      LLVMContext &Context);
 
+  /// Return true if \p Buffer contains a bitcode file with ObjC code (category
+  /// or class) in it.
+  bool isBitcodeContainingObjCCategory(MemoryBufferRef Buffer,
+                                       LLVMContext &Context);
+
   /// Read the header of the specified bitcode buffer and extract just the
   /// producer string information. If successful, this returns a string. On
   /// error, this returns "".
@@ -89,8 +94,11 @@ namespace llvm {
   /// Value in \c M.  These will be reconstructed exactly when \a M is
   /// deserialized.
   ///
-  /// If \c EmitSummaryIndex, emit the module's summary index (currently
-  /// for use in ThinLTO optimization).
+  /// If \c Index is supplied, the bitcode will contain the summary index
+  /// (currently for use in ThinLTO optimization).
+  ///
+  /// \p GenerateHash enables hashing the Module and including the hash in the
+  /// bitcode (currently for use in ThinLTO incremental build).
   void WriteBitcodeToFile(const Module *M, raw_ostream &Out,
                           bool ShouldPreserveUseListOrder = false,
                           const ModuleSummaryIndex *Index = nullptr,
@@ -102,7 +110,7 @@ namespace llvm {
   /// index for a distributed backend, provide the \p ModuleToSummariesForIndex
   /// map.
   void WriteIndexToFile(const ModuleSummaryIndex &Index, raw_ostream &Out,
-                        std::map<std::string, GVSummaryMapTy>
+                        const std::map<std::string, GVSummaryMapTy>
                             *ModuleToSummariesForIndex = nullptr);
 
   /// isBitcodeWrapper - Return true if the given bytes are the magic bytes

@@ -272,8 +272,9 @@ static bool shouldInstrumentReadWriteFromAddress(Value *Addr) {
         return false;
     }
 
-    // Check if the global is in the GCOV counters array.
-    if (GV->getName() == "__llvm_gcov_ctr")
+    // Check if the global is private gcov data.
+    if (GV->getName().startswith("__llvm_gcov") ||
+        GV->getName().startswith("__llvm_gcda"))
       return false;
   }
 
@@ -510,7 +511,7 @@ static ConstantInt *createOrdering(IRBuilder<> *IRB, AtomicOrdering ord) {
   switch (ord) {
     case AtomicOrdering::NotAtomic:
       llvm_unreachable("unexpected atomic ordering!");
-    case AtomicOrdering::Unordered:              // Fall-through.
+    case AtomicOrdering::Unordered:              LLVM_FALLTHROUGH;
     case AtomicOrdering::Monotonic:              v = 0; break;
     // Not specified yet:
     // case AtomicOrdering::Consume:                v = 1; break;

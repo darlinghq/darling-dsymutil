@@ -22,10 +22,9 @@ using namespace llvm::PatternMatch;
 
 #define DEBUG_TYPE "instcombine"
 
-/// ShrinkDemandedConstant - Check to see if the specified operand of the
-/// specified instruction is a constant integer.  If so, check to see if there
-/// are any bits set in the constant that are not demanded.  If so, shrink the
-/// constant and return true.
+/// Check to see if the specified operand of the specified instruction is a
+/// constant integer. If so, check to see if there are any bits set in the
+/// constant that are not demanded. If so, shrink the constant and return true.
 static bool ShrinkDemandedConstant(Instruction *I, unsigned OpNo,
                                    APInt Demanded) {
   assert(I && "No instruction?");
@@ -49,9 +48,8 @@ static bool ShrinkDemandedConstant(Instruction *I, unsigned OpNo,
 
 
 
-/// SimplifyDemandedInstructionBits - Inst is an integer instruction that
-/// SimplifyDemandedBits knows about.  See if the instruction has any
-/// properties that allow us to simplify its operands.
+/// Inst is an integer instruction that SimplifyDemandedBits knows about. See if
+/// the instruction has any properties that allow us to simplify its operands.
 bool InstCombiner::SimplifyDemandedInstructionBits(Instruction &Inst) {
   unsigned BitWidth = Inst.getType()->getScalarSizeInBits();
   APInt KnownZero(BitWidth, 0), KnownOne(BitWidth, 0);
@@ -65,9 +63,9 @@ bool InstCombiner::SimplifyDemandedInstructionBits(Instruction &Inst) {
   return true;
 }
 
-/// SimplifyDemandedBits - This form of SimplifyDemandedBits simplifies the
-/// specified instruction operand if possible, updating it in place.  It returns
-/// true if it made any change and false otherwise.
+/// This form of SimplifyDemandedBits simplifies the specified instruction
+/// operand if possible, updating it in place. It returns true if it made any
+/// change and false otherwise.
 bool InstCombiner::SimplifyDemandedBits(Use &U, const APInt &DemandedMask,
                                         APInt &KnownZero, APInt &KnownOne,
                                         unsigned Depth) {
@@ -80,21 +78,22 @@ bool InstCombiner::SimplifyDemandedBits(Use &U, const APInt &DemandedMask,
 }
 
 
-/// SimplifyDemandedUseBits - This function attempts to replace V with a simpler
-/// value based on the demanded bits.  When this function is called, it is known
-/// that only the bits set in DemandedMask of the result of V are ever used
-/// downstream. Consequently, depending on the mask and V, it may be possible
-/// to replace V with a constant or one of its operands. In such cases, this
-/// function does the replacement and returns true. In all other cases, it
-/// returns false after analyzing the expression and setting KnownOne and known
-/// to be one in the expression.  KnownZero contains all the bits that are known
-/// to be zero in the expression. These are provided to potentially allow the
-/// caller (which might recursively be SimplifyDemandedBits itself) to simplify
-/// the expression. KnownOne and KnownZero always follow the invariant that
-/// KnownOne & KnownZero == 0. That is, a bit can't be both 1 and 0. Note that
-/// the bits in KnownOne and KnownZero may only be accurate for those bits set
-/// in DemandedMask. Note also that the bitwidth of V, DemandedMask, KnownZero
-/// and KnownOne must all be the same.
+/// This function attempts to replace V with a simpler value based on the
+/// demanded bits. When this function is called, it is known that only the bits
+/// set in DemandedMask of the result of V are ever used downstream.
+/// Consequently, depending on the mask and V, it may be possible to replace V
+/// with a constant or one of its operands. In such cases, this function does
+/// the replacement and returns true. In all other cases, it returns false after
+/// analyzing the expression and setting KnownOne and known to be one in the
+/// expression. KnownZero contains all the bits that are known to be zero in the
+/// expression. These are provided to potentially allow the caller (which might
+/// recursively be SimplifyDemandedBits itself) to simplify the expression.
+/// KnownOne and KnownZero always follow the invariant that:
+///   KnownOne & KnownZero == 0.
+/// That is, a bit can't be both 1 and 0. Note that the bits in KnownOne and
+/// KnownZero may only be accurate for those bits set in DemandedMask. Note also
+/// that the bitwidth of V, DemandedMask, KnownZero and KnownOne must all be the
+/// same.
 ///
 /// This returns null if it did not change anything and it permits no
 /// simplification.  This returns V itself if it did some simplification of V's
@@ -896,10 +895,10 @@ Value *InstCombiner::SimplifyShrShlDemandedBits(Instruction *Shr,
   return nullptr;
 }
 
-/// SimplifyDemandedVectorElts - The specified value produces a vector with
-/// any number of elements. DemandedElts contains the set of elements that are
-/// actually used by the caller.  This method analyzes which elements of the
-/// operand are undef and returns that information in UndefElts.
+/// The specified value produces a vector with any number of elements.
+/// DemandedElts contains the set of elements that are actually used by the
+/// caller. This method analyzes which elements of the operand are undef and
+/// returns that information in UndefElts.
 ///
 /// If the information about demanded elements can be used to simplify the
 /// operation, the operation is simplified, then the resultant value is
@@ -1038,17 +1037,21 @@ Value *InstCombiner::SimplifyDemandedVectorElts(Value *V, APInt DemandedElts,
       }
     }
 
-    APInt UndefElts4(LHSVWidth, 0);
+    APInt LHSUndefElts(LHSVWidth, 0);
     TmpV = SimplifyDemandedVectorElts(I->getOperand(0), LeftDemanded,
-                                      UndefElts4, Depth + 1);
+                                      LHSUndefElts, Depth + 1);
     if (TmpV) { I->setOperand(0, TmpV); MadeChange = true; }
 
-    APInt UndefElts3(LHSVWidth, 0);
+    APInt RHSUndefElts(LHSVWidth, 0);
     TmpV = SimplifyDemandedVectorElts(I->getOperand(1), RightDemanded,
-                                      UndefElts3, Depth + 1);
+                                      RHSUndefElts, Depth + 1);
     if (TmpV) { I->setOperand(1, TmpV); MadeChange = true; }
 
     bool NewUndefElts = false;
+    unsigned LHSIdx = -1u;
+    unsigned RHSIdx = -1u;
+    bool LHSUniform = true;
+    bool RHSUniform = true;
     for (unsigned i = 0; i < VWidth; i++) {
       unsigned MaskVal = Shuffle->getMaskValue(i);
       if (MaskVal == -1u) {
@@ -1057,18 +1060,57 @@ Value *InstCombiner::SimplifyDemandedVectorElts(Value *V, APInt DemandedElts,
         NewUndefElts = true;
         UndefElts.setBit(i);
       } else if (MaskVal < LHSVWidth) {
-        if (UndefElts4[MaskVal]) {
+        if (LHSUndefElts[MaskVal]) {
           NewUndefElts = true;
           UndefElts.setBit(i);
+        } else {
+          LHSIdx = LHSIdx == -1u ? MaskVal : LHSVWidth;
+          LHSUniform = LHSUniform && (MaskVal == i);
         }
       } else {
-        if (UndefElts3[MaskVal - LHSVWidth]) {
+        if (RHSUndefElts[MaskVal - LHSVWidth]) {
           NewUndefElts = true;
           UndefElts.setBit(i);
+        } else {
+          RHSIdx = RHSIdx == -1u ? MaskVal - LHSVWidth : LHSVWidth;
+          RHSUniform = RHSUniform && (MaskVal - LHSVWidth == i);
         }
       }
     }
 
+    // Try to transform shuffle with constant vector and single element from
+    // this constant vector to single insertelement instruction.
+    // shufflevector V, C, <v1, v2, .., ci, .., vm> ->
+    // insertelement V, C[ci], ci-n
+    if (LHSVWidth == Shuffle->getType()->getNumElements()) {
+      Value *Op = nullptr;
+      Constant *Value = nullptr;
+      unsigned Idx = -1u;
+
+      // Find constant vector wigth the single element in shuffle (LHS or RHS).
+      if (LHSIdx < LHSVWidth && RHSUniform) {
+        if (auto *CV = dyn_cast<ConstantVector>(Shuffle->getOperand(0))) {
+          Op = Shuffle->getOperand(1);
+          Value = CV->getOperand(LHSIdx);
+          Idx = LHSIdx;
+        }
+      }
+      if (RHSIdx < LHSVWidth && LHSUniform) {
+        if (auto *CV = dyn_cast<ConstantVector>(Shuffle->getOperand(1))) {
+          Op = Shuffle->getOperand(0);
+          Value = CV->getOperand(RHSIdx);
+          Idx = RHSIdx;
+        }
+      }
+      // Found constant vector with single element - convert to insertelement.
+      if (Op && Value) {
+        Instruction *New = InsertElementInst::Create(
+            Op, Value, ConstantInt::get(Type::getInt32Ty(I->getContext()), Idx),
+            Shuffle->getName());
+        InsertNewInstWith(New, *Shuffle);
+        return New;
+      }
+    }
     if (NewUndefElts) {
       // Add additional discovered undefs.
       SmallVector<Constant*, 16> Elts;

@@ -210,6 +210,7 @@ public:
 private:
   friend class AttrBuilder;
   friend class AttributeSetImpl;
+  friend class AttributeSetNode;
   template <typename Ty> friend struct DenseMapInfo;
 
   /// \brief The attributes that we are managing. This can be null to represent
@@ -337,9 +338,15 @@ public:
   /// may be faster.
   bool hasFnAttribute(Attribute::AttrKind Kind) const;
 
+  /// \brief Equivalent to hasAttribute(AttributeSet::FunctionIndex, Kind) but
+  /// may be faster.
+  bool hasFnAttribute(StringRef Kind) const;
+
   /// \brief Return true if the specified attribute is set for at least one
-  /// parameter or for the return value.
-  bool hasAttrSomewhere(Attribute::AttrKind Kind) const;
+  /// parameter or for the return value. If Index is not nullptr, the index
+  /// of a parameter with the specified attribute is provided.
+  bool hasAttrSomewhere(Attribute::AttrKind Kind,
+                        unsigned *Index = nullptr) const;
 
   /// \brief Return the attribute object that exists at the given index.
   Attribute getAttribute(unsigned Index, Attribute::AttrKind Kind) const;

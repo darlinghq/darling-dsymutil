@@ -145,6 +145,7 @@ def SDT_ZVecQuaternaryInt   : SDTypeProfile<1, 4,
                                              SDTCisSameAs<0, 2>,
                                              SDTCisSameAs<0, 3>,
                                              SDTCisVT<4, i32>]>;
+def SDT_ZTest               : SDTypeProfile<0, 2, [SDTCisVT<1, i64>]>;
 
 //===----------------------------------------------------------------------===//
 // Node definitions
@@ -203,6 +204,8 @@ def z_loadbswap        : SDNode<"SystemZISD::LRV", SDT_ZLoadBSwap,
                                  [SDNPHasChain, SDNPMayLoad, SDNPMemOperand]>;
 def z_storebswap       : SDNode<"SystemZISD::STRV", SDT_ZStoreBSwap,
                                  [SDNPHasChain, SDNPMayStore, SDNPMemOperand]>;
+
+def z_tdc               : SDNode<"SystemZISD::TDC", SDT_ZTest, [SDNPOutGlue]>;
 
 // Defined because the index is an i32 rather than a pointer.
 def z_vector_insert     : SDNode<"ISD::INSERT_VECTOR_ELT",
@@ -526,7 +529,7 @@ def inserthf : PatFrag<(ops node:$src1, node:$src2),
 // ORs that can be treated as insertions.
 def or_as_inserti8 : PatFrag<(ops node:$src1, node:$src2),
                              (or node:$src1, node:$src2), [{
-  unsigned BitWidth = N->getValueType(0).getScalarType().getSizeInBits();
+  unsigned BitWidth = N->getValueType(0).getScalarSizeInBits();
   return CurDAG->MaskedValueIsZero(N->getOperand(0),
                                    APInt::getLowBitsSet(BitWidth, 8));
 }]>;
@@ -534,7 +537,7 @@ def or_as_inserti8 : PatFrag<(ops node:$src1, node:$src2),
 // ORs that can be treated as reversed insertions.
 def or_as_revinserti8 : PatFrag<(ops node:$src1, node:$src2),
                                 (or node:$src1, node:$src2), [{
-  unsigned BitWidth = N->getValueType(0).getScalarType().getSizeInBits();
+  unsigned BitWidth = N->getValueType(0).getScalarSizeInBits();
   return CurDAG->MaskedValueIsZero(N->getOperand(1),
                                    APInt::getLowBitsSet(BitWidth, 8));
 }]>;

@@ -54,89 +54,93 @@ private:
                                          unsigned SubIdx,
                                          const TargetRegisterClass *SubRC) const;
 
-  void swapOperands(MachineBasicBlock::iterator Inst) const;
+  void swapOperands(MachineInstr &Inst) const;
 
   void lowerScalarAbs(SmallVectorImpl<MachineInstr *> &Worklist,
-                      MachineInstr *Inst) const;
+                      MachineInstr &Inst) const;
 
   void splitScalar64BitUnaryOp(SmallVectorImpl<MachineInstr *> &Worklist,
-                               MachineInstr *Inst, unsigned Opcode) const;
+                               MachineInstr &Inst, unsigned Opcode) const;
 
   void splitScalar64BitBinaryOp(SmallVectorImpl<MachineInstr *> &Worklist,
-                                MachineInstr *Inst, unsigned Opcode) const;
+                                MachineInstr &Inst, unsigned Opcode) const;
 
   void splitScalar64BitBCNT(SmallVectorImpl<MachineInstr *> &Worklist,
-                            MachineInstr *Inst) const;
+                            MachineInstr &Inst) const;
   void splitScalar64BitBFE(SmallVectorImpl<MachineInstr *> &Worklist,
-                           MachineInstr *Inst) const;
+                           MachineInstr &Inst) const;
 
   void addUsersToMoveToVALUWorklist(
     unsigned Reg, MachineRegisterInfo &MRI,
     SmallVectorImpl<MachineInstr *> &Worklist) const;
 
-  void addSCCDefUsersToVALUWorklist(
-    MachineInstr *SCCDefInst, SmallVectorImpl<MachineInstr *> &Worklist) const;
+  void
+  addSCCDefUsersToVALUWorklist(MachineInstr &SCCDefInst,
+                               SmallVectorImpl<MachineInstr *> &Worklist) const;
 
   const TargetRegisterClass *
   getDestEquivalentVGPRClass(const MachineInstr &Inst) const;
 
-  bool checkInstOffsetsDoNotOverlap(MachineInstr *MIa,
-                                    MachineInstr *MIb) const;
+  bool checkInstOffsetsDoNotOverlap(MachineInstr &MIa, MachineInstr &MIb) const;
 
-  unsigned findUsedSGPR(const MachineInstr *MI, int OpIndices[3]) const;
+  unsigned findUsedSGPR(const MachineInstr &MI, int OpIndices[3]) const;
 
 protected:
-  MachineInstr *commuteInstructionImpl(MachineInstr *MI,
-                                       bool NewMI,
+  bool swapSourceModifiers(MachineInstr &MI,
+                           MachineOperand &Src0, unsigned Src0OpName,
+                           MachineOperand &Src1, unsigned Src1OpName) const;
+
+  MachineInstr *commuteInstructionImpl(MachineInstr &MI, bool NewMI,
                                        unsigned OpIdx0,
                                        unsigned OpIdx1) const override;
 
 public:
+
+  enum TargetOperandFlags {
+    MO_NONE = 0,
+    MO_GOTPCREL = 1
+  };
+
   explicit SIInstrInfo(const SISubtarget &);
 
   const SIRegisterInfo &getRegisterInfo() const {
     return RI;
   }
 
-  bool isReallyTriviallyReMaterializable(const MachineInstr *MI,
+  bool isReallyTriviallyReMaterializable(const MachineInstr &MI,
                                          AliasAnalysis *AA) const override;
 
   bool areLoadsFromSameBasePtr(SDNode *Load1, SDNode *Load2,
                                int64_t &Offset1,
                                int64_t &Offset2) const override;
 
-  bool getMemOpBaseRegImmOfs(MachineInstr *LdSt, unsigned &BaseReg,
+  bool getMemOpBaseRegImmOfs(MachineInstr &LdSt, unsigned &BaseReg,
                              int64_t &Offset,
                              const TargetRegisterInfo *TRI) const final;
 
-  bool shouldClusterMemOps(MachineInstr *FirstLdSt,
-                           MachineInstr *SecondLdSt,
+  bool shouldClusterMemOps(MachineInstr &FirstLdSt, MachineInstr &SecondLdSt,
                            unsigned NumLoads) const final;
 
   void copyPhysReg(MachineBasicBlock &MBB, MachineBasicBlock::iterator MI,
                    const DebugLoc &DL, unsigned DestReg, unsigned SrcReg,
                    bool KillSrc) const override;
 
-  unsigned calculateLDSSpillAddress(MachineBasicBlock &MBB,
-                                    MachineBasicBlock::iterator MI,
-                                    RegScavenger *RS,
-                                    unsigned TmpReg,
-                                    unsigned Offset,
-                                    unsigned Size) const;
+  unsigned calculateLDSSpillAddress(MachineBasicBlock &MBB, MachineInstr &MI,
+                                    RegScavenger *RS, unsigned TmpReg,
+                                    unsigned Offset, unsigned Size) const;
 
   void storeRegToStackSlot(MachineBasicBlock &MBB,
-                           MachineBasicBlock::iterator MI,
-                           unsigned SrcReg, bool isKill, int FrameIndex,
+                           MachineBasicBlock::iterator MI, unsigned SrcReg,
+                           bool isKill, int FrameIndex,
                            const TargetRegisterClass *RC,
                            const TargetRegisterInfo *TRI) const override;
 
   void loadRegFromStackSlot(MachineBasicBlock &MBB,
-                            MachineBasicBlock::iterator MI,
-                            unsigned DestReg, int FrameIndex,
-                            const TargetRegisterClass *RC,
+                            MachineBasicBlock::iterator MI, unsigned DestReg,
+                            int FrameIndex, const TargetRegisterClass *RC,
                             const TargetRegisterInfo *TRI) const override;
 
-  bool expandPostRAPseudo(MachineBasicBlock::iterator MI) const override;
+  bool expandPostRAPseudo(MachineInstr &MI) const override;
 
   // \brief Returns an opcode that can be used to move a value to a \p DstRC
   // register.  If there is no hardware instruction that can store to \p
@@ -144,40 +148,46 @@ public:
   unsigned getMovOpcode(const TargetRegisterClass *DstRC) const;
 
   LLVM_READONLY
-  int commuteOpcode(const MachineInstr &MI) const;
+  int commuteOpcode(unsigned Opc) const;
 
-  bool findCommutedOpIndices(MachineInstr *MI,
-                             unsigned &SrcOpIdx1,
+  LLVM_READONLY
+  inline int commuteOpcode(const MachineInstr &MI) const {
+    return commuteOpcode(MI.getOpcode());
+  }
+
+  bool findCommutedOpIndices(MachineInstr &MI, unsigned &SrcOpIdx1,
                              unsigned &SrcOpIdx2) const override;
 
-  bool AnalyzeBranch(MachineBasicBlock &MBB, MachineBasicBlock *&TBB,
+  bool analyzeBranch(MachineBasicBlock &MBB, MachineBasicBlock *&TBB,
                      MachineBasicBlock *&FBB,
                      SmallVectorImpl<MachineOperand> &Cond,
                      bool AllowModify) const override;
 
-  unsigned RemoveBranch(MachineBasicBlock &MBB) const override;
+  unsigned removeBranch(MachineBasicBlock &MBB,
+                        int *BytesRemoved = nullptr) const override;
 
-  unsigned InsertBranch(MachineBasicBlock &MBB, MachineBasicBlock *TBB,
+  unsigned insertBranch(MachineBasicBlock &MBB, MachineBasicBlock *TBB,
                         MachineBasicBlock *FBB, ArrayRef<MachineOperand> Cond,
-                        const DebugLoc &DL) const override;
+                        const DebugLoc &DL,
+                        int *BytesAdded = nullptr) const override;
 
-  bool ReverseBranchCondition(
+  bool reverseBranchCondition(
     SmallVectorImpl<MachineOperand> &Cond) const override;
 
-  bool areMemAccessesTriviallyDisjoint(
-    MachineInstr *MIa, MachineInstr *MIb,
-    AliasAnalysis *AA = nullptr) const override;
+  bool
+  areMemAccessesTriviallyDisjoint(MachineInstr &MIa, MachineInstr &MIb,
+                                  AliasAnalysis *AA = nullptr) const override;
 
-  bool FoldImmediate(MachineInstr *UseMI, MachineInstr *DefMI,
-                     unsigned Reg, MachineRegisterInfo *MRI) const final;
+  bool FoldImmediate(MachineInstr &UseMI, MachineInstr &DefMI, unsigned Reg,
+                     MachineRegisterInfo *MRI) const final;
 
   unsigned getMachineCSELookAheadLimit() const override { return 500; }
 
   MachineInstr *convertToThreeAddress(MachineFunction::iterator &MBB,
-                                      MachineBasicBlock::iterator &MI,
+                                      MachineInstr &MI,
                                       LiveVariables *LV) const override;
 
-  bool isSchedulingBoundary(const MachineInstr *MI,
+  bool isSchedulingBoundary(const MachineInstr &MI,
                             const MachineBasicBlock *MBB,
                             const MachineFunction &MF) const override;
 
@@ -317,6 +327,14 @@ public:
     return get(Opcode).TSFlags & SIInstrFlags::MIMG;
   }
 
+  static bool isGather4(const MachineInstr &MI) {
+    return MI.getDesc().TSFlags & SIInstrFlags::Gather4;
+  }
+
+  bool isGather4(uint16_t Opcode) const {
+    return get(Opcode).TSFlags & SIInstrFlags::Gather4;
+  }
+
   static bool isFLAT(const MachineInstr &MI) {
     return MI.getDesc().TSFlags & SIInstrFlags::FLAT;
   }
@@ -333,6 +351,14 @@ public:
     return get(Opcode).TSFlags & SIInstrFlags::WQM;
   }
 
+  static bool isDisableWQM(const MachineInstr &MI) {
+    return MI.getDesc().TSFlags & SIInstrFlags::DisableWQM;
+  }
+
+  bool isDisableWQM(uint16_t Opcode) const {
+    return get(Opcode).TSFlags & SIInstrFlags::DisableWQM;
+  }
+
   static bool isVGPRSpill(const MachineInstr &MI) {
     return MI.getDesc().TSFlags & SIInstrFlags::VGPRSpill;
   }
@@ -341,12 +367,36 @@ public:
     return get(Opcode).TSFlags & SIInstrFlags::VGPRSpill;
   }
 
+  static bool isSGPRSpill(const MachineInstr &MI) {
+    return MI.getDesc().TSFlags & SIInstrFlags::SGPRSpill;
+  }
+
+  bool isSGPRSpill(uint16_t Opcode) const {
+    return get(Opcode).TSFlags & SIInstrFlags::SGPRSpill;
+  }
+
   static bool isDPP(const MachineInstr &MI) {
     return MI.getDesc().TSFlags & SIInstrFlags::DPP;
   }
 
   bool isDPP(uint16_t Opcode) const {
     return get(Opcode).TSFlags & SIInstrFlags::DPP;
+  }
+
+  static bool isScalarUnit(const MachineInstr &MI) {
+    return MI.getDesc().TSFlags & (SIInstrFlags::SALU | SIInstrFlags::SMRD);
+  }
+
+  static bool usesVM_CNT(const MachineInstr &MI) {
+    return MI.getDesc().TSFlags & SIInstrFlags::VM_CNT;
+  }
+
+  static bool sopkIsZext(const MachineInstr &MI) {
+    return MI.getDesc().TSFlags & SIInstrFlags::SOPK_ZEXT;
+  }
+
+  bool sopkIsZext(uint16_t Opcode) const {
+    return get(Opcode).TSFlags & SIInstrFlags::SOPK_ZEXT;
   }
 
   bool isVGPRCopy(const MachineInstr &MI) const {
@@ -361,7 +411,13 @@ public:
   bool isInlineConstant(const MachineOperand &MO, unsigned OpSize) const;
   bool isLiteralConstant(const MachineOperand &MO, unsigned OpSize) const;
 
-  bool isImmOperandLegal(const MachineInstr *MI, unsigned OpNo,
+  // Returns true if this operand could potentially require a 32-bit literal
+  // operand, but not necessarily. A FrameIndex for example could resolve to an
+  // inline immediate value that will not require an additional 4-bytes; this
+  // assumes that it will.
+  bool isLiteralConstantLike(const MachineOperand &MO, unsigned OpSize) const;
+
+  bool isImmOperandLegal(const MachineInstr &MI, unsigned OpNo,
                          const MachineOperand &MO) const;
 
   /// \brief Return true if this 64-bit VALU instruction has a 32-bit encoding.
@@ -380,7 +436,7 @@ public:
   bool hasModifiersSet(const MachineInstr &MI,
                        unsigned OpName) const;
 
-  bool verifyInstruction(const MachineInstr *MI,
+  bool verifyInstruction(const MachineInstr &MI,
                          StringRef &ErrInfo) const override;
 
   static unsigned getVALUOp(const MachineInstr &MI);
@@ -428,11 +484,11 @@ public:
   ///
   /// If the operand being legalized is a register, then a COPY will be used
   /// instead of MOV.
-  void legalizeOpWithMove(MachineInstr *MI, unsigned OpIdx) const;
+  void legalizeOpWithMove(MachineInstr &MI, unsigned OpIdx) const;
 
   /// \brief Check if \p MO is a legal operand if it was the \p OpIdx Operand
   /// for \p MI.
-  bool isOperandLegal(const MachineInstr *MI, unsigned OpIdx,
+  bool isOperandLegal(const MachineInstr &MI, unsigned OpIdx,
                       const MachineOperand *MO = nullptr) const;
 
   /// \brief Check if \p MO would be a valid operand for the given operand
@@ -450,36 +506,28 @@ public:
 
   /// \brief Legalize operands in \p MI by either commuting it or inserting a
   /// copy of src1.
-  void legalizeOperandsVOP2(MachineRegisterInfo &MRI, MachineInstr *MI) const;
+  void legalizeOperandsVOP2(MachineRegisterInfo &MRI, MachineInstr &MI) const;
 
   /// \brief Fix operands in \p MI to satisfy constant bus requirements.
-  void legalizeOperandsVOP3(MachineRegisterInfo &MRI, MachineInstr *MI) const;
+  void legalizeOperandsVOP3(MachineRegisterInfo &MRI, MachineInstr &MI) const;
 
   /// Copy a value from a VGPR (\p SrcReg) to SGPR.  This function can only
   /// be used when it is know that the value in SrcReg is same across all
   /// threads in the wave.
   /// \returns The SGPR register that \p SrcReg was copied to.
-  unsigned readlaneVGPRToSGPR(unsigned SrcReg, MachineInstr *UseMI,
-                          MachineRegisterInfo &MRI) const;
+  unsigned readlaneVGPRToSGPR(unsigned SrcReg, MachineInstr &UseMI,
+                              MachineRegisterInfo &MRI) const;
 
-  void legalizeOperandsSMRD(MachineRegisterInfo &MRI, MachineInstr *MI) const;
+  void legalizeOperandsSMRD(MachineRegisterInfo &MRI, MachineInstr &MI) const;
 
   /// \brief Legalize all operands in this instruction.  This function may
   /// create new instruction and insert them before \p MI.
-  void legalizeOperands(MachineInstr *MI) const;
+  void legalizeOperands(MachineInstr &MI) const;
 
   /// \brief Replace this instruction's opcode with the equivalent VALU
   /// opcode.  This function will also move the users of \p MI to the
   /// VALU if necessary.
   void moveToVALU(MachineInstr &MI) const;
-
-  const TargetRegisterClass *getIndirectAddrRegClass() const override;
-
-  void reserveIndirectRegisters(BitVector &Reserved,
-                                const MachineFunction &MF) const;
-
-  void LoadM0(MachineInstr *MoveRel, MachineBasicBlock::iterator I,
-              unsigned SavReg, unsigned IndexReg) const;
 
   void insertWaitStates(MachineBasicBlock &MBB,MachineBasicBlock::iterator MI,
                         int Count) const;
@@ -511,8 +559,8 @@ public:
   uint64_t getDefaultRsrcDataFormat() const;
   uint64_t getScratchRsrcWords23() const;
 
-  bool isLowLatencyInstruction(const MachineInstr *MI) const;
-  bool isHighLatencyInstruction(const MachineInstr *MI) const;
+  bool isLowLatencyInstruction(const MachineInstr &MI) const;
+  bool isHighLatencyInstruction(const MachineInstr &MI) const;
 
   /// \brief Return the descriptor of the target-specific machine instruction
   /// that corresponds to the specified pseudo or native opcode.
@@ -520,7 +568,15 @@ public:
     return get(pseudoToMCOpcode(Opcode));
   }
 
-  unsigned getInstSizeInBytes(const MachineInstr &MI) const;
+  unsigned isStackAccess(const MachineInstr &MI, int &FrameIndex) const;
+  unsigned isSGPRStackAccess(const MachineInstr &MI, int &FrameIndex) const;
+
+  unsigned isLoadFromStackSlot(const MachineInstr &MI,
+                               int &FrameIndex) const override;
+  unsigned isStoreToStackSlot(const MachineInstr &MI,
+                              int &FrameIndex) const override;
+
+  unsigned getInstSizeInBytes(const MachineInstr &MI) const override;
 
   ArrayRef<std::pair<int, const char *>>
   getSerializableTargetIndices() const override;
@@ -554,6 +610,9 @@ namespace AMDGPU {
 
   LLVM_READONLY
   int getAtomicNoRetOp(uint16_t Opcode);
+
+  LLVM_READONLY
+  int getSOPKOp(uint16_t Opcode);
 
   const uint64_t RSRC_DATA_FORMAT = 0xf00000000000LL;
   const uint64_t RSRC_ELEMENT_SIZE_SHIFT = (32 + 19);

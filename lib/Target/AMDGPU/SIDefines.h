@@ -40,17 +40,29 @@ enum {
   FLAT = 1 << 21,
   WQM = 1 << 22,
   VGPRSpill = 1 << 23,
-  VOPAsmPrefer32Bit = 1 << 24
+  SGPRSpill = 1 << 24,
+  VOPAsmPrefer32Bit = 1 << 25,
+  Gather4 = 1 << 26,
+  DisableWQM = 1 << 27,
+  SOPK_ZEXT = 1 << 28
 };
 }
 
 namespace llvm {
 namespace AMDGPU {
   enum OperandType {
-    /// Operand with register or 32-bit immediate
-    OPERAND_REG_IMM32 = MCOI::OPERAND_FIRST_TARGET,
-    /// Operand with register or inline constant
-    OPERAND_REG_INLINE_C
+    /// Operands with register or 32-bit immediate
+    OPERAND_REG_IMM32_INT = MCOI::OPERAND_FIRST_TARGET,
+    OPERAND_REG_IMM32_FP,
+    /// Operands with register or inline constant
+    OPERAND_REG_INLINE_C_INT,
+    OPERAND_REG_INLINE_C_FP,
+
+    // Operand for source modifiers for VOP instructions
+    OPERAND_INPUT_MODS,
+
+    /// Operand with 32-bit immediate that uses the constant bus.
+    OPERAND_KIMM32
   };
 }
 }
@@ -95,6 +107,15 @@ namespace SIOutMods {
     MUL2 = 1,
     MUL4 = 2,
     DIV2 = 3
+  };
+}
+
+namespace AMDGPUAsmVariants {
+  enum {
+    DEFAULT = 0,
+    VOP3 = 1,
+    SDWA = 2,
+    DPP = 3
   };
 }
 
@@ -302,5 +323,7 @@ enum WidthMinusOne { // WidthMinusOne, (5) [15:11]
 #define R_0286E8_SPI_TMPRING_SIZE                                       0x0286E8
 #define   S_0286E8_WAVESIZE(x)                                        (((x) & 0x1FFF) << 12)
 
+#define R_SPILLED_SGPRS         0x4
+#define R_SPILLED_VGPRS         0x8
 
 #endif

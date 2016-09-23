@@ -346,7 +346,7 @@ bool MachineCSE::isCSECandidate(MachineInstr *MI) {
     // Okay, this instruction does a load. As a refinement, we allow the target
     // to decide whether the loaded value is actually a constant. If so, we can
     // actually use it as a load.
-    if (!MI->isInvariantLoad(AA))
+    if (!MI->isDereferenceableInvariantLoad(AA))
       // FIXME: we should be able to hoist loads with no other side effects if
       // there are no other instructions which can change memory in this loop.
       // This is a trivial form of alias analysis.
@@ -389,7 +389,7 @@ bool MachineCSE::isProfitableToCSE(unsigned CSReg, unsigned Reg,
   // Heuristics #1: Don't CSE "cheap" computation if the def is not local or in
   // an immediate predecessor. We don't want to increase register pressure and
   // end up causing other computation to be spilled.
-  if (TII->isAsCheapAsAMove(MI)) {
+  if (TII->isAsCheapAsAMove(*MI)) {
     MachineBasicBlock *CSBB = CSMI->getParent();
     MachineBasicBlock *BB = MI->getParent();
     if (CSBB != BB && !CSBB->isSuccessor(BB))
@@ -478,8 +478,7 @@ bool MachineCSE::ProcessBlock(MachineBasicBlock *MBB) {
     // Commute commutable instructions.
     bool Commuted = false;
     if (!FoundCSE && MI->isCommutable()) {
-      MachineInstr *NewMI = TII->commuteInstruction(MI);
-      if (NewMI) {
+      if (MachineInstr *NewMI = TII->commuteInstruction(*MI)) {
         Commuted = true;
         FoundCSE = VNT.count(NewMI);
         if (NewMI != MI) {
@@ -488,7 +487,7 @@ bool MachineCSE::ProcessBlock(MachineBasicBlock *MBB) {
           Changed = true;
         } else if (!FoundCSE)
           // MI was changed but it didn't help, commute it back!
-          (void)TII->commuteInstruction(MI);
+          (void)TII->commuteInstruction(*MI);
       }
     }
 

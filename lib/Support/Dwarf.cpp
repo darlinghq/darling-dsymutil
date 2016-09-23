@@ -147,6 +147,7 @@ const char *llvm::dwarf::AttributeString(unsigned Attribute) {
   case DW_AT_dwo_name:                   return "DW_AT_dwo_name";
   case DW_AT_reference:                  return "DW_AT_reference";
   case DW_AT_rvalue_reference:           return "DW_AT_rvalue_reference";
+  case DW_AT_noreturn:                   return "DW_AT_noreturn";
   case DW_AT_MIPS_loop_begin:            return "DW_AT_MIPS_loop_begin";
   case DW_AT_MIPS_tail_loop_begin:       return "DW_AT_MIPS_tail_loop_begin";
   case DW_AT_MIPS_epilog_begin:          return "DW_AT_MIPS_epilog_begin";
@@ -545,6 +546,12 @@ const char *llvm::dwarf::ApplePropertyString(unsigned Prop) {
     return "DW_APPLE_PROPERTY_strong";
   case DW_APPLE_PROPERTY_unsafe_unretained:
     return "DW_APPLE_PROPERTY_unsafe_unretained";
+  case DW_APPLE_PROPERTY_nullability:
+    return "DW_APPLE_PROPERTY_nullability";
+  case DW_APPLE_PROPERTY_null_resettable:
+    return "DW_APPLE_PROPERTY_null_resettable";
+  case DW_APPLE_PROPERTY_class:
+    return "DW_APPLE_PROPERTY_class";
   }
   return nullptr;
 }

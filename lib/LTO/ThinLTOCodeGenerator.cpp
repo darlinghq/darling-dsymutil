@@ -12,7 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/LTO/ThinLTOCodeGenerator.h"
+#include "llvm/LTO/legacy/ThinLTOCodeGenerator.h"
 
 #ifdef HAVE_LLVM_REVISION
 #include "LLVMLTORevision.h"
@@ -78,9 +78,9 @@ static void saveTempBitcode(const Module &TheModule, StringRef TempDir,
   if (TempDir.empty())
     return;
   // User asked to save temps, let dump the bitcode file after import.
-  auto SaveTempPath = TempDir + llvm::utostr(count) + Suffix;
+  std::string SaveTempPath = (TempDir + llvm::utostr(count) + Suffix).str();
   std::error_code EC;
-  raw_fd_ostream OS(SaveTempPath.str(), EC, sys::fs::F_None);
+  raw_fd_ostream OS(SaveTempPath, EC, sys::fs::F_None);
   if (EC)
     report_fatal_error(Twine("Failed to open ") + SaveTempPath +
                        " to save optimized bitcode\n");
@@ -377,8 +377,8 @@ ProcessThinLTOModule(Module &TheModule, ModuleSummaryIndex &Index,
     SmallVector<char, 128> OutputBuffer;
     {
       raw_svector_ostream OS(OutputBuffer);
-      ModuleSummaryIndexBuilder IndexBuilder(&TheModule);
-      WriteBitcodeToFile(&TheModule, OS, true, &IndexBuilder.getIndex());
+      auto Index = buildModuleSummaryIndex(TheModule);
+      WriteBitcodeToFile(&TheModule, OS, true, &Index);
     }
     return make_unique<ObjectMemoryBuffer>(std::move(OutputBuffer));
   }
@@ -393,8 +393,6 @@ ProcessThinLTOModule(Module &TheModule, ModuleSummaryIndex &Index,
 /// copies when possible).
 static void resolveWeakForLinkerInIndex(
     ModuleSummaryIndex &Index,
-    const StringMap<FunctionImporter::ExportSetTy> &ExportLists,
-    const DenseSet<GlobalValue::GUID> &GUIDPreservedSymbols,
     StringMap<std::map<GlobalValue::GUID, GlobalValue::LinkageTypes>>
         &ResolvedODR) {
 
@@ -409,21 +407,13 @@ static void resolveWeakForLinkerInIndex(
     return Prevailing->second == S;
   };
 
-  auto isExported = [&](StringRef ModuleIdentifier, GlobalValue::GUID GUID) {
-    const auto &ExportList = ExportLists.find(ModuleIdentifier);
-    return (ExportList != ExportLists.end() &&
-            ExportList->second.count(GUID)) ||
-           GUIDPreservedSymbols.count(GUID);
-  };
-
   auto recordNewLinkage = [&](StringRef ModuleIdentifier,
                               GlobalValue::GUID GUID,
                               GlobalValue::LinkageTypes NewLinkage) {
     ResolvedODR[ModuleIdentifier][GUID] = NewLinkage;
   };
 
-  thinLTOResolveWeakForLinkerInIndex(Index, isPrevailing, isExported,
-                                     recordNewLinkage);
+  thinLTOResolveWeakForLinkerInIndex(Index, isPrevailing, recordNewLinkage);
 }
 
 // Initialize the TargetMachine builder for a given Triple
@@ -537,14 +527,9 @@ void ThinLTOCodeGenerator::promote(Module &TheModule,
   ComputeCrossModuleImport(Index, ModuleToDefinedGVSummaries, ImportLists,
                            ExportLists);
 
-  // Convert the preserved symbols set from string to GUID
-  auto GUIDPreservedSymbols =
-  computeGUIDPreservedSymbols(PreservedSymbols, TMBuilder.TheTriple);
-
   // Resolve LinkOnce/Weak symbols.
   StringMap<std::map<GlobalValue::GUID, GlobalValue::LinkageTypes>> ResolvedODR;
-  resolveWeakForLinkerInIndex(Index, ExportLists, GUIDPreservedSymbols,
-                              ResolvedODR);
+  resolveWeakForLinkerInIndex(Index, ResolvedODR);
 
   thinLTOResolveWeakForLinkerModule(
       TheModule, ModuleToDefinedGVSummaries[ModuleIdentifier]);
@@ -593,7 +578,7 @@ void ThinLTOCodeGenerator::gatherImportedSummariesForModule(
                            ExportLists);
 
   llvm::gatherImportedSummariesForModule(ModulePath, ModuleToDefinedGVSummaries,
-                                         ImportLists,
+                                         ImportLists[ModulePath],
                                          ModuleToSummariesForIndex);
 }
 
@@ -616,7 +601,7 @@ void ThinLTOCodeGenerator::emitImports(StringRef ModulePath,
                            ExportLists);
 
   std::error_code EC;
-  if ((EC = EmitImportsFiles(ModulePath, OutputName, ImportLists)))
+  if ((EC = EmitImportsFiles(ModulePath, OutputName, ImportLists[ModulePath])))
     report_fatal_error(Twine("Failed to open ") + OutputName +
                        " to save imports lists\n");
 }
@@ -750,8 +735,7 @@ void ThinLTOCodeGenerator::run() {
 
   // Resolve LinkOnce/Weak symbols, this has to be computed early because it
   // impacts the caching.
-  resolveWeakForLinkerInIndex(*Index, ExportLists, GUIDPreservedSymbols,
-                              ResolvedODR);
+  resolveWeakForLinkerInIndex(*Index, ResolvedODR);
 
   auto isExported = [&](StringRef ModuleIdentifier, GlobalValue::GUID GUID) {
     const auto &ExportList = ExportLists.find(ModuleIdentifier);

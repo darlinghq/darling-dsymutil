@@ -351,6 +351,12 @@ public:
                            bool HasBaseReg, int64_t Scale,
                            unsigned AddrSpace = 0) const;
 
+  /// \brief Return true if target supports the load / store
+  /// instruction with the given Offset on the form reg + Offset. It
+  /// may be that Offset is too big for a certain type (register
+  /// class).
+  bool isFoldableMemAccessOffset(Instruction *I, int64_t Offset) const;
+  
   /// \brief Return true if it's free to truncate a value of type Ty1 to type
   /// Ty2. e.g. On x86 it's free to truncate a i32 value in register EAX to i16
   /// by referencing its sub-register AX.
@@ -388,6 +394,12 @@ public:
   /// operations, shuffles, or casts.
   bool isFPVectorizationPotentiallyUnsafe() const;
 
+  /// \brief Determine if the target supports unaligned memory accesses.
+  bool allowsMisalignedMemoryAccesses(LLVMContext &Context,
+                                      unsigned BitWidth, unsigned AddressSpace = 0,
+                                      unsigned Alignment = 1,
+                                      bool *Fast = nullptr) const;
+
   /// \brief Return hardware support for population count.
   PopcntSupportKind getPopcntSupport(unsigned IntTyWidthInBit) const;
 
@@ -409,6 +421,16 @@ public:
                     Type *Ty) const;
   int getIntImmCost(Intrinsic::ID IID, unsigned Idx, const APInt &Imm,
                     Type *Ty) const;
+
+  /// \brief Return the expected cost for the given integer when optimising
+  /// for size. This is different than the other integer immediate cost
+  /// functions in that it is subtarget agnostic. This is useful when you e.g.
+  /// target one ISA such as Aarch32 but smaller encodings could be possible
+  /// with another such as Thumb. This return value is used as a penalty when
+  /// the total costs for a constant is calculated (the bigger the cost, the
+  /// more beneficial constant hoisting is).
+  int getIntImmCodeSizeCost(unsigned Opc, unsigned Idx, const APInt &Imm,
+                            Type *Ty) const;
   /// @}
 
   /// \name Vector Target Information
@@ -644,6 +666,7 @@ public:
   virtual int getScalingFactorCost(Type *Ty, GlobalValue *BaseGV,
                                    int64_t BaseOffset, bool HasBaseReg,
                                    int64_t Scale, unsigned AddrSpace) = 0;
+  virtual bool isFoldableMemAccessOffset(Instruction *I, int64_t Offset) = 0;
   virtual bool isTruncateFree(Type *Ty1, Type *Ty2) = 0;
   virtual bool isProfitableToHoist(Instruction *I) = 0;
   virtual bool isTypeLegal(Type *Ty) = 0;
@@ -653,9 +676,16 @@ public:
   virtual bool enableAggressiveInterleaving(bool LoopHasReductions) = 0;
   virtual bool enableInterleavedAccessVectorization() = 0;
   virtual bool isFPVectorizationPotentiallyUnsafe() = 0;
+  virtual bool allowsMisalignedMemoryAccesses(LLVMContext &Context,
+                                              unsigned BitWidth,
+                                              unsigned AddressSpace,
+                                              unsigned Alignment,
+                                              bool *Fast) = 0;
   virtual PopcntSupportKind getPopcntSupport(unsigned IntTyWidthInBit) = 0;
   virtual bool haveFastSqrt(Type *Ty) = 0;
   virtual int getFPOpCost(Type *Ty) = 0;
+  virtual int getIntImmCodeSizeCost(unsigned Opc, unsigned Idx, const APInt &Imm,
+                                    Type *Ty) = 0;
   virtual int getIntImmCost(const APInt &Imm, Type *Ty) = 0;
   virtual int getIntImmCost(unsigned Opc, unsigned Idx, const APInt &Imm,
                             Type *Ty) = 0;
@@ -799,6 +829,9 @@ public:
     return Impl.getScalingFactorCost(Ty, BaseGV, BaseOffset, HasBaseReg,
                                      Scale, AddrSpace);
   }
+  bool isFoldableMemAccessOffset(Instruction *I, int64_t Offset) override {
+    return Impl.isFoldableMemAccessOffset(I, Offset);
+  }
   bool isTruncateFree(Type *Ty1, Type *Ty2) override {
     return Impl.isTruncateFree(Ty1, Ty2);
   }
@@ -820,6 +853,12 @@ public:
   bool isFPVectorizationPotentiallyUnsafe() override {
     return Impl.isFPVectorizationPotentiallyUnsafe();
   }
+  bool allowsMisalignedMemoryAccesses(LLVMContext &Context,
+                                      unsigned BitWidth, unsigned AddressSpace,
+                                      unsigned Alignment, bool *Fast) override {
+    return Impl.allowsMisalignedMemoryAccesses(Context, BitWidth, AddressSpace,
+                                               Alignment, Fast);
+  }
   PopcntSupportKind getPopcntSupport(unsigned IntTyWidthInBit) override {
     return Impl.getPopcntSupport(IntTyWidthInBit);
   }
@@ -827,6 +866,10 @@ public:
 
   int getFPOpCost(Type *Ty) override { return Impl.getFPOpCost(Ty); }
 
+  int getIntImmCodeSizeCost(unsigned Opc, unsigned Idx, const APInt &Imm,
+                            Type *Ty) override {
+    return Impl.getIntImmCodeSizeCost(Opc, Idx, Imm, Ty);
+  }
   int getIntImmCost(const APInt &Imm, Type *Ty) override {
     return Impl.getIntImmCost(Imm, Ty);
   }
@@ -995,7 +1038,7 @@ public:
     return *this;
   }
 
-  Result run(const Function &F, AnalysisManager<Function> &);
+  Result run(const Function &F, FunctionAnalysisManager &);
 
 private:
   friend AnalysisInfoMixin<TargetIRAnalysis>;

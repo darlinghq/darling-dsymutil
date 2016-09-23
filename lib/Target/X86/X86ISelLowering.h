@@ -106,6 +106,10 @@ namespace llvm {
       /// 0s or 1s.  Generally DTRT for C/C++ with NaNs.
       FSETCC,
 
+      /// X86 FP SETCC, similar to above, but with output as an i1 mask and
+      /// with optional rounding mode.
+      FSETCCM, FSETCCM_RND,
+
       /// X86 conditional moves. Operand 0 and operand 1 are the two values
       /// to select from. Operand 2 is the condition code, and operand 3 is the
       /// flag operand produced by a CMP or TEST instruction. It also writes a
@@ -205,12 +209,12 @@ namespace llvm {
       FDIV_RND,
       FMAX_RND,
       FMIN_RND,
-      FSQRT_RND,
+      FSQRT_RND, FSQRTS_RND,
 
       // FP vector get exponent.
-      FGETEXP_RND,
+      FGETEXP_RND, FGETEXPS_RND,
       // Extract Normalized Mantissas.
-      VGETMANT,
+      VGETMANT, VGETMANTS,
       // FP Scale.
       SCALEF,
       SCALEFS,
@@ -251,7 +255,7 @@ namespace llvm {
       /// in order to obtain suitable precision.
       FRSQRT, FRCP,
       FRSQRTS, FRCPS,
-   
+
       // Thread Local Storage.
       TLSADDR,
 
@@ -293,10 +297,10 @@ namespace llvm {
       VTRUNCUS, VTRUNCS,
 
       // Vector FP extend.
-      VFPEXT,
+      VFPEXT, VFPEXT_RND, VFPEXTS_RND,
 
       // Vector FP round.
-      VFPROUND,
+      VFPROUND, VFPROUND_RND, VFPROUNDS_RND,
 
       // Vector signed/unsigned integer to double.
       CVTDQ2PD, CVTUDQ2PD,
@@ -426,9 +430,9 @@ namespace llvm {
       // Range Restriction Calculation For Packed Pairs of Float32/64 values.
       VRANGE,
       // Reduce - Perform Reduction Transformation on scalar\packed FP.
-      VREDUCE,
+      VREDUCE, VREDUCES,
       // RndScale - Round FP Values To Include A Given Number Of Fraction Bits.
-      VRNDSCALE,
+      VRNDSCALE, VRNDSCALES,
       // Tests Types Of a FP Values for packed types.
       VFPCLASS,
       // Tests Types Of a FP Values for scalar types.
@@ -490,15 +494,19 @@ namespace llvm {
       COMPRESS,
       EXPAND,
 
-      // Convert Unsigned/Integer to Scalar Floating-Point Value
-      // with rounding mode.
-      SINT_TO_FP_RND,
-      UINT_TO_FP_RND,
+      // Convert Unsigned/Integer to Floating-Point Value with rounding mode.
+      SINT_TO_FP_RND, UINT_TO_FP_RND,
+      SCALAR_SINT_TO_FP_RND, SCALAR_UINT_TO_FP_RND,
 
       // Vector float/double to signed/unsigned integer.
-      FP_TO_SINT_RND, FP_TO_UINT_RND,
+      CVTP2SI, CVTP2UI, CVTP2SI_RND, CVTP2UI_RND,
       // Scalar float/double to signed/unsigned integer.
-      SCALAR_FP_TO_SINT_RND, SCALAR_FP_TO_UINT_RND,
+      CVTS2SI_RND, CVTS2UI_RND,
+
+      // Vector float/double to signed/unsigned integer with truncation.
+      CVTTP2SI_RND, CVTTP2UI_RND,
+      // Scalar float/double to signed/unsigned integer with truncation.
+      CVTTS2SI_RND, CVTTS2UI_RND,
 
       // Save xmm argument registers to the stack, according to %al. An operator
       // is needed so that this can be expanded with control flow.
@@ -537,7 +545,10 @@ namespace llvm {
       XTEST,
 
       // ERI instructions.
-      RSQRT28, RCP28, EXP2,
+      RSQRT28, RSQRT28S, RCP28, RCP28S, EXP2,
+
+      // Conversions between float and half-float.
+      CVTPS2PH, CVTPH2PS,
 
       // Compare and swap.
       LCMPXCHG_DAG = ISD::FIRST_TARGET_MEMORY_OPCODE,
@@ -656,7 +667,6 @@ namespace llvm {
   //  X86 Implementation of the TargetLowering interface
   class X86TargetLowering final : public TargetLowering {
   public:
-    bool isPositionIndependent() const;
     explicit X86TargetLowering(const X86TargetMachine &TM,
                                const X86Subtarget &STI);
 
@@ -751,9 +761,8 @@ namespace llvm {
     bool hasCopyImplyingStackAdjustment(MachineFunction *MF) const override;
 
     MachineBasicBlock *
-      EmitInstrWithCustomInserter(MachineInstr *MI,
-                                  MachineBasicBlock *MBB) const override;
-
+    EmitInstrWithCustomInserter(MachineInstr &MI,
+                                MachineBasicBlock *MBB) const override;
 
     /// This method returns the name of a target specific DAG node.
     const char *getTargetNodeName(unsigned Opcode) const override;
@@ -764,6 +773,26 @@ namespace llvm {
 
     bool hasBitPreservingFPLogic(EVT VT) const override {
       return VT == MVT::f32 || VT == MVT::f64 || VT.isVector();
+    }
+
+    bool isMultiStoresCheaperThanBitsMerge(SDValue Lo,
+                                           SDValue Hi) const override {
+      // If the pair to store is a mixture of float and int values, we will
+      // save two bitwise instructions and one float-to-int instruction and
+      // increase one store instruction. There is potentially a more
+      // significant benefit because it avoids the float->int domain switch
+      // for input value. So It is more likely a win.
+      if (Lo.getOpcode() == ISD::BITCAST || Hi.getOpcode() == ISD::BITCAST) {
+        SDValue Opd = (Lo.getOpcode() == ISD::BITCAST) ? Lo.getOperand(0)
+                                                       : Hi.getOperand(0);
+        if (Opd.getValueType().isFloatingPoint())
+          return true;
+      }
+      // If the pair only contains int values, we will save two bitwise
+      // instructions and increase one store instruction (costing one more
+      // store buffer). Since the benefit is more blurred so we leave
+      // such pair out until we get testcase to prove it is a win.
+      return false;
     }
 
     bool hasAndNotCompare(SDValue Y) const override;
@@ -997,9 +1026,7 @@ namespace llvm {
 
     bool isIntDivCheap(EVT VT, AttributeSet Attr) const override;
 
-    bool supportSwiftError() const override {
-      return true;
-    }
+    bool supportSwiftError() const override;
 
   protected:
     std::pair<const TargetRegisterClass *, uint8_t>
@@ -1034,7 +1061,7 @@ namespace llvm {
     SDValue LowerMemArgument(SDValue Chain, CallingConv::ID CallConv,
                              const SmallVectorImpl<ISD::InputArg> &ArgInfo,
                              const SDLoc &dl, SelectionDAG &DAG,
-                             const CCValAssign &VA, MachineFrameInfo *MFI,
+                             const CCValAssign &VA, MachineFrameInfo &MFI,
                              unsigned i) const;
     SDValue LowerMemOpCallTo(SDValue Chain, SDValue StackPtr, SDValue Arg,
                              const SDLoc &dl, SelectionDAG &DAG,
@@ -1162,50 +1189,50 @@ namespace llvm {
 
     bool needsCmpXchgNb(Type *MemType) const;
 
-    void SetupEntryBlockForSjLj(MachineInstr *MI, MachineBasicBlock *MBB,
+    void SetupEntryBlockForSjLj(MachineInstr &MI, MachineBasicBlock *MBB,
                                 MachineBasicBlock *DispatchBB, int FI) const;
 
     // Utility function to emit the low-level va_arg code for X86-64.
-    MachineBasicBlock *EmitVAARG64WithCustomInserter(
-                       MachineInstr *MI,
-                       MachineBasicBlock *MBB) const;
+    MachineBasicBlock *
+    EmitVAARG64WithCustomInserter(MachineInstr &MI,
+                                  MachineBasicBlock *MBB) const;
 
     /// Utility function to emit the xmm reg save portion of va_start.
-    MachineBasicBlock *EmitVAStartSaveXMMRegsWithCustomInserter(
-                                                   MachineInstr *BInstr,
-                                                   MachineBasicBlock *BB) const;
+    MachineBasicBlock *
+    EmitVAStartSaveXMMRegsWithCustomInserter(MachineInstr &BInstr,
+                                             MachineBasicBlock *BB) const;
 
-    MachineBasicBlock *EmitLoweredSelect(MachineInstr *I,
+    MachineBasicBlock *EmitLoweredSelect(MachineInstr &I,
                                          MachineBasicBlock *BB) const;
 
-    MachineBasicBlock *EmitLoweredAtomicFP(MachineInstr *I,
+    MachineBasicBlock *EmitLoweredAtomicFP(MachineInstr &I,
                                            MachineBasicBlock *BB) const;
 
-    MachineBasicBlock *EmitLoweredCatchRet(MachineInstr *MI,
+    MachineBasicBlock *EmitLoweredCatchRet(MachineInstr &MI,
                                            MachineBasicBlock *BB) const;
 
-    MachineBasicBlock *EmitLoweredCatchPad(MachineInstr *MI,
+    MachineBasicBlock *EmitLoweredCatchPad(MachineInstr &MI,
                                            MachineBasicBlock *BB) const;
 
-    MachineBasicBlock *EmitLoweredSegAlloca(MachineInstr *MI,
+    MachineBasicBlock *EmitLoweredSegAlloca(MachineInstr &MI,
                                             MachineBasicBlock *BB) const;
 
-    MachineBasicBlock *EmitLoweredTLSAddr(MachineInstr *MI,
+    MachineBasicBlock *EmitLoweredTLSAddr(MachineInstr &MI,
                                           MachineBasicBlock *BB) const;
 
-    MachineBasicBlock *EmitLoweredTLSCall(MachineInstr *MI,
+    MachineBasicBlock *EmitLoweredTLSCall(MachineInstr &MI,
                                           MachineBasicBlock *BB) const;
 
-    MachineBasicBlock *emitEHSjLjSetJmp(MachineInstr *MI,
+    MachineBasicBlock *emitEHSjLjSetJmp(MachineInstr &MI,
                                         MachineBasicBlock *MBB) const;
 
-    MachineBasicBlock *emitEHSjLjLongJmp(MachineInstr *MI,
+    MachineBasicBlock *emitEHSjLjLongJmp(MachineInstr &MI,
                                          MachineBasicBlock *MBB) const;
 
-    MachineBasicBlock *emitFMA3Instr(MachineInstr *MI,
+    MachineBasicBlock *emitFMA3Instr(MachineInstr &MI,
                                      MachineBasicBlock *MBB) const;
 
-    MachineBasicBlock *EmitSjLjDispatchBlock(MachineInstr *MI,
+    MachineBasicBlock *EmitSjLjDispatchBlock(MachineInstr &MI,
                                              MachineBasicBlock *MBB) const;
 
     /// Emit nodes that will be selected as "test Op0,Op0", or something
@@ -1220,6 +1247,9 @@ namespace llvm {
 
     /// Convert a comparison if required by the subtarget.
     SDValue ConvertCmpIfNecessary(SDValue Cmp, SelectionDAG &DAG) const;
+
+    /// Check if replacement of SQRT with RSQRT should be disabled.
+    bool isFsqrtCheap(SDValue Operand, SelectionDAG &DAG) const override;
 
     /// Use rsqrt* to speed up sqrt calculations.
     SDValue getRsqrtEstimate(SDValue Operand, DAGCombinerInfo &DCI,

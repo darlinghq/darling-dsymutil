@@ -16,6 +16,7 @@ add_llvm_library(LLVMTransformUtils
   FunctionImportUtils.cpp
   GlobalStatus.cpp
   InlineFunction.cpp
+  ImportedFunctionsInliningStatistics.cpp
   InstructionNamer.cpp
   IntegerDivision.cpp
   LCSSA.cpp
@@ -31,7 +32,7 @@ add_llvm_library(LLVMTransformUtils
   MemorySSA.cpp
   MetaRenamer.cpp
   ModuleUtils.cpp
-  NameAnonFunctions.cpp
+  NameAnonGlobals.cpp
   PromoteMemoryToRegister.cpp
   SSAUpdater.cpp
   SanitizerStats.cpp

@@ -10,7 +10,7 @@
 #include "Error.h"
 #include "obj2yaml.h"
 #include "llvm/Object/MachOUniversal.h"
-#include "llvm/ObjectYAML/MachOYAML.h"
+#include "llvm/ObjectYAML/ObjectYAML.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/LEB128.h"
 
@@ -455,8 +455,6 @@ void MachODumper::dumpSymbols(std::unique_ptr<MachOYAML::Object> &Y) {
   while (RemainingTable.size() > 0) {
     auto SymbolPair = RemainingTable.split('\0');
     RemainingTable = SymbolPair.second;
-    if (SymbolPair.first.empty())
-      break;
     LEData.StringTable.push_back(SymbolPair.first);
   }
 }
@@ -467,15 +465,18 @@ Error macho2yaml(raw_ostream &Out, const object::MachOObjectFile &Obj) {
   if (!YAML)
     return YAML.takeError();
 
+  yaml::YamlObjectFile YAMLFile;
+  YAMLFile.MachO = std::move(YAML.get());
+
   yaml::Output Yout(Out);
-  Yout << *(YAML.get());
+  Yout << YAMLFile;
   return Error::success();
 }
 
 Error macho2yaml(raw_ostream &Out, const object::MachOUniversalBinary &Obj) {
-  MachOYAML::MachFile YAMLFile;
-  YAMLFile.isFat = true;
-  MachOYAML::UniversalBinary &YAML = YAMLFile.FatFile;
+  yaml::YamlObjectFile YAMLFile;
+  YAMLFile.FatMachO.reset(new MachOYAML::UniversalBinary());
+  MachOYAML::UniversalBinary &YAML = *YAMLFile.FatMachO;
   YAML.Header.magic = Obj.getMagic();
   YAML.Header.nfat_arch = Obj.getNumberOfObjects();
 

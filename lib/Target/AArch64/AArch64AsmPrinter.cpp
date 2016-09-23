@@ -49,6 +49,7 @@ namespace {
 class AArch64AsmPrinter : public AsmPrinter {
   AArch64MCInstLower MCInstLowering;
   StackMaps SM;
+  const AArch64Subtarget *STI;
 
 public:
   AArch64AsmPrinter(TargetMachine &TM, std::unique_ptr<MCStreamer> Streamer)
@@ -83,6 +84,7 @@ public:
 
   bool runOnMachineFunction(MachineFunction &F) override {
     AArch64FI = F.getInfo<AArch64FunctionInfo>();
+    STI = static_cast<const AArch64Subtarget*>(&F.getSubtarget());
     return AsmPrinter::runOnMachineFunction(F);
   }
 
@@ -110,6 +112,9 @@ private:
 
   /// \brief Emit the LOHs contained in AArch64FI.
   void EmitLOHs();
+
+  /// Emit instruction to set float register to zero.
+  void EmitFMov0(const MachineInstr &MI);
 
   typedef std::map<const MachineInstr *, MCSymbol *> MInstToMCSymbol;
   MInstToMCSymbol LOHInstToLabel;
@@ -224,8 +229,7 @@ bool AArch64AsmPrinter::printAsmRegInClass(const MachineOperand &MO,
                                            const TargetRegisterClass *RC,
                                            bool isVector, raw_ostream &O) {
   assert(MO.isReg() && "Should only get here with a register!");
-  const AArch64RegisterInfo *RI =
-      MF->getSubtarget<AArch64Subtarget>().getRegisterInfo();
+  const TargetRegisterInfo *RI = STI->getRegisterInfo();
   unsigned Reg = MO.getReg();
   unsigned RegToPrint = RC->getRegister(RI->getEncodingValue(Reg));
   assert(RI->regsOverlap(RegToPrint, Reg));
@@ -350,7 +354,7 @@ void AArch64AsmPrinter::PrintDebugValueComment(const MachineInstr *MI,
 
 void AArch64AsmPrinter::LowerSTACKMAP(MCStreamer &OutStreamer, StackMaps &SM,
                                       const MachineInstr &MI) {
-  unsigned NumNOPBytes = MI.getOperand(1).getImm();
+  unsigned NumNOPBytes = StackMapOpers(&MI).getNumPatchBytes();
 
   SM.recordStackMap(MI);
   assert(NumNOPBytes % 4 == 0 && "Invalid number of NOP bytes requested!");
@@ -382,7 +386,7 @@ void AArch64AsmPrinter::LowerPATCHPOINT(MCStreamer &OutStreamer, StackMaps &SM,
 
   PatchPointOpers Opers(&MI);
 
-  int64_t CallTarget = Opers.getMetaOper(PatchPointOpers::TargetPos).getImm();
+  int64_t CallTarget = Opers.getCallTarget().getImm();
   unsigned EncodedBytes = 0;
   if (CallTarget) {
     assert((CallTarget & 0xFFFFFFFFFFFF) == CallTarget &&
@@ -407,13 +411,47 @@ void AArch64AsmPrinter::LowerPATCHPOINT(MCStreamer &OutStreamer, StackMaps &SM,
     EmitToStreamer(OutStreamer, MCInstBuilder(AArch64::BLR).addReg(ScratchReg));
   }
   // Emit padding.
-  unsigned NumBytes = Opers.getMetaOper(PatchPointOpers::NBytesPos).getImm();
+  unsigned NumBytes = Opers.getNumPatchBytes();
   assert(NumBytes >= EncodedBytes &&
          "Patchpoint can't request size less than the length of a call.");
   assert((NumBytes - EncodedBytes) % 4 == 0 &&
          "Invalid number of NOP bytes requested!");
   for (unsigned i = EncodedBytes; i < NumBytes; i += 4)
     EmitToStreamer(OutStreamer, MCInstBuilder(AArch64::HINT).addImm(0));
+}
+
+void AArch64AsmPrinter::EmitFMov0(const MachineInstr &MI) {
+  unsigned DestReg = MI.getOperand(0).getReg();
+  if (STI->hasZeroCycleZeroing()) {
+    // Convert S/D register to corresponding Q register
+    if (AArch64::S0 <= DestReg && DestReg <= AArch64::S31) {
+      DestReg = AArch64::Q0 + (DestReg - AArch64::S0);
+    } else {
+      assert(AArch64::D0 <= DestReg && DestReg <= AArch64::D31);
+      DestReg = AArch64::Q0 + (DestReg - AArch64::D0);
+    }
+    MCInst MOVI;
+    MOVI.setOpcode(AArch64::MOVIv2d_ns);
+    MOVI.addOperand(MCOperand::createReg(DestReg));
+    MOVI.addOperand(MCOperand::createImm(0));
+    EmitToStreamer(*OutStreamer, MOVI);
+  } else {
+    MCInst FMov;
+    switch (MI.getOpcode()) {
+    default: llvm_unreachable("Unexpected opcode");
+    case AArch64::FMOVS0:
+      FMov.setOpcode(AArch64::FMOVWSr);
+      FMov.addOperand(MCOperand::createReg(DestReg));
+      FMov.addOperand(MCOperand::createReg(AArch64::WZR));
+      break;
+    case AArch64::FMOVD0:
+      FMov.setOpcode(AArch64::FMOVXDr);
+      FMov.addOperand(MCOperand::createReg(DestReg));
+      FMov.addOperand(MCOperand::createReg(AArch64::XZR));
+      break;
+    }
+    EmitToStreamer(*OutStreamer, FMov);
+  }
 }
 
 // Simple pseudo-instructions have their lowering (with expansion to real
@@ -520,6 +558,11 @@ void AArch64AsmPrinter::EmitInstruction(const MachineInstr *MI) {
 
     return;
   }
+
+  case AArch64::FMOVS0:
+  case AArch64::FMOVD0:
+    EmitFMov0(*MI);
+    return;
 
   case TargetOpcode::STACKMAP:
     return LowerSTACKMAP(*OutStreamer, SM, *MI);

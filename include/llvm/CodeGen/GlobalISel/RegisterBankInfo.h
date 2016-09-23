@@ -16,6 +16,8 @@
 #define LLVM_CODEGEN_GLOBALISEL_REGBANKINFO_H
 
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/GlobalISel/RegisterBank.h"
 #include "llvm/CodeGen/MachineValueType.h" // For SimpleValueType.
@@ -84,13 +86,21 @@ public:
   /// different register banks.
   struct ValueMapping {
     /// How the value is broken down between the different register banks.
-    SmallVector<PartialMapping, 2> BreakDown;
+    const PartialMapping *BreakDown;
 
-    /// Verify that this mapping makes sense for a value of \p ExpectedBitWidth.
+    /// Number of partial mapping to break down this value.
+    unsigned NumBreakDowns;
+
+    /// Iterators through the PartialMappings.
+    const PartialMapping *begin() const { return BreakDown; }
+    const PartialMapping *end() const { return BreakDown + NumBreakDowns; }
+
+    /// Verify that this mapping makes sense for a value of
+    /// \p MeaningFulBitWidth.
     /// \note This method does not check anything when assertions are disabled.
     ///
     /// \return True is the check was successful.
-    bool verify(unsigned ExpectedBitWidth) const;
+    bool verify(unsigned MeaningFulBitWidth) const;
 
     /// Print this on dbgs() stream.
     void dump() const;
@@ -109,7 +119,8 @@ public:
     /// Cost of this mapping.
     unsigned Cost;
     /// Mapping of all the operands.
-    std::unique_ptr<ValueMapping[]> OperandsMapping;
+    /// Note: Use a SmallVector to avoid heap allocation in most cases.
+    SmallVector<ValueMapping, 8> OperandsMapping;
     /// Number of operands.
     unsigned NumOperands;
 
@@ -131,7 +142,7 @@ public:
         : ID(ID), Cost(Cost), NumOperands(NumOperands) {
       assert(getID() != InvalidMappingID &&
              "Use the default constructor for invalid mapping");
-      OperandsMapping.reset(new ValueMapping[getNumOperands()]);
+      OperandsMapping.resize(getNumOperands());
     }
 
     /// Default constructor.
@@ -161,13 +172,6 @@ public:
     /// This is a lightweight check for obvious wrong instance.
     bool isValid() const { return getID() != InvalidMappingID; }
 
-    /// Set the operand mapping for the \p OpIdx-th operand.
-    /// The mapping will consist of only one element in the break down list.
-    /// This element will map to \p RegBank and fully define a mask, whose
-    /// bitwidth matches the size of \p MaskSize.
-    void setOperandMapping(unsigned OpIdx, unsigned MaskSize,
-                           const RegisterBank &RegBank);
-
     /// Verifiy that this mapping makes sense for \p MI.
     /// \pre \p MI must be connected to a MachineFunction.
     ///
@@ -193,7 +197,8 @@ public:
   class OperandsMapper {
     /// The OpIdx-th cell contains the index in NewVRegs where the VRegs of the
     /// OpIdx-th operand starts. -1 means we do not have such mapping yet.
-    std::unique_ptr<int[]> OpToNewVRegIdx;
+    /// Note: We use a SmallVector to avoid heap allocation for most cases.
+    SmallVector<int, 8> OpToNewVRegIdx;
     /// Hold the registers that will be used to map MI with InstrMapping.
     SmallVector<unsigned, 8> NewVRegs;
     /// Current MachineRegisterInfo, used to create new virtual registers.
@@ -287,12 +292,13 @@ public:
 
 protected:
   /// Hold the set of supported register banks.
-  std::unique_ptr<RegisterBank[]> RegBanks;
+  RegisterBank **RegBanks;
   /// Total number of register banks.
   unsigned NumRegBanks;
 
-  /// Mapping from MVT::SimpleValueType to register banks.
-  std::unique_ptr<const RegisterBank *[]> VTToRegBank;
+  /// Keep dynamically allocated PartialMapping in a separate map.
+  /// This shouldn't be needed when everything gets TableGen'ed.
+  mutable DenseMap<unsigned, PartialMapping> MapOfPartialMappings;
 
   /// Create a RegisterBankInfo that can accomodate up to \p NumRegBanks
   /// RegisterBank instances.
@@ -300,7 +306,7 @@ protected:
   /// \note For the verify method to succeed all the \p NumRegBanks
   /// must be initialized by createRegisterBank and updated with
   /// addRegBankCoverage RegisterBank.
-  RegisterBankInfo(unsigned NumRegBanks);
+  RegisterBankInfo(RegisterBank **RegBanks, unsigned NumRegBanks);
 
   /// This constructor is meaningless.
   /// It just provides a default constructor that can be used at link time
@@ -325,14 +331,6 @@ protected:
   /// It also adjusts the size of the register bank to reflect the maximal
   /// size of a value that can be hold into that register bank.
   ///
-  /// If \p AddTypeMapping is true, this method also records what types can
-  /// be mapped to \p ID. Although this done by default, targets may want to
-  /// disable it, espicially if a given type may be mapped on different
-  /// register bank. Indeed, in such case, this method only records the
-  /// first register bank where the type matches.
-  /// This information is only used to provide default mapping
-  /// (see getInstrMappingImpl).
-  ///
   /// \note This method does *not* add the super classes of \p RCId.
   /// The rationale is if \p ID covers the registers of \p RCId, that
   /// does not necessarily mean that \p ID covers the set of registers
@@ -343,43 +341,12 @@ protected:
   ///
   /// \todo TableGen should just generate the BitSet vector for us.
   void addRegBankCoverage(unsigned ID, unsigned RCId,
-                          const TargetRegisterInfo &TRI,
-                          bool AddTypeMapping = true);
+                          const TargetRegisterInfo &TRI);
 
   /// Get the register bank identified by \p ID.
   RegisterBank &getRegBank(unsigned ID) {
     assert(ID < getNumRegBanks() && "Accessing an unknown register bank");
-    return RegBanks[ID];
-  }
-
-  /// Get the register bank that has been recorded to cover \p SVT.
-  const RegisterBank *getRegBankForType(MVT::SimpleValueType SVT) const {
-    if (!VTToRegBank)
-      return nullptr;
-    assert(SVT < MVT::SimpleValueType::LAST_VALUETYPE && "Out-of-bound access");
-    return VTToRegBank.get()[SVT];
-  }
-
-  /// Record \p RegBank as the register bank that covers \p SVT.
-  /// If a record was already set for \p SVT, the mapping is not
-  /// updated, unless \p Force == true
-  ///
-  /// \post if getRegBankForType(SVT)\@pre == nullptr then
-  ///                       getRegBankForType(SVT) == &RegBank
-  /// \post if Force == true then getRegBankForType(SVT) == &RegBank
-  void recordRegBankForType(const RegisterBank &RegBank,
-                            MVT::SimpleValueType SVT, bool Force = false) {
-    if (!VTToRegBank) {
-      VTToRegBank.reset(
-          new const RegisterBank *[MVT::SimpleValueType::LAST_VALUETYPE]);
-      std::fill(&VTToRegBank[0],
-                &VTToRegBank[MVT::SimpleValueType::LAST_VALUETYPE], nullptr);
-    }
-    assert(SVT < MVT::SimpleValueType::LAST_VALUETYPE && "Out-of-bound access");
-    // If we want to override the mapping or the mapping does not exits yet,
-    // set the register bank for SVT.
-    if (Force || !getRegBankForType(SVT))
-      VTToRegBank.get()[SVT] = &RegBank;
+    return *RegBanks[ID];
   }
 
   /// Try to get the mapping of \p MI.
@@ -400,6 +367,11 @@ protected:
   /// In other words, this method will likely fail to find a mapping for
   /// any generic opcode that has not been lowered by target specific code.
   InstructionMapping getInstrMappingImpl(const MachineInstr &MI) const;
+
+  /// Get the uniquely generated PartialMapping for the
+  /// given arguments.
+  const PartialMapping &getPartialMapping(unsigned StartIdx, unsigned Length,
+                                          const RegisterBank &RegBank) const;
 
   /// Get the register bank for the \p OpIdx-th operand of \p MI form
   /// the encoding constraints, if any.
@@ -478,6 +450,15 @@ public:
     // to override that properly anyway if they care.
     return &A != &B;
   }
+
+  /// Constrain the (possibly generic) virtual register \p Reg to \p RC.
+  ///
+  /// \pre \p Reg is a virtual register that either has a bank or a class.
+  /// \returns The constrained register class, or nullptr if there is none.
+  /// \note This is a generic variant of MachineRegisterInfo::constrainRegClass
+  static const TargetRegisterClass *
+  constrainGenericRegister(unsigned Reg, const TargetRegisterClass &RC,
+                           MachineRegisterInfo &MRI);
 
   /// Identifier used when the related instruction mapping instance
   /// is generated by target independent code.
