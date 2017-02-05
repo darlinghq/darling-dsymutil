@@ -148,16 +148,7 @@ void MCELFStreamer::ChangeSection(MCSection *Section,
     Asm.registerSymbol(*Grp);
 
   this->MCObjectStreamer::ChangeSection(Section, Subsection);
-  MCContext &Ctx = getContext();
-  auto *Begin = cast_or_null<MCSymbolELF>(Section->getBeginSymbol());
-  if (!Begin) {
-    Begin = Ctx.getOrCreateSectionSymbol(*SectionELF);
-    Section->setBeginSymbol(Begin);
-  }
-  if (Begin->isUndefined()) {
-    Asm.registerSymbol(*Begin);
-    Begin->setType(ELF::STT_SECTION);
-  }
+  Asm.registerSymbol(*Section->getBeginSymbol());
 }
 
 void MCELFStreamer::EmitWeakReference(MCSymbol *Alias, const MCSymbol *Symbol) {
@@ -329,8 +320,8 @@ void MCELFStreamer::EmitCommonSymbol(MCSymbol *S, uint64_t Size,
       ->setSize(MCConstantExpr::create(Size, getContext()));
 }
 
-void MCELFStreamer::emitELFSize(MCSymbolELF *Symbol, const MCExpr *Value) {
-  Symbol->setSize(Value);
+void MCELFStreamer::emitELFSize(MCSymbol *Symbol, const MCExpr *Value) {
+  cast<MCSymbolELF>(Symbol)->setSize(Value);
 }
 
 void MCELFStreamer::EmitLocalCommonSymbol(MCSymbol *S, uint64_t Size,

@@ -49,6 +49,7 @@
 #include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ToolOutputFile.h"
+#include "llvm/Support/YAMLTraits.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/Coroutines.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
@@ -96,6 +97,10 @@ NoOutput("disable-output",
 
 static cl::opt<bool>
 OutputAssembly("S", cl::desc("Write output as LLVM assembly"));
+
+static cl::opt<bool>
+    OutputThinLTOBC("thinlto-bc",
+                    cl::desc("Write output as ThinLTO-ready bitcode"));
 
 static cl::opt<bool>
 NoVerify("disable-verify", cl::desc("Do not run the verifier"), cl::Hidden);
@@ -231,6 +236,11 @@ static cl::opt<bool> PassRemarksWithHotness(
     cl::desc("With PGO, include profile count in optimization remarks"),
     cl::Hidden);
 
+static cl::opt<std::string>
+    RemarksFilename("pass-remarks-output",
+                    cl::desc("YAML output filename for pass remarks"),
+                    cl::value_desc("filename"));
+
 static inline void addPass(legacy::PassManagerBase &PM, Pass *P) {
   // Add the pass to the pass manager...
   PM.add(P);
@@ -277,13 +287,8 @@ static void AddOptimizationPasses(legacy::PassManagerBase &MPM,
   Builder.SLPVectorize =
       DisableSLPVectorization ? false : OptLevel > 1 && SizeLevel < 2;
 
-  // Add target-specific passes that need to run as early as possible.
   if (TM)
-    Builder.addExtension(
-        PassManagerBuilder::EP_EarlyAsPossible,
-        [&](const PassManagerBuilder &, legacy::PassManagerBase &PM) {
-          TM->addEarlyAsPossiblePasses(PM);
-        });
+    TM->adjustPassManager(Builder);
 
   if (Coroutines)
     addCoroutinePassesToExtensionPoints(Builder);
@@ -358,6 +363,7 @@ int main(int argc, char **argv) {
   InitializeAllTargets();
   InitializeAllTargetMCs();
   InitializeAllAsmPrinters();
+  InitializeAllAsmParsers();
 
   // Initialize passes
   PassRegistry &Registry = *PassRegistry::getPassRegistry();
@@ -407,6 +413,19 @@ int main(int argc, char **argv) {
 
   if (PassRemarksWithHotness)
     Context.setDiagnosticHotnessRequested(true);
+
+  std::unique_ptr<tool_output_file> YamlFile;
+  if (RemarksFilename != "") {
+    std::error_code EC;
+    YamlFile = llvm::make_unique<tool_output_file>(RemarksFilename, EC,
+                                                   sys::fs::F_None);
+    if (EC) {
+      errs() << EC.message() << '\n';
+      return 1;
+    }
+    Context.setDiagnosticsOutputFile(
+        llvm::make_unique<yaml::Output>(YamlFile->os()));
+  }
 
   // Load the input module...
   std::unique_ptr<Module> M = parseIRFile(InputFilename, Err, Context);
@@ -684,7 +703,9 @@ int main(int argc, char **argv) {
       if (EmitModuleHash)
         report_fatal_error("Text output is incompatible with -module-hash");
       Passes.add(createPrintModulePass(*OS, "", PreserveAssemblyUseListOrder));
-    } else
+    } else if (OutputThinLTOBC)
+      Passes.add(createWriteThinLTOBitcodePass(*OS));
+    else
       Passes.add(createBitcodeWriterPass(*OS, PreserveBitcodeUseListOrder,
                                          EmitSummaryIndex, EmitModuleHash));
   }
@@ -716,6 +737,8 @@ int main(int argc, char **argv) {
                 "the compile-twice option\n";
       Out->os() << BOS->str();
       Out->keep();
+      if (YamlFile)
+        YamlFile->keep();
       return 1;
     }
     Out->os() << BOS->str();
@@ -724,6 +747,9 @@ int main(int argc, char **argv) {
   // Declare success.
   if (!NoOutput || PrintBreakpoints)
     Out->keep();
+
+  if (YamlFile)
+    YamlFile->keep();
 
   return 0;
 }

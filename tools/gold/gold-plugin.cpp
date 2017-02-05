@@ -12,7 +12,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/Bitcode/ReaderWriter.h"
+#include "llvm/ADT/Statistic.h"
+#include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/CodeGen/CommandFlags.h"
 #include "llvm/Config/config.h" // plugin-api.h requires HAVE_STDINT_H
 #include "llvm/IR/Constants.h"
@@ -105,7 +107,6 @@ static DenseMap<int, void *> FDToLeaderHandle;
 static StringMap<ResolutionInfo> ResInfo;
 static std::vector<std::string> Cleanup;
 static llvm::TargetOptions TargetOpts;
-static size_t MaxTasks;
 
 namespace options {
   enum OutputType {
@@ -118,9 +119,11 @@ namespace options {
   static unsigned OptLevel = 2;
   // Default parallelism of 0 used to indicate that user did not specify.
   // Actual parallelism default value depends on implementation.
-  // Currently, code generation defaults to no parallelism, whereas
-  // ThinLTO uses the hardware_concurrency as the default.
+  // Currently only affects ThinLTO, where the default is
+  // llvm::heavyweight_hardware_concurrency.
   static unsigned Parallelism = 0;
+  // Default regular LTO codegen parallelism (number of partitions).
+  static unsigned ParallelCodeGenParallelismLevel = 1;
 #ifdef NDEBUG
   static bool DisableVerify = true;
 #else
@@ -168,6 +171,8 @@ namespace options {
   // Note: This array will contain all plugin options which are not claimed
   // as plugin exclusive to pass to the code generator.
   static std::vector<const char *> extra;
+  // Sample profile file path
+  static std::string sample_profile;
 
   static void process_plugin_option(const char *opt_)
   {
@@ -200,7 +205,7 @@ namespace options {
       thinlto_emit_imports_files = true;
     } else if (opt.startswith("thinlto-prefix-replace=")) {
       thinlto_prefix_replace = opt.substr(strlen("thinlto-prefix-replace="));
-      if (thinlto_prefix_replace.find(";") == std::string::npos)
+      if (thinlto_prefix_replace.find(';') == std::string::npos)
         message(LDPL_FATAL, "thinlto-prefix-replace expects 'old;new' format");
     } else if (opt.startswith("cache-dir=")) {
       cache_dir = opt.substr(strlen("cache-dir="));
@@ -211,8 +216,14 @@ namespace options {
     } else if (opt.startswith("jobs=")) {
       if (StringRef(opt_ + 5).getAsInteger(10, Parallelism))
         message(LDPL_FATAL, "Invalid parallelism level: %s", opt_ + 5);
+    } else if (opt.startswith("lto-partitions=")) {
+      if (opt.substr(strlen("lto-partitions="))
+              .getAsInteger(10, ParallelCodeGenParallelismLevel))
+        message(LDPL_FATAL, "Invalid codegen partition level: %s", opt_ + 5);
     } else if (opt == "disable-verify") {
       DisableVerify = true;
+    } else if (opt.startswith("sample-profile=")) {
+      sample_profile= opt.substr(strlen("sample-profile="));
     } else {
       // Save this option to pass to the code generator.
       // ParseCommandLineOptions() expects argv[0] to be program name. Lazily
@@ -362,12 +373,6 @@ ld_plugin_status onload(ld_plugin_tv *tv) {
 }
 
 static void diagnosticHandler(const DiagnosticInfo &DI) {
-  if (const auto *BDI = dyn_cast<BitcodeDiagnosticInfo>(&DI)) {
-    std::error_code EC = BDI->getError();
-    if (EC == BitcodeError::InvalidBitcodeSignature)
-      return;
-  }
-
   std::string ErrStorage;
   {
     raw_string_ostream OS(ErrStorage);
@@ -391,7 +396,7 @@ static void diagnosticHandler(const DiagnosticInfo &DI) {
 }
 
 static void check(Error E, std::string Msg = "LLVM gold plugin") {
-  handleAllErrors(std::move(E), [&](ErrorInfoBase &EIB) {
+  handleAllErrors(std::move(E), [&](ErrorInfoBase &EIB) -> Error {
     message(LDPL_FATAL, "%s: %s", Msg.c_str(), EIB.message().c_str());
     return Error::success();
   });
@@ -520,9 +525,11 @@ static ld_plugin_status claim_file_hook(const ld_plugin_input_file *file,
 
     sym.size = 0;
     sym.comdat_key = nullptr;
-    const Comdat *C = check(Sym.getComdat());
-    if (C)
-      sym.comdat_key = strdup(C->getName().str().c_str());
+    int CI = check(Sym.getComdatIndex());
+    if (CI != -1) {
+      StringRef C = Obj->getComdatTable()[CI];
+      sym.comdat_key = strdup(C.str().c_str());
+    }
 
     sym.resolution = LDPR_UNKNOWN;
   }
@@ -630,7 +637,7 @@ static void recordFile(std::string Filename, bool TempOutFile) {
 /// indicating whether a temp file should be generated, and an optional task id.
 /// The new filename generated is returned in \p NewFilename.
 static void getOutputFileName(SmallString<128> InFilename, bool TempOutFile,
-                              SmallString<128> &NewFilename, int TaskID = -1) {
+                              SmallString<128> &NewFilename, int TaskID) {
   if (TempOutFile) {
     std::error_code EC =
         sys::fs::createTemporaryFile("lto-llvm", "o", NewFilename);
@@ -639,7 +646,7 @@ static void getOutputFileName(SmallString<128> InFilename, bool TempOutFile,
               EC.message().c_str());
   } else {
     NewFilename = InFilename;
-    if (TaskID >= 0)
+    if (TaskID > 0)
       NewFilename += utostr(TaskID);
   }
 }
@@ -669,28 +676,9 @@ static void getThinLTOOldAndNewPrefix(std::string &OldPrefix,
   NewPrefix = Split.second.str();
 }
 
-namespace {
-// Define the LTOOutput handling
-class LTOOutput : public lto::NativeObjectOutput {
-  StringRef Path;
-
-public:
-  LTOOutput(StringRef Path) : Path(Path) {}
-  // Open the filename \p Path and allocate a stream.
-  std::unique_ptr<raw_pwrite_stream> getStream() override {
-    int FD;
-    std::error_code EC = sys::fs::openFileForWrite(Path, FD, sys::fs::F_None);
-    if (EC)
-      message(LDPL_FATAL, "Could not open file: %s", EC.message().c_str());
-    return llvm::make_unique<llvm::raw_fd_ostream>(FD, true);
-  }
-};
-}
-
 static std::unique_ptr<LTO> createLTO() {
   Config Conf;
   ThinBackend Backend;
-  unsigned ParallelCodeGenParallelismLevel = 1;
 
   Conf.CPU = options::mcpu;
   Conf.Options = InitTargetOptionsFromCodeGenFlags();
@@ -704,12 +692,8 @@ static std::unique_ptr<LTO> createLTO() {
   Conf.CGOptLevel = getCGOptLevel();
   Conf.DisableVerify = options::DisableVerify;
   Conf.OptLevel = options::OptLevel;
-  if (options::Parallelism) {
-    if (options::thinlto)
-      Backend = createInProcessThinBackend(options::Parallelism);
-    else
-      ParallelCodeGenParallelismLevel = options::Parallelism;
-  }
+  if (options::Parallelism)
+    Backend = createInProcessThinBackend(options::Parallelism);
   if (options::thinlto_index_only) {
     std::string OldPrefix, NewPrefix;
     getThinLTOOldAndNewPrefix(OldPrefix, NewPrefix);
@@ -748,8 +732,11 @@ static std::unique_ptr<LTO> createLTO() {
     break;
   }
 
+  if (!options::sample_profile.empty())
+    Conf.SampleProfile = options::sample_profile;
+
   return llvm::make_unique<LTO>(std::move(Conf), Backend,
-                                ParallelCodeGenParallelismLevel);
+                                options::ParallelCodeGenParallelismLevel);
 }
 
 // Write empty files that may be expected by a distributed build
@@ -826,31 +813,40 @@ static ld_plugin_status allSymbolsReadHook() {
     Filename = output_name + ".o";
   bool SaveTemps = !Filename.empty();
 
-  MaxTasks = Lto->getMaxTasks();
+  size_t MaxTasks = Lto->getMaxTasks();
   std::vector<uintptr_t> IsTemporary(MaxTasks);
   std::vector<SmallString<128>> Filenames(MaxTasks);
 
-  auto AddOutput =
-      [&](size_t Task) -> std::unique_ptr<lto::NativeObjectOutput> {
-    auto &OutputName = Filenames[Task];
-    getOutputFileName(Filename, /*TempOutFile=*/!SaveTemps, OutputName,
-                      MaxTasks > 1 ? Task : -1);
-    IsTemporary[Task] = !SaveTemps && options::cache_dir.empty();
-    if (options::cache_dir.empty())
-      return llvm::make_unique<LTOOutput>(OutputName);
-
-    return llvm::make_unique<CacheObjectOutput>(
-        options::cache_dir,
-        [&OutputName](std::string EntryPath) { OutputName = EntryPath; });
+  auto AddStream =
+      [&](size_t Task) -> std::unique_ptr<lto::NativeObjectStream> {
+    IsTemporary[Task] = !SaveTemps;
+    getOutputFileName(Filename, /*TempOutFile=*/!SaveTemps, Filenames[Task],
+                      Task);
+    int FD;
+    std::error_code EC =
+        sys::fs::openFileForWrite(Filenames[Task], FD, sys::fs::F_None);
+    if (EC)
+      message(LDPL_FATAL, "Could not open file %s: %s", Filenames[Task].c_str(),
+              EC.message().c_str());
+    return llvm::make_unique<lto::NativeObjectStream>(
+        llvm::make_unique<llvm::raw_fd_ostream>(FD, true));
   };
 
-  check(Lto->run(AddOutput));
+  auto AddFile = [&](size_t Task, StringRef Path) { Filenames[Task] = Path; };
+
+  NativeObjectCache Cache;
+  if (!options::cache_dir.empty())
+    Cache = localCache(options::cache_dir, AddFile);
+
+  check(Lto->run(AddStream, Cache));
 
   if (options::TheOutputType == options::OT_DISABLE ||
       options::TheOutputType == options::OT_BC_ONLY)
     return LDPS_OK;
 
   if (options::thinlto_index_only) {
+    if (llvm::AreStatisticsEnabled())
+      llvm::PrintStatistics();
     cleanup_hook();
     exit(0);
   }

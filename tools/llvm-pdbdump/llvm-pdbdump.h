@@ -43,6 +43,8 @@ struct BlockRange {
 extern llvm::Optional<BlockRange> DumpBlockRange;
 extern llvm::cl::list<uint32_t> DumpStreamData;
 
+extern llvm::cl::opt<bool> CompactRecords;
+extern llvm::cl::opt<bool> DumpGlobals;
 extern llvm::cl::opt<bool> DumpHeaders;
 extern llvm::cl::opt<bool> DumpStreamBlocks;
 extern llvm::cl::opt<bool> DumpStreamSummary;
@@ -62,15 +64,18 @@ extern llvm::cl::opt<bool> DumpSectionMap;
 extern llvm::cl::opt<bool> DumpSymRecordBytes;
 extern llvm::cl::opt<bool> DumpSectionHeaders;
 extern llvm::cl::opt<bool> DumpFpo;
+extern llvm::cl::opt<bool> DumpStringTable;
 }
 
 namespace pdb2yaml {
 extern llvm::cl::opt<bool> NoFileHeaders;
 extern llvm::cl::opt<bool> StreamMetadata;
 extern llvm::cl::opt<bool> StreamDirectory;
+extern llvm::cl::opt<bool> StringTable;
 extern llvm::cl::opt<bool> PdbStream;
 extern llvm::cl::opt<bool> DbiStream;
 extern llvm::cl::opt<bool> DbiModuleInfo;
+extern llvm::cl::opt<bool> DbiModuleSyms;
 extern llvm::cl::opt<bool> DbiModuleSourceFileInfo;
 extern llvm::cl::opt<bool> TpiStream;
 extern llvm::cl::opt<bool> IpiStream;

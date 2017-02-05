@@ -61,6 +61,10 @@ if(${CMAKE_SOURCE_DIR} STREQUAL ${CMAKE_CURRENT_SOURCE_DIR})
   # This variable makes sure that e.g. llvm-lit is found.
   set(LLVM_MAIN_SRC_DIR ${LLVM_BUILD_MAIN_SRC_DIR})
 
+  # Handle common options used by all runtimes.
+  include(AddLLVM)
+  include(HandleLLVMOptions)
+
   foreach(entry ${runtimes})
     get_filename_component(projName ${entry} NAME)
 
@@ -73,7 +77,13 @@ if(${CMAKE_SOURCE_DIR} STREQUAL ${CMAKE_CURRENT_SOURCE_DIR})
     # Setting a variable to let sub-projects detect which other projects
     # will be included under here.
     set(HAVE_${canon_name} On)
+  endforeach()
 
+  # We do this in two loops so that HAVE_* is set for each runtime before the
+  # other runtimes are added.
+  foreach(entry ${runtimes})
+    get_filename_component(projName ${entry} NAME)
+    
     # Between each sub-project we want to cache and clear the LIT properties
     set_property(GLOBAL PROPERTY LLVM_LIT_TESTSUITES)
     set_property(GLOBAL PROPERTY LLVM_LIT_PARAMS)
@@ -139,13 +149,46 @@ else() # if this is included from LLVM's CMake
   # is required because the other runtimes need the builtin libraries present
   # before the just-built compiler can pass the configuration tests.
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/compiler-rt)
-    llvm_ExternalProject_Add(builtins
-                             ${CMAKE_CURRENT_SOURCE_DIR}/compiler-rt/lib/builtins
-                             CMAKE_ARGS -DLLVM_LIBRARY_OUTPUT_INTDIR=${LLVM_LIBRARY_DIR}
-                                        -DLLVM_RUNTIME_OUTPUT_INTDIR=${LLVM_TOOLS_BINARY_DIR}
-                             PASSTHROUGH_PREFIXES COMPILER_RT
-                             USE_TOOLCHAIN)
+    if(APPLE OR NOT LLVM_BUILTIN_TARGETS)
+      llvm_ExternalProject_Add(builtins
+                               ${CMAKE_CURRENT_SOURCE_DIR}/compiler-rt/lib/builtins
+                               CMAKE_ARGS -DLLVM_LIBRARY_OUTPUT_INTDIR=${LLVM_LIBRARY_DIR}
+                                          -DLLVM_RUNTIME_OUTPUT_INTDIR=${LLVM_TOOLS_BINARY_DIR}
+                                          -DCMAKE_C_COMPILER_TARGET=${TARGET_TRIPLE}
+                                          -DCMAKE_ASM_COMPILER_TARGET=${TARGET_TRIPLE}
+                               PASSTHROUGH_PREFIXES COMPILER_RT
+                               USE_TOOLCHAIN)
+    else()
+      get_cmake_property(variableNames VARIABLES)
+      add_custom_target(builtins)
+      foreach(target ${LLVM_BUILTIN_TARGETS})
+        foreach(variableName ${variableNames})
+          if(variableName MATCHES "^BUILTINS_${target}")
+            string(REPLACE "BUILTINS_${target}_" "" new_name ${variableName})
+            list(APPEND ${target}_extra_args "-D${new_name}=${${variableName}}")
+          endif()
+        endforeach()
+        llvm_ExternalProject_Add(builtins-${target}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/compiler-rt/lib/builtins
+                               CMAKE_ARGS -DLLVM_LIBRARY_OUTPUT_INTDIR=${LLVM_LIBRARY_DIR}
+                                          -DLLVM_RUNTIME_OUTPUT_INTDIR=${LLVM_TOOLS_BINARY_DIR}
+                                          -DCMAKE_C_COMPILER_TARGET=${target}
+                                          -DCMAKE_ASM_COMPILER_TARGET=${target}
+                                          -DCMAKE_C_COMPILER_WORKS=On
+                                          -DCMAKE_ASM_COMPILER_WORKS=On
+                                          -DCOMPILER_RT_DEFAULT_TARGET_ONLY=On
+                                          ${${target}_extra_args}
+                               PASSTHROUGH_PREFIXES COMPILER_RT
+                               USE_TOOLCHAIN)
+        add_dependencies(builtins builtins-${target})
+      endforeach()
+    endif()
     set(deps builtins)
+    # We don't need to depend on the builtins if we're building instrumented
+    # because the next stage will use the same compiler used to build this stage.
+    if(NOT LLVM_BUILD_INSTRUMENTED AND CLANG_ENABLE_BOOTSTRAP)
+      add_dependencies(clang-bootstrap-deps builtins)
+    endif()
   endif()
 
   # We create a list the names of all the runtime projects in all uppercase and
@@ -196,6 +239,16 @@ else() # if this is included from LLVM's CMake
                                             ${SUB_COMPONENT_CHECK_TARGETS}
                                             ${SUB_INSTALL_TARGETS}
                              USE_TOOLCHAIN)
+    
+    # TODO: This is a hack needed because the libcxx headers are copied into the
+    # build directory during configuration. Without that step the clang in the
+    # build directory cannot find the C++ headers in certain configurations.
+    # I need to build a mechanism for runtime projects to provide CMake code
+    # that executes at LLVM configuration time to handle this case.
+    if(NOT LLVM_BUILD_INSTRUMENTED AND CLANG_ENABLE_BOOTSTRAP)
+      add_dependencies(clang-bootstrap-deps runtimes-configure)
+    endif()
+
     if(LLVM_INCLUDE_TESTS)
       set_property(GLOBAL APPEND PROPERTY LLVM_ADDITIONAL_TEST_DEPENDS runtimes-test-depends)
       set_property(GLOBAL APPEND PROPERTY LLVM_ADDITIONAL_TEST_TARGETS check-runtimes)

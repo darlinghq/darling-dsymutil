@@ -1,10 +1,10 @@
 ; RUN: llc -march=amdgcn < %s | FileCheck -check-prefix=SI -check-prefix=FUNC %s
-; RUN: llc -march=amdgcn -mcpu=tonga < %s | FileCheck -check-prefix=SI -check-prefix=FUNC %s
+; RUN: llc -march=amdgcn -mcpu=tonga -mattr=-flat-for-global < %s | FileCheck -check-prefix=SI -check-prefix=FUNC %s
 ; RUN: llc -march=r600 -mcpu=redwood < %s | FileCheck -check-prefix=R600 -check-prefix=FUNC %s
 
 ; FUNC-LABEL: {{^}}round_f32:
 ; SI-DAG: s_load_dword [[SX:s[0-9]+]]
-; SI-DAG: s_mov_b32 [[K:s[0-9]+]], 0x7fffffff
+; SI-DAG: s_brev_b32 [[K:s[0-9]+]], -2{{$}}
 ; SI-DAG: v_trunc_f32_e32 [[TRUNC:v[0-9]+]], [[SX]]
 ; SI-DAG: v_sub_f32_e32 [[SUB:v[0-9]+]], [[SX]], [[TRUNC]]
 ; SI-DAG: v_mov_b32_e32 [[VX:v[0-9]+]], [[SX]]

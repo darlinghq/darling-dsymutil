@@ -30,6 +30,7 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/Program.h"
+#include "llvm/Support/ScopedPrinter.h"
 #include "llvm/Support/ThreadPool.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include <functional>
@@ -38,8 +39,7 @@
 using namespace llvm;
 using namespace coverage;
 
-void exportCoverageDataToJson(StringRef ObjectFilename,
-                              const coverage::CoverageMapping &CoverageMapping,
+void exportCoverageDataToJson(const coverage::CoverageMapping &CoverageMapping,
                               raw_ostream &OS);
 
 namespace {
@@ -64,7 +64,8 @@ private:
   /// \brief Print the warning message to the error output stream.
   void warning(const Twine &Message, StringRef Whence = "");
 
-  /// \brief Copy \p Path into the list of input source files.
+  /// \brief Convert \p Path into an absolute path and append it to the list
+  /// of collected paths.
   void addCollectedPath(const std::string &Path);
 
   /// \brief If \p Path is a regular file, collect the path. If it's a
@@ -88,14 +89,21 @@ private:
   std::unique_ptr<SourceCoverageView>
   createSourceFileView(StringRef SourceFile, const CoverageMapping &Coverage);
 
-  /// \brief Load the coverage mapping data. Return nullptr if an error occured.
+  /// \brief Load the coverage mapping data. Return nullptr if an error occurred.
   std::unique_ptr<CoverageMapping> load();
+
+  /// \brief Remove input source files which aren't mapped by \p Coverage.
+  void removeUnmappedInputs(const CoverageMapping &Coverage);
 
   /// \brief If a demangler is available, demangle all symbol names.
   void demangleSymbols(const CoverageMapping &Coverage);
 
   /// \brief Demangle \p Sym if possible. Otherwise, just return \p Sym.
   StringRef getSymbolForHumans(StringRef Sym) const;
+
+  /// \brief Write out a source file view to the filesystem.
+  void writeSourceFileView(StringRef SourceFile, CoverageMapping *Coverage,
+                           CoveragePrinter *Printer, bool ShowFilenames);
 
   typedef llvm::function_ref<int(int, const char **)> CommandLineParserType;
 
@@ -108,7 +116,7 @@ private:
   int export_(int argc, const char **argv,
               CommandLineParserType commandLineParser);
 
-  std::string ObjectFilename;
+  std::vector<StringRef> ObjectFilenames;
   CoverageViewOptions ViewOpts;
   CoverageFiltersMatchAll Filters;
 
@@ -116,7 +124,7 @@ private:
   std::string PGOFilename;
 
   /// A list of input source files.
-  std::vector<StringRef> SourceFiles;
+  std::vector<std::string> SourceFiles;
 
   /// Whether or not we're in -filename-equivalence mode.
   bool CompareFilenamesOnly;
@@ -130,9 +138,6 @@ private:
 
   /// A cache for demangled symbol names.
   StringMap<std::string> DemangledNames;
-
-  /// File paths (absolute, or otherwise) to input source files.
-  std::vector<std::string> CollectedPaths;
 
   /// Errors and warnings which have not been printed.
   std::mutex ErrsLock;
@@ -168,7 +173,7 @@ void CodeCoverageTool::warning(const Twine &Message, StringRef Whence) {
 
 void CodeCoverageTool::addCollectedPath(const std::string &Path) {
   if (CompareFilenamesOnly) {
-    CollectedPaths.push_back(Path);
+    SourceFiles.emplace_back(Path);
   } else {
     SmallString<128> EffectivePath(Path);
     if (std::error_code EC = sys::fs::make_absolute(EffectivePath)) {
@@ -176,10 +181,8 @@ void CodeCoverageTool::addCollectedPath(const std::string &Path) {
       return;
     }
     sys::path::remove_dots(EffectivePath, /*remove_dot_dots=*/true);
-    CollectedPaths.push_back(EffectivePath.str());
+    SourceFiles.emplace_back(EffectivePath.str());
   }
-
-  SourceFiles.emplace_back(CollectedPaths.back());
 }
 
 void CodeCoverageTool::collectPaths(const std::string &Path) {
@@ -322,13 +325,15 @@ static bool modifiedTimeGT(StringRef LHS, StringRef RHS) {
 }
 
 std::unique_ptr<CoverageMapping> CodeCoverageTool::load() {
-  if (modifiedTimeGT(ObjectFilename, PGOFilename))
-    warning("profile data may be out of date - object is newer",
-            ObjectFilename);
+  for (StringRef ObjectFilename : ObjectFilenames)
+    if (modifiedTimeGT(ObjectFilename, PGOFilename))
+      warning("profile data may be out of date - object is newer",
+              ObjectFilename);
   auto CoverageOrErr =
-      CoverageMapping::load(ObjectFilename, PGOFilename, CoverageArch);
+      CoverageMapping::load(ObjectFilenames, PGOFilename, CoverageArch);
   if (Error E = CoverageOrErr.takeError()) {
-    error("Failed to load coverage: " + toString(std::move(E)), ObjectFilename);
+    error("Failed to load coverage: " + toString(std::move(E)),
+          join(ObjectFilenames.begin(), ObjectFilenames.end(), ", "));
     return nullptr;
   }
   auto Coverage = std::move(CoverageOrErr.get());
@@ -336,22 +341,43 @@ std::unique_ptr<CoverageMapping> CodeCoverageTool::load() {
   if (Mismatched)
     warning(utostr(Mismatched) + " functions have mismatched data");
 
-  if (CompareFilenamesOnly) {
-    auto CoveredFiles = Coverage.get()->getUniqueSourceFiles();
+  if (!SourceFiles.empty())
+    removeUnmappedInputs(*Coverage);
+
+  demangleSymbols(*Coverage);
+
+  return Coverage;
+}
+
+void CodeCoverageTool::removeUnmappedInputs(const CoverageMapping &Coverage) {
+  std::vector<StringRef> CoveredFiles = Coverage.getUniqueSourceFiles();
+
+  auto UncoveredFilesIt = SourceFiles.end();
+  if (!CompareFilenamesOnly) {
+    // The user may have specified source files which aren't in the coverage
+    // mapping. Filter these files away.
+    UncoveredFilesIt = std::remove_if(
+        SourceFiles.begin(), SourceFiles.end(), [&](const std::string &SF) {
+          return !std::binary_search(CoveredFiles.begin(), CoveredFiles.end(),
+                                     SF);
+        });
+  } else {
     for (auto &SF : SourceFiles) {
       StringRef SFBase = sys::path::filename(SF);
-      for (const auto &CF : CoveredFiles)
+      for (const auto &CF : CoveredFiles) {
         if (SFBase == sys::path::filename(CF)) {
           RemappedFilenames[CF] = SF;
           SF = CF;
           break;
         }
+      }
     }
+    UncoveredFilesIt = std::remove_if(
+        SourceFiles.begin(), SourceFiles.end(),
+        [&](const std::string &SF) { return !RemappedFilenames.count(SF); });
   }
 
-  demangleSymbols(*Coverage);
-
-  return Coverage;
+  SourceFiles.erase(UncoveredFilesIt, SourceFiles.end());
 }
 
 void CodeCoverageTool::demangleSymbols(const CoverageMapping &Coverage) {
@@ -437,10 +463,35 @@ StringRef CodeCoverageTool::getSymbolForHumans(StringRef Sym) const {
   return DemangledName->getValue();
 }
 
+void CodeCoverageTool::writeSourceFileView(StringRef SourceFile,
+                                           CoverageMapping *Coverage,
+                                           CoveragePrinter *Printer,
+                                           bool ShowFilenames) {
+  auto View = createSourceFileView(SourceFile, *Coverage);
+  if (!View) {
+    warning("The file '" + SourceFile + "' isn't covered.");
+    return;
+  }
+
+  auto OSOrErr = Printer->createViewFile(SourceFile, /*InToplevel=*/false);
+  if (Error E = OSOrErr.takeError()) {
+    error("Could not create view file!", toString(std::move(E)));
+    return;
+  }
+  auto OS = std::move(OSOrErr.get());
+
+  View->print(*OS.get(), /*Wholefile=*/true,
+              /*ShowSourceName=*/ShowFilenames);
+  Printer->closeViewFile(std::move(OS));
+}
+
 int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
-  cl::opt<std::string, true> ObjectFilename(
-      cl::Positional, cl::Required, cl::location(this->ObjectFilename),
-      cl::desc("Covered executable or object file."));
+  cl::opt<std::string> CovFilename(
+      cl::Positional, cl::desc("Covered executable or object file."));
+
+  cl::list<std::string> CovFilenames(
+      "object", cl::desc("Coverage executable or object file"), cl::ZeroOrMore,
+      cl::CommaSeparated);
 
   cl::list<std::string> InputSourceFiles(
       cl::Positional, cl::desc("<Source files>"), cl::ZeroOrMore);
@@ -465,8 +516,7 @@ int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
       cl::values(clEnumValN(CoverageViewOptions::OutputFormat::Text, "text",
                             "Text output"),
                  clEnumValN(CoverageViewOptions::OutputFormat::HTML, "html",
-                            "HTML output"),
-                 clEnumValEnd),
+                            "HTML output")),
       cl::init(CoverageViewOptions::OutputFormat::Text));
 
   cl::opt<bool> FilenameEquivalence(
@@ -523,14 +573,16 @@ int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
     ViewOpts.Debug = DebugDump;
     CompareFilenamesOnly = FilenameEquivalence;
 
-    ViewOpts.Format = Format;
-    SmallString<128> ObjectFilePath(this->ObjectFilename);
-    if (std::error_code EC = sys::fs::make_absolute(ObjectFilePath)) {
-      error(EC.message(), this->ObjectFilename);
-      return 1;
+    if (!CovFilename.empty())
+      ObjectFilenames.emplace_back(CovFilename);
+    for (const std::string &Filename : CovFilenames)
+      ObjectFilenames.emplace_back(Filename);
+    if (ObjectFilenames.empty()) {
+      errs() << "No filenames specified!\n";
+      ::exit(1);
     }
-    sys::path::native(ObjectFilePath);
-    ViewOpts.ObjectFilename = ObjectFilePath.c_str();
+
+    ViewOpts.Format = Format;
     switch (ViewOpts.Format) {
     case CoverageViewOptions::OutputFormat::Text:
       ViewOpts.Colors = UseColor == cl::BOU_UNSET
@@ -539,7 +591,7 @@ int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
       break;
     case CoverageViewOptions::OutputFormat::HTML:
       if (UseColor == cl::BOU_FALSE)
-        error("Color output cannot be disabled when generating html.");
+        errs() << "Color output cannot be disabled when generating html.\n";
       ViewOpts.Colors = true;
       break;
     }
@@ -597,7 +649,7 @@ int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
       collectPaths(File);
 
     if (DebugDumpCollectedPaths) {
-      for (StringRef SF : SourceFiles)
+      for (const std::string &SF : SourceFiles)
         outs() << SF << '\n';
       ::exit(0);
     }
@@ -689,8 +741,8 @@ int CodeCoverageTool::show(int argc, const char **argv,
   }
 
   auto ModifiedTime = Status.getLastModificationTime();
-  std::string ModifiedTimeStr = ModifiedTime.str();
-  size_t found = ModifiedTimeStr.rfind(":");
+  std::string ModifiedTimeStr = to_string(ModifiedTime);
+  size_t found = ModifiedTimeStr.rfind(':');
   ViewOpts.CreatedTimeStr = (found != std::string::npos)
                                 ? "Created: " + ModifiedTimeStr.substr(0, found)
                                 : "Created: " + ModifiedTimeStr;
@@ -745,34 +797,20 @@ int CodeCoverageTool::show(int argc, const char **argv,
     }
   }
 
-  // In -output-dir mode, it's safe to use multiple threads to print files.
-  unsigned ThreadCount = 1;
-  if (ViewOpts.hasOutputDirectory())
-    ThreadCount = std::thread::hardware_concurrency();
-  ThreadPool Pool(ThreadCount);
-
-  for (StringRef SourceFile : SourceFiles) {
-    Pool.async([this, SourceFile, &Coverage, &Printer, ShowFilenames] {
-      auto View = createSourceFileView(SourceFile, *Coverage);
-      if (!View) {
-        warning("The file '" + SourceFile.str() + "' isn't covered.");
-        return;
-      }
-
-      auto OSOrErr = Printer->createViewFile(SourceFile, /*InToplevel=*/false);
-      if (Error E = OSOrErr.takeError()) {
-        error("Could not create view file!", toString(std::move(E)));
-        return;
-      }
-      auto OS = std::move(OSOrErr.get());
-
-      View->print(*OS.get(), /*Wholefile=*/true,
-                  /*ShowSourceName=*/ShowFilenames);
-      Printer->closeViewFile(std::move(OS));
-    });
+  // FIXME: Sink the hardware_concurrency() == 1 check into ThreadPool.
+  if (!ViewOpts.hasOutputDirectory() ||
+      std::thread::hardware_concurrency() == 1) {
+    for (const std::string &SourceFile : SourceFiles)
+      writeSourceFileView(SourceFile, Coverage.get(), Printer.get(),
+                          ShowFilenames);
+  } else {
+    // In -output-dir mode, it's safe to use multiple threads to print files.
+    ThreadPool Pool;
+    for (const std::string &SourceFile : SourceFiles)
+      Pool.async(&CodeCoverageTool::writeSourceFileView, this, SourceFile,
+                 Coverage.get(), Printer.get(), ShowFilenames);
+    Pool.wait();
   }
-
-  Pool.wait();
 
   return 0;
 }
@@ -811,7 +849,7 @@ int CodeCoverageTool::export_(int argc, const char **argv,
     return 1;
   }
 
-  exportCoverageDataToJson(ObjectFilename, *Coverage.get(), outs());
+  exportCoverageDataToJson(*Coverage.get(), outs());
 
   return 0;
 }

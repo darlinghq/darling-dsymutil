@@ -21,6 +21,15 @@ class VOP1e <bits<8> op, VOPProfile P> : Enc32 {
   let Inst{31-25} = 0x3f; //encoding
 }
 
+class VOP1_SDWAe <bits<8> op, VOPProfile P> : VOP_SDWAe <P> {
+  bits<8> vdst;
+  
+  let Inst{8-0}   = 0xf9; // sdwa
+  let Inst{16-9}  = op;
+  let Inst{24-17} = !if(P.EmitDst, vdst{7-0}, 0);
+  let Inst{31-25} = 0x3f; // encoding
+}
+
 class VOP1_Pseudo <string opName, VOPProfile P, list<dag> pattern=[]> :
   InstSI <P.Outs32, P.Ins32, "", pattern>,
   VOP <opName>,
@@ -56,6 +65,9 @@ class VOP1_Real <VOP1_Pseudo ps, int EncodingFamily> :
   let isPseudo = 0;
   let isCodeGenOnly = 0;
 
+  let Constraints     = ps.Constraints;
+  let DisableEncoding = ps.DisableEncoding;
+
   // copy relevant pseudo op flags
   let SubtargetPredicate = ps.SubtargetPredicate;
   let AsmMatchConverter  = ps.AsmMatchConverter;
@@ -63,6 +75,11 @@ class VOP1_Real <VOP1_Pseudo ps, int EncodingFamily> :
   let Constraints        = ps.Constraints;
   let DisableEncoding    = ps.DisableEncoding;
   let TSFlags            = ps.TSFlags;
+}
+
+class VOP1_SDWA_Pseudo <string OpName, VOPProfile P, list<dag> pattern=[]> :
+  VOP_SDWA_Pseudo <OpName, P, pattern> {
+  let AsmMatchConverter = "cvtSdwaVOP1";
 }
 
 class getVOP1Pat64 <SDPatternOperator node, VOPProfile P> : LetDummies {
@@ -76,6 +93,7 @@ multiclass VOP1Inst <string opName, VOPProfile P,
                      SDPatternOperator node = null_frag> {
   def _e32 : VOP1_Pseudo <opName, P>;
   def _e64 : VOP3_Pseudo <opName, P, getVOP1Pat64<node, P>.ret>;
+  def _sdwa : VOP1_SDWA_Pseudo <opName, P>;
 }
 
 //===----------------------------------------------------------------------===//
@@ -129,8 +147,8 @@ defm V_CVT_F32_I32 : VOP1Inst <"v_cvt_f32_i32", VOP_F32_I32, sint_to_fp>;
 defm V_CVT_F32_U32 : VOP1Inst <"v_cvt_f32_u32", VOP_F32_I32, uint_to_fp>;
 defm V_CVT_U32_F32 : VOP1Inst <"v_cvt_u32_f32", VOP_I32_F32, fp_to_uint>;
 defm V_CVT_I32_F32 : VOP1Inst <"v_cvt_i32_f32", VOP_I32_F32, fp_to_sint>;
-defm V_CVT_F16_F32 : VOP1Inst <"v_cvt_f16_f32", VOP_I32_F32, fp_to_f16>;
-defm V_CVT_F32_F16 : VOP1Inst <"v_cvt_f32_f16", VOP_F32_I32, f16_to_fp>;
+defm V_CVT_F16_F32 : VOP1Inst <"v_cvt_f16_f32", VOP_F16_F32, fpround>;
+defm V_CVT_F32_F16 : VOP1Inst <"v_cvt_f32_f16", VOP_F32_F16, fpextend>;
 defm V_CVT_RPI_I32_F32 : VOP1Inst <"v_cvt_rpi_i32_f32", VOP_I32_F32, cvt_rpi_i32_f32>;
 defm V_CVT_FLR_I32_F32 : VOP1Inst <"v_cvt_flr_i32_f32", VOP_I32_F32, cvt_flr_i32_f32>;
 defm V_CVT_OFF_F32_I4 : VOP1Inst  <"v_cvt_off_f32_i4", VOP_F32_I32>;
@@ -212,10 +230,9 @@ def VOP_MOVRELD : VOPProfile<[untyped, i32, untyped, untyped]> {
   let Outs = (outs);
   let Ins32 = (ins Src0RC32:$vdst, VSrc_b32:$src0);
   let Ins64 = (ins Src0RC64:$vdst, VSrc_b32:$src0);
-
   let InsDPP = (ins Src0RC32:$vdst, Src0RC32:$src0, dpp_ctrl:$dpp_ctrl, row_mask:$row_mask,
                     bank_mask:$bank_mask, bound_ctrl:$bound_ctrl);
-  let InsSDWA = (ins Src0RC32:$vdst, Int32InputMods:$src0_modifiers, VCSrc_b32:$src0,
+  let InsSDWA = (ins Src0RC32:$vdst, Src0ModSDWA:$src0_modifiers, VCSrc_b32:$src0,
                      clampmod:$clamp, dst_sel:$dst_sel, dst_unused:$dst_unused,
                      src0_sel:$src0_sel);
 
@@ -229,7 +246,7 @@ def VOP_MOVRELD : VOPProfile<[untyped, i32, untyped, untyped]> {
   let EmitDst = 1; // force vdst emission
 }
 
-let Uses = [M0, EXEC] in {
+let SubtargetPredicate = HasMovrel, Uses = [M0, EXEC] in {
 // v_movreld_b32 is a special case because the destination output
  // register is really a source. It isn't actually read (but may be
  // written), and is only to provide the base register to start
@@ -280,24 +297,38 @@ defm V_EXP_LEGACY_F32 : VOP1Inst <"v_exp_legacy_f32", VOP_F32_F32>;
 
 let SubtargetPredicate = isVI in {
 
-defm V_CVT_F16_U16 : VOP1Inst <"v_cvt_f16_u16", VOP_F16_I16>;
-defm V_CVT_F16_I16 : VOP1Inst <"v_cvt_f16_i16", VOP_F16_I16>;
-defm V_CVT_U16_F16 : VOP1Inst <"v_cvt_u16_f16", VOP_I16_F16>;
-defm V_CVT_I16_F16 : VOP1Inst <"v_cvt_i16_f16", VOP_I16_F16>;
-defm V_RCP_F16 : VOP1Inst <"v_rcp_f16", VOP_F16_F16>;
-defm V_SQRT_F16 : VOP1Inst <"v_sqrt_f16", VOP_F16_F16>;
-defm V_RSQ_F16 : VOP1Inst <"v_rsq_f16", VOP_F16_F16>;
-defm V_LOG_F16 : VOP1Inst <"v_log_f16", VOP_F16_F16>;
-defm V_EXP_F16 : VOP1Inst <"v_exp_f16", VOP_F16_F16>;
-defm V_FREXP_MANT_F16 : VOP1Inst <"v_frexp_mant_f16", VOP_F16_F16>;
-defm V_FREXP_EXP_I16_F16 : VOP1Inst <"v_frexp_exp_i16_f16", VOP_I16_F16>;
-defm V_FLOOR_F16 : VOP1Inst <"v_floor_f16", VOP_F16_F16>;
-defm V_CEIL_F16 : VOP1Inst <"v_ceil_f16", VOP_F16_F16>;
-defm V_TRUNC_F16 : VOP1Inst <"v_trunc_f16", VOP_F16_F16>;
-defm V_RNDNE_F16 : VOP1Inst <"v_rndne_f16", VOP_F16_F16>;
-defm V_FRACT_F16 : VOP1Inst <"v_fract_f16", VOP_F16_F16>;
-defm V_SIN_F16 : VOP1Inst <"v_sin_f16", VOP_F16_F16>;
-defm V_COS_F16 : VOP1Inst <"v_cos_f16", VOP_F16_F16>;
+defm V_CVT_F16_U16 : VOP1Inst <"v_cvt_f16_u16", VOP_F16_I16, uint_to_fp>;
+defm V_CVT_F16_I16 : VOP1Inst <"v_cvt_f16_i16", VOP_F16_I16, sint_to_fp>;
+defm V_CVT_U16_F16 : VOP1Inst <"v_cvt_u16_f16", VOP_I16_F16, fp_to_uint>;
+defm V_CVT_I16_F16 : VOP1Inst <"v_cvt_i16_f16", VOP_I16_F16, fp_to_sint>;
+defm V_RCP_F16 : VOP1Inst <"v_rcp_f16", VOP_F16_F16, AMDGPUrcp>;
+defm V_SQRT_F16 : VOP1Inst <"v_sqrt_f16", VOP_F16_F16, fsqrt>;
+defm V_RSQ_F16 : VOP1Inst <"v_rsq_f16", VOP_F16_F16, AMDGPUrsq>;
+defm V_LOG_F16 : VOP1Inst <"v_log_f16", VOP_F16_F16, flog2>;
+defm V_EXP_F16 : VOP1Inst <"v_exp_f16", VOP_F16_F16, fexp2>;
+defm V_FREXP_MANT_F16 : VOP1Inst <"v_frexp_mant_f16", VOP_F16_F16, int_amdgcn_frexp_mant>;
+defm V_FREXP_EXP_I16_F16 : VOP1Inst <"v_frexp_exp_i16_f16", VOP_I16_F16, int_amdgcn_frexp_exp>;
+defm V_FLOOR_F16 : VOP1Inst <"v_floor_f16", VOP_F16_F16, ffloor>;
+defm V_CEIL_F16 : VOP1Inst <"v_ceil_f16", VOP_F16_F16, fceil>;
+defm V_TRUNC_F16 : VOP1Inst <"v_trunc_f16", VOP_F16_F16, ftrunc>;
+defm V_RNDNE_F16 : VOP1Inst <"v_rndne_f16", VOP_F16_F16, frint>;
+defm V_FRACT_F16 : VOP1Inst <"v_fract_f16", VOP_F16_F16, AMDGPUfract>;
+defm V_SIN_F16 : VOP1Inst <"v_sin_f16", VOP_F16_F16, AMDGPUsin>;
+defm V_COS_F16 : VOP1Inst <"v_cos_f16", VOP_F16_F16, AMDGPUcos>;
+
+}
+
+let Predicates = [isVI] in {
+
+def : Pat<
+    (f32 (f16_to_fp i16:$src)),
+    (V_CVT_F32_F16_e32 $src)
+>;
+
+def : Pat<
+    (i16 (fp_to_f16 f32:$src)),
+    (V_CVT_F16_F32_e32 $src)
+>;
 
 }
 
@@ -406,27 +437,14 @@ defm V_EXP_LEGACY_F32    : VOP1_Real_ci <0x46>;
 // VI
 //===----------------------------------------------------------------------===//
 
-class VOP1_SDWA <bits<8> op, VOP1_Pseudo ps, VOPProfile P = ps.Pfl> :
-  VOP_SDWA <ps.OpName, P> {
-  let Defs = ps.Defs;
-  let Uses = ps.Uses;
-  let SchedRW = ps.SchedRW;
-  let hasSideEffects = ps.hasSideEffects;
-  let AsmMatchConverter = "cvtSdwaVOP1";
-
-  bits<8> vdst;
-  let Inst{8-0}   = 0xf9; // sdwa
-  let Inst{16-9}  = op;
-  let Inst{24-17} = !if(P.EmitDst, vdst{7-0}, 0);
-  let Inst{31-25} = 0x3f; // encoding
-}
-
 class VOP1_DPP <bits<8> op, VOP1_Pseudo ps, VOPProfile P = ps.Pfl> :
   VOP_DPP <ps.OpName, P> {
   let Defs = ps.Defs;
   let Uses = ps.Uses;
   let SchedRW = ps.SchedRW;
   let hasSideEffects = ps.hasSideEffects;
+  let Constraints = ps.Constraints;
+  let DisableEncoding = ps.DisableEncoding;
 
   bits<8> vdst;
   let Inst{8-0}   = 0xfa; // dpp
@@ -445,9 +463,12 @@ multiclass VOP1_Real_vi <bits<10> op> {
       VOP3e_vi <!add(0x140, op), !cast<VOP3_Pseudo>(NAME#"_e64").Pfl>;
   }
 
-  // for now left sdwa/dpp only for asm/dasm
+  def _sdwa_vi :
+    VOP_SDWA_Real <!cast<VOP1_SDWA_Pseudo>(NAME#"_sdwa")>,
+    VOP1_SDWAe <op{7-0}, !cast<VOP1_SDWA_Pseudo>(NAME#"_sdwa").Pfl>;
+
+  // For now left dpp only for asm/dasm
   // TODO: add corresponding pseudo
-  def _sdwa : VOP1_SDWA<op{7-0}, !cast<VOP1_Pseudo>(NAME#"_e32")>;
   def _dpp : VOP1_DPP<op{7-0}, !cast<VOP1_Pseudo>(NAME#"_e32")>;
 }
 
@@ -527,13 +548,74 @@ defm V_FRACT_F16         : VOP1_Real_vi <0x48>;
 defm V_SIN_F16           : VOP1_Real_vi <0x49>;
 defm V_COS_F16           : VOP1_Real_vi <0x4a>;
 
+
+// Copy of v_mov_b32 with $vdst as a use operand for use with VGPR
+// indexing mode. vdst can't be treated as a def for codegen purposes,
+// and an implicit use and def of the super register should be added.
+def V_MOV_B32_indirect : VPseudoInstSI<(outs),
+  (ins getVALUDstForVT<i32>.ret:$vdst, getVOPSrc0ForVT<i32>.ret:$src0)>,
+  PseudoInstExpansion<(V_MOV_B32_e32_vi getVALUDstForVT<i32>.ret:$vdst,
+                                        getVOPSrc0ForVT<i32>.ret:$src0)> {
+  let VOP1 = 1;
+  let SubtargetPredicate = isVI;
+}
+
+// This is a pseudo variant of the v_movreld_b32 instruction in which the
+// vector operand appears only twice, once as def and once as use. Using this
+// pseudo avoids problems with the Two Address instructions pass.
+class V_MOVRELD_B32_pseudo<RegisterClass rc> : VPseudoInstSI <
+  (outs rc:$vdst),
+  (ins rc:$vsrc, VSrc_b32:$val, i32imm:$offset)> {
+  let VOP1 = 1;
+
+  let Constraints = "$vsrc = $vdst";
+  let Uses = [M0, EXEC];
+
+  let SubtargetPredicate = HasMovrel;
+}
+
+def V_MOVRELD_B32_V1 : V_MOVRELD_B32_pseudo<VGPR_32>;
+def V_MOVRELD_B32_V2 : V_MOVRELD_B32_pseudo<VReg_64>;
+def V_MOVRELD_B32_V4 : V_MOVRELD_B32_pseudo<VReg_128>;
+def V_MOVRELD_B32_V8 : V_MOVRELD_B32_pseudo<VReg_256>;
+def V_MOVRELD_B32_V16 : V_MOVRELD_B32_pseudo<VReg_512>;
+
 let Predicates = [isVI] in {
 
 def : Pat <
-  (int_amdgcn_mov_dpp i32:$src, imm:$dpp_ctrl, imm:$row_mask, imm:$bank_mask,
-                      imm:$bound_ctrl),
+  (i32 (int_amdgcn_mov_dpp i32:$src, imm:$dpp_ctrl, imm:$row_mask, imm:$bank_mask,
+                      imm:$bound_ctrl)),
   (V_MOV_B32_dpp $src, (as_i32imm $dpp_ctrl), (as_i32imm $row_mask),
                        (as_i32imm $bank_mask), (as_i1imm $bound_ctrl))
+>;
+
+
+def : Pat<
+  (i32 (anyext i16:$src)),
+  (COPY $src)
+>;
+
+def : Pat<
+   (i64 (anyext i16:$src)),
+   (REG_SEQUENCE VReg_64,
+     (i32 (COPY $src)), sub0,
+     (V_MOV_B32_e32 (i32 0)), sub1)
+>;
+
+def : Pat<
+  (i16 (trunc i32:$src)),
+  (COPY $src)
+>;
+
+def : Pat<
+  (i1 (trunc i16:$src)),
+  (COPY $src)
+>;
+
+
+def : Pat <
+  (i16 (trunc i64:$src)),
+  (EXTRACT_SUBREG $src, sub0)
 >;
 
 } // End Predicates = [isVI]

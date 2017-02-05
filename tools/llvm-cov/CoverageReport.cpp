@@ -120,13 +120,15 @@ raw_ostream::Colors determineCoveragePercentageColor(const T &Info) {
 
 /// \brief Determine the length of the longest common prefix of the strings in
 /// \p Strings.
-unsigned getLongestCommonPrefixLen(ArrayRef<StringRef> Strings) {
+unsigned getLongestCommonPrefixLen(ArrayRef<std::string> Strings) {
   unsigned LCP = Strings[0].size();
   for (unsigned I = 1, E = Strings.size(); LCP > 0 && I < E; ++I) {
-    auto Mismatch =
-        std::mismatch(Strings[0].begin(), Strings[0].end(), Strings[I].begin())
-            .first;
-    LCP = std::min(LCP, (unsigned)std::distance(Strings[0].begin(), Mismatch));
+    unsigned Cursor;
+    StringRef S = Strings[I];
+    for (Cursor = 0; Cursor < LCP && Cursor < S.size(); ++Cursor)
+      if (Strings[0][Cursor] != S[Cursor])
+        break;
+    LCP = std::min(LCP, Cursor);
   }
   return LCP;
 }
@@ -152,36 +154,48 @@ void CoverageReport::render(const FileCoverageSummary &File,
                (unsigned)File.RegionCoverage.NumRegions);
   Options.colored_ostream(OS, FileCoverageColor) << format(
       "%*u", FileReportColumns[2], (unsigned)File.RegionCoverage.NotCovered);
-  Options.colored_ostream(OS, FileCoverageColor)
-      << format("%*.2f", FileReportColumns[3] - 1,
-                File.RegionCoverage.getPercentCovered())
-      << '%';
+  if (File.RegionCoverage.NumRegions)
+    Options.colored_ostream(OS, FileCoverageColor)
+        << format("%*.2f", FileReportColumns[3] - 1,
+                  File.RegionCoverage.getPercentCovered())
+        << '%';
+  else
+    OS << column("-", FileReportColumns[3], Column::RightAlignment);
   OS << format("%*u", FileReportColumns[4],
                (unsigned)File.FunctionCoverage.NumFunctions);
   OS << format("%*u", FileReportColumns[5],
                (unsigned)(File.FunctionCoverage.NumFunctions -
                           File.FunctionCoverage.Executed));
-  Options.colored_ostream(OS, FuncCoverageColor)
-      << format("%*.2f", FileReportColumns[6] - 1,
-                File.FunctionCoverage.getPercentCovered())
-      << '%';
+  if (File.FunctionCoverage.NumFunctions)
+    Options.colored_ostream(OS, FuncCoverageColor)
+        << format("%*.2f", FileReportColumns[6] - 1,
+                  File.FunctionCoverage.getPercentCovered())
+        << '%';
+  else
+    OS << column("-", FileReportColumns[6], Column::RightAlignment);
   OS << format("%*u", FileReportColumns[7],
                (unsigned)File.InstantiationCoverage.NumFunctions);
   OS << format("%*u", FileReportColumns[8],
                (unsigned)(File.InstantiationCoverage.NumFunctions -
                           File.InstantiationCoverage.Executed));
-  Options.colored_ostream(OS, InstantiationCoverageColor)
-      << format("%*.2f", FileReportColumns[9] - 1,
-                File.InstantiationCoverage.getPercentCovered())
-      << '%';
+  if (File.InstantiationCoverage.NumFunctions)
+    Options.colored_ostream(OS, InstantiationCoverageColor)
+        << format("%*.2f", FileReportColumns[9] - 1,
+                  File.InstantiationCoverage.getPercentCovered())
+        << '%';
+  else
+    OS << column("-", FileReportColumns[9], Column::RightAlignment);
   OS << format("%*u", FileReportColumns[10],
                (unsigned)File.LineCoverage.NumLines);
   Options.colored_ostream(OS, LineCoverageColor) << format(
       "%*u", FileReportColumns[11], (unsigned)File.LineCoverage.NotCovered);
-  Options.colored_ostream(OS, LineCoverageColor)
-      << format("%*.2f", FileReportColumns[12] - 1,
-                File.LineCoverage.getPercentCovered())
-      << '%';
+  if (File.LineCoverage.NumLines)
+    Options.colored_ostream(OS, LineCoverageColor)
+        << format("%*.2f", FileReportColumns[12] - 1,
+                  File.LineCoverage.getPercentCovered())
+        << '%';
+  else
+    OS << column("-", FileReportColumns[12], Column::RightAlignment);
   OS << "\n";
 }
 
@@ -215,7 +229,7 @@ void CoverageReport::render(const FunctionCoverageSummary &Function,
   OS << "\n";
 }
 
-void CoverageReport::renderFunctionReports(ArrayRef<StringRef> Files,
+void CoverageReport::renderFunctionReports(ArrayRef<std::string> Files,
                                            raw_ostream &OS) {
   bool isFirst = true;
   for (StringRef Filename : Files) {
@@ -261,7 +275,7 @@ void CoverageReport::renderFunctionReports(ArrayRef<StringRef> Files,
 std::vector<FileCoverageSummary>
 CoverageReport::prepareFileReports(const coverage::CoverageMapping &Coverage,
                                    FileCoverageSummary &Totals,
-                                   ArrayRef<StringRef> Files) {
+                                   ArrayRef<std::string> Files) {
   std::vector<FileCoverageSummary> FileReports;
   unsigned LCP = 0;
   if (Files.size() > 1)
@@ -298,12 +312,14 @@ CoverageReport::prepareFileReports(const coverage::CoverageMapping &Coverage,
 }
 
 void CoverageReport::renderFileReports(raw_ostream &OS) const {
-  std::vector<StringRef> UniqueSourceFiles = Coverage.getUniqueSourceFiles();
+  std::vector<std::string> UniqueSourceFiles;
+  for (StringRef SF : Coverage.getUniqueSourceFiles())
+    UniqueSourceFiles.emplace_back(SF.str());
   renderFileReports(OS, UniqueSourceFiles);
 }
 
 void CoverageReport::renderFileReports(raw_ostream &OS,
-                                       ArrayRef<StringRef> Files) const {
+                                       ArrayRef<std::string> Files) const {
   FileCoverageSummary Totals("TOTAL");
   auto FileReports = prepareFileReports(Coverage, Totals, Files);
 

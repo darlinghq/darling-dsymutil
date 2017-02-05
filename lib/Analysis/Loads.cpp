@@ -91,8 +91,11 @@ static bool isDereferenceableAndAlignedPointer(
     // then the GEP (== Base + Offset == k_0 * Align + k_1 * Align) is also
     // aligned to Align bytes.
 
-    return isDereferenceableAndAlignedPointer(Base, Align, Offset + Size, DL,
-                                              CtxI, DT, Visited);
+    // Offset and Size may have different bit widths if we have visited an
+    // addrspacecast, so we can't do arithmetic directly on the APInt values.
+    return isDereferenceableAndAlignedPointer(
+        Base, Align, Offset + Size.sextOrTrunc(Offset.getBitWidth()),
+        DL, CtxI, DT, Visited);
   }
 
   // For gc.relocate, look through relocations
@@ -309,7 +312,8 @@ Value *llvm::FindAvailableLoadedValue(LoadInst *Load,
                                       BasicBlock *ScanBB,
                                       BasicBlock::iterator &ScanFrom,
                                       unsigned MaxInstsToScan,
-                                      AliasAnalysis *AA, bool *IsLoadCSE) {
+                                      AliasAnalysis *AA, bool *IsLoadCSE,
+                                      unsigned *NumScanedInst) {
   if (MaxInstsToScan == 0)
     MaxInstsToScan = ~0U;
 
@@ -340,6 +344,9 @@ Value *llvm::FindAvailableLoadedValue(LoadInst *Load,
 
     // Restore ScanFrom to expected value in case next test succeeds
     ScanFrom++;
+
+    if (NumScanedInst)
+      ++(*NumScanedInst);
 
     // Don't scan huge blocks.
     if (MaxInstsToScan-- == 0)

@@ -67,7 +67,7 @@ define i64 @test3(float %f, double %d) {
 ; CHECK-NEXT:    [[TMP12:%.*]] = add i64 [[TMP1]], [[TMP3]]
 ; CHECK-NEXT:    [[TMP13:%.*]] = add i64 [[TMP5]], [[TMP7]]
 ; CHECK-NEXT:    [[TMP14:%.*]] = add i64 [[TMP12]], [[TMP13]]
-; CHECK-NEXT:    [[TMP15:%.*]] = add i64 [[TMP11]], [[TMP14]]
+; CHECK-NEXT:    [[TMP15:%.*]] = add i64 [[TMP14]], [[TMP11]]
 ; CHECK-NEXT:    ret i64 [[TMP15]]
 ;
   %v00 = insertelement <4 x float> undef, float %f, i32 0
@@ -210,6 +210,15 @@ define <2 x double> @test_fpext(float %f) {
   %tmp5 = fpext <4 x float> %tmp12 to <4 x double>
   %ret = shufflevector <4 x double> %tmp5, <4 x double> undef, <2 x i32> <i32 0, i32 1>
   ret <2 x double> %ret
+}
+
+define <4 x double> @test_shuffle(<4 x double> %f) {
+; CHECK-LABEL: @test_shuffle(
+; CHECK-NEXT:    [[RET1:%.*]] = insertelement <4 x double> %f, double 1.000000e+00, i32 3
+; CHECK-NEXT:    ret <4 x double> [[RET1]]
+;
+  %ret = shufflevector <4 x double> %f, <4 x double> <double undef, double 1.0, double undef, double undef>, <4 x i32> <i32 0, i32 1, i32 2, i32 5>
+  ret <4 x double> %ret
 }
 
 define <4 x float> @test_select(float %f, float %g) {

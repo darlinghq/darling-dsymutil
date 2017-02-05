@@ -100,7 +100,7 @@ define i32 @test9(i32 %A) {
 define i1 @test10(i8 %A, i8 %b) {
 ; CHECK-LABEL: @test10(
 ; CHECK-NEXT:    [[B:%.*]] = sub i8 0, %b
-; CHECK-NEXT:    [[C:%.*]] = icmp ne i8 %A, [[B]]
+; CHECK-NEXT:    [[C:%.*]] = icmp ne i8 [[B]], %A
 ; CHECK-NEXT:    ret i1 [[C]]
 ;
   %B = add i8 %A, %b
@@ -112,7 +112,7 @@ define i1 @test10(i8 %A, i8 %b) {
 define <2 x i1> @test10vec(<2 x i8> %a, <2 x i8> %b) {
 ; CHECK-LABEL: @test10vec(
 ; CHECK-NEXT:    [[C:%.*]] = sub <2 x i8> zeroinitializer, %b
-; CHECK-NEXT:    [[D:%.*]] = icmp ne <2 x i8> %a, [[C]]
+; CHECK-NEXT:    [[D:%.*]] = icmp ne <2 x i8> [[C]], %a
 ; CHECK-NEXT:    ret <2 x i1> [[D]]
 ;
   %c = add <2 x i8> %a, %b
@@ -506,4 +506,16 @@ define i1 @test40(i32 %a, i32 %b) {
   %add = add i32 %b, %a
   %cmp = icmp eq i32 %add, %b
   ret i1 %cmp
+}
+
+define i64 @test41(i32 %a) {
+; CHECK-LABEL: @test41(
+; CHECK-NEXT:    [[ADD:%.*]] = add nuw i32 %a, 15
+; CHECK-NEXT:    [[EXT:%.*]] = zext i32 [[ADD]] to i64
+; CHECK-NEXT:    ret i64 [[EXT]]
+;
+  %add = add nuw i32 %a, 16
+  %zext = zext i32 %add to i64
+  %sub = add i64 %zext, -1
+  ret i64 %sub
 }

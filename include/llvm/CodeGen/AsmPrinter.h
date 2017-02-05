@@ -122,11 +122,16 @@ private:
 
   struct HandlerInfo {
     AsmPrinterHandler *Handler;
-    const char *TimerName, *TimerGroupName;
+    const char *TimerName;
+    const char *TimerDescription;
+    const char *TimerGroupName;
+    const char *TimerGroupDescription;
     HandlerInfo(AsmPrinterHandler *Handler, const char *TimerName,
-                const char *TimerGroupName)
+                const char *TimerDescription, const char *TimerGroupName,
+                const char *TimerGroupDescription)
         : Handler(Handler), TimerName(TimerName),
-          TimerGroupName(TimerGroupName) {}
+          TimerDescription(TimerDescription), TimerGroupName(TimerGroupName),
+          TimerGroupDescription(TimerGroupDescription) {}
   };
   /// A vector of all debug/EH info emitters we should use. This vector
   /// maintains ownership of the emitters.
@@ -134,6 +139,9 @@ private:
 
   /// If the target supports dwarf debug info, this pointer is non-null.
   DwarfDebug *DD;
+
+  /// If the current module uses dwarf CFI annotations strictly for debugging.
+  bool isCFIMoveForDebugging;
 
 protected:
   explicit AsmPrinter(TargetMachine &TM, std::unique_ptr<MCStreamer> Streamer);
@@ -143,6 +151,9 @@ public:
 
   DwarfDebug *getDwarfDebug() { return DD; }
   DwarfDebug *getDwarfDebug() const { return DD; }
+
+  uint16_t getDwarfVersion() const;
+  void setDwarfVersion(uint16_t Version);
 
   bool isPositionIndependent() const;
 
@@ -172,9 +183,6 @@ public:
 
   void EmitToStreamer(MCStreamer &S, const MCInst &Inst);
 
-  /// Return the target triple string.
-  StringRef getTargetTriple() const;
-
   /// Return the current section we are emitting to.
   const MCSection *getCurrentSection() const;
 
@@ -203,6 +211,8 @@ public:
     SledKind Kind;
     bool AlwaysInstrument;
     const class Function *Fn;
+
+    void emit(int, MCStreamer *, const MCSymbol *) const;
   };
 
   // All the sleds to be emitted.
@@ -210,6 +220,9 @@ public:
 
   // Helper function to record a given XRay sled.
   void recordSled(MCSymbol *Sled, const MachineInstr &MI, SledKind Kind);
+
+  /// Emit a table with all XRay instrumentation points.
+  void emitXRayTable();
 
   //===------------------------------------------------------------------===//
   // MachineFunctionPass Implementation.
@@ -251,6 +264,10 @@ public:
 
   enum CFIMoveType { CFI_M_None, CFI_M_EH, CFI_M_Debug };
   CFIMoveType needsCFIMoves();
+
+  /// Returns false if needsCFIMoves() == CFI_M_EH for any function
+  /// in the module.
+  bool needsOnlyDebugCFIMoves() const { return isCFIMoveForDebugging; }
 
   bool needsSEHMoves();
 
@@ -463,9 +480,11 @@ public:
   /// Get the value for DW_AT_APPLE_isa. Zero if no isa encoding specified.
   virtual unsigned getISAEncoding() { return 0; }
 
-  /// EmitDwarfRegOp - Emit a dwarf register operation.
-  virtual void EmitDwarfRegOp(ByteStreamer &BS,
-                              const MachineLocation &MLoc) const;
+  /// Emit the directive and value for debug thread local expression
+  ///
+  /// \p Value - The value to emit.
+  /// \p Size - The size of the integer (in bytes) to emit.
+  virtual void EmitDebugValue(const MCExpr *Value, unsigned Size) const;
 
   //===------------------------------------------------------------------===//
   // Dwarf Lowering Routines

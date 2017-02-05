@@ -187,8 +187,15 @@ public:
     return *this;
   }
 
-  const MachineInstrBuilder &addOperand(const MachineOperand &MO) const {
+  const MachineInstrBuilder &add(const MachineOperand &MO) const {
     MI->addOperand(*MF, MO);
+    return *this;
+  }
+
+  const MachineInstrBuilder &add(ArrayRef<MachineOperand> MOs) const {
+    for (const MachineOperand &MO : MOs) {
+      MI->addOperand(*MF, MO);
+    }
     return *this;
   }
 
@@ -460,7 +467,8 @@ public:
   /// Create an MIBundleBuilder representing an existing instruction or bundle
   /// that has MI as its head.
   explicit MIBundleBuilder(MachineInstr *MI)
-      : MBB(*MI->getParent()), Begin(MI), End(getBundleEnd(*MI)) {}
+      : MBB(*MI->getParent()), Begin(MI),
+        End(getBundleEnd(MI->getIterator())) {}
 
   /// Return a reference to the basic block containing this bundle.
   MachineBasicBlock &getMBB() const { return MBB; }

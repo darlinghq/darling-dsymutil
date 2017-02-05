@@ -1,6 +1,6 @@
 ; RUN: opt < %s -sancov -sanitizer-coverage-level=0 -S | FileCheck %s --check-prefix=CHECK0
 ; RUN: opt < %s -sancov -sanitizer-coverage-level=1 -S | FileCheck %s --check-prefix=CHECK1
-; RUN: opt < %s -sancov -sanitizer-coverage-level=2 -S | FileCheck %s --check-prefix=CHECK2
+; RUN: opt < %s -sancov -sanitizer-coverage-level=2 -S | FileCheck %s --check-prefix=CHECK_WITH_CHECK
 ; RUN: opt < %s -sancov -sanitizer-coverage-level=2 -sanitizer-coverage-block-threshold=10 -S | FileCheck %s --check-prefix=CHECK2
 ; RUN: opt < %s -sancov -sanitizer-coverage-level=2 -sanitizer-coverage-block-threshold=0  -S | FileCheck %s --check-prefix=CHECK_WITH_CHECK
 ; RUN: opt < %s -sancov -sanitizer-coverage-level=2 -sanitizer-coverage-block-threshold=1  -S | FileCheck %s --check-prefix=CHECK_WITH_CHECK
@@ -49,7 +49,7 @@ entry:
 
 ; CHECK1-LABEL: define internal void @sancov.module_ctor
 ; CHECK1-NOT: ret
-; CHECK1: call void @__sanitizer_cov_module_init({{.*}}, i64 2,
+; CHECK1: call void @__sanitizer_cov_module_init({{.*}}, i64 2, {{.*}}@__sancov_gen_modname
 ; CHECK1: ret
 
 ; CHECK_WITH_CHECK-LABEL: define void @foo

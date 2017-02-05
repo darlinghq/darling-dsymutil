@@ -23,16 +23,22 @@
 #include "SIISelLowering.h"
 #include "SIFrameLowering.h"
 #include "Utils/AMDGPUBaseInfo.h"
+#include "llvm/ADT/Triple.h"
 #include "llvm/CodeGen/GlobalISel/GISelAccessor.h"
+#include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/SelectionDAGTargetInfo.h"
-#include "llvm/Target/TargetSubtargetInfo.h"
+#include "llvm/MC/MCInstrItineraries.h"
+#include "llvm/Support/MathExtras.h"
+#include <cassert>
+#include <cstdint>
+#include <memory>
+#include <utility>
 
 #define GET_SUBTARGETINFO_HEADER
 #include "AMDGPUGenSubtargetInfo.inc"
 
 namespace llvm {
 
-class SIMachineFunctionInfo;
 class StringRef;
 
 class AMDGPUSubtarget : public AMDGPUGenSubtargetInfo {
@@ -51,9 +57,13 @@ public:
     ISAVersion0_0_0,
     ISAVersion7_0_0,
     ISAVersion7_0_1,
+    ISAVersion7_0_2,
     ISAVersion8_0_0,
     ISAVersion8_0_1,
-    ISAVersion8_0_3
+    ISAVersion8_0_2,
+    ISAVersion8_0_3,
+    ISAVersion8_0_4,
+    ISAVersion8_1_0,
   };
 
 protected:
@@ -72,9 +82,10 @@ protected:
 
   // Dynamially set bits that enable features.
   bool FP32Denormals;
-  bool FP64Denormals;
+  bool FP64FP16Denormals;
   bool FPExceptions;
   bool FlatForGlobal;
+  bool UnalignedScratchAccess;
   bool UnalignedBufferAccess;
   bool EnableXNACK;
   bool DebuggerInsertNops;
@@ -98,12 +109,19 @@ protected:
   bool SGPRInitBug;
   bool HasSMemRealTime;
   bool Has16BitInsts;
+  bool HasMovrel;
+  bool HasVGPRIndexMode;
+  bool HasScalarStores;
+  bool HasInv2PiInlineImm;
+  bool HasSDWA;
+  bool HasDPP;
   bool FlatAddressSpace;
   bool R600ALUInst;
   bool CaymanISA;
   bool CFALUBug;
   bool HasVertexCache;
   short TexVTXClauseSize;
+  bool ScalarizeGlobal;
 
   // Dummy feature to use for assembler in tablegen.
   bool FeatureDisable;
@@ -114,7 +132,8 @@ protected:
 public:
   AMDGPUSubtarget(const Triple &TT, StringRef GPU, StringRef FS,
                   const TargetMachine &TM);
-  virtual ~AMDGPUSubtarget();
+  ~AMDGPUSubtarget() override;
+
   AMDGPUSubtarget &initializeSubtargetDependencies(const Triple &TT,
                                                    StringRef GPU, StringRef FS);
 
@@ -164,6 +183,10 @@ public:
 
   unsigned getMaxPrivateElementSize() const {
     return MaxPrivateElementSize;
+  }
+
+  bool has16BitInsts() const {
+    return Has16BitInsts;
   }
 
   bool hasHWFP64() const {
@@ -245,21 +268,29 @@ public:
     return DumpCode;
   }
 
+  bool enableIEEEBit(const MachineFunction &MF) const {
+    return AMDGPU::isCompute(MF.getFunction()->getCallingConv());
+  }
+
   /// Return the amount of LDS that can be used that will not restrict the
   /// occupancy lower than WaveCount.
-  unsigned getMaxLocalMemSizeWithWaveCount(unsigned WaveCount) const;
+  unsigned getMaxLocalMemSizeWithWaveCount(unsigned WaveCount,
+                                           const Function &) const;
 
   /// Inverse of getMaxLocalMemWithWaveCount. Return the maximum wavecount if
   /// the given LDS memory size is the only constraint.
-  unsigned getOccupancyWithLocalMemSize(uint32_t Bytes) const;
+  unsigned getOccupancyWithLocalMemSize(uint32_t Bytes, const Function &) const;
 
+  bool hasFP16Denormals() const {
+    return FP64FP16Denormals;
+  }
 
   bool hasFP32Denormals() const {
     return FP32Denormals;
   }
 
   bool hasFP64Denormals() const {
-    return FP64Denormals;
+    return FP64FP16Denormals;
   }
 
   bool hasFPExceptions() const {
@@ -274,26 +305,47 @@ public:
     return UnalignedBufferAccess;
   }
 
+  bool hasUnalignedScratchAccess() const {
+    return UnalignedScratchAccess;
+  }
+
   bool isXNACKEnabled() const {
     return EnableXNACK;
   }
 
-  bool isAmdCodeObjectV2() const {
-    return isAmdHsaOS() || isMesa3DOS();
+  bool hasFlatAddressSpace() const {
+    return FlatAddressSpace;
+  }
+
+  bool isMesaKernel(const MachineFunction &MF) const {
+    return isMesa3DOS() && !AMDGPU::isShader(MF.getFunction()->getCallingConv());
+  }
+
+  // Covers VS/PS/CS graphics shaders
+  bool isMesaGfxShader(const MachineFunction &MF) const {
+    return isMesa3DOS() && AMDGPU::isShader(MF.getFunction()->getCallingConv());
+  }
+
+  bool isAmdCodeObjectV2(const MachineFunction &MF) const {
+    return isAmdHsaOS() || isMesaKernel(MF);
+  }
+
+  bool hasFminFmaxLegacy() const {
+    return getGeneration() < AMDGPUSubtarget::VOLCANIC_ISLANDS;
   }
 
   /// \brief Returns the offset in bytes from the start of the input buffer
   ///        of the first explicit kernel argument.
-  unsigned getExplicitKernelArgOffset() const {
-    return isAmdCodeObjectV2() ? 0 : 36;
+  unsigned getExplicitKernelArgOffset(const MachineFunction &MF) const {
+    return isAmdCodeObjectV2(MF) ? 0 : 36;
   }
 
   unsigned getAlignmentForImplicitArgPtr() const {
     return isAmdHsaOS() ? 8 : 4;
   }
 
-  unsigned getImplicitArgNumBytes() const {
-    if (isMesa3DOS())
+  unsigned getImplicitArgNumBytes(const MachineFunction &MF) const {
+    if (isMesaKernel(MF))
       return 16;
     if (isAmdHsaOS() && isOpenCLEnv())
       return 32;
@@ -375,6 +427,9 @@ public:
   unsigned getWavesPerWorkGroup(unsigned FlatWorkGroupSize) const {
     return alignTo(FlatWorkGroupSize, getWavefrontSize()) / getWavefrontSize();
   }
+
+  void setScalarizeGlobalBehavior(bool b) { ScalarizeGlobal = b;}
+  bool getScalarizeGlobalBehavior() const { return ScalarizeGlobal;}
 
   /// \returns Subtarget's default pair of minimum/maximum flat work group sizes
   /// for function \p F, or minimum/maximum flat work group sizes explicitly
@@ -471,12 +526,32 @@ public:
     return GISel->getCallLowering();
   }
 
+  const InstructionSelector *getInstructionSelector() const override {
+    assert(GISel && "Access to GlobalISel APIs not set");
+    return GISel->getInstructionSelector();
+  }
+
+  const LegalizerInfo *getLegalizerInfo() const override {
+    assert(GISel && "Access to GlobalISel APIs not set");
+    return GISel->getLegalizerInfo();
+  }
+
+  const RegisterBankInfo *getRegBankInfo() const override {
+    assert(GISel && "Access to GlobalISel APIs not set");
+    return GISel->getRegBankInfo();
+  }
+
   const SIRegisterInfo *getRegisterInfo() const override {
     return &InstrInfo.getRegisterInfo();
   }
 
   void setGISelAccessor(GISelAccessor &GISel) {
     this->GISel.reset(&GISel);
+  }
+
+  // XXX - Why is this here if it isn't in the default pass set?
+  bool enableEarlyIfConversion() const override {
+    return true;
   }
 
   void overrideSchedPolicy(MachineSchedPolicy &Policy,
@@ -488,20 +563,36 @@ public:
     return 16;
   }
 
-  bool hasFlatAddressSpace() const {
-    return FlatAddressSpace;
-  }
-
   bool hasSMemRealTime() const {
     return HasSMemRealTime;
   }
 
-  bool has16BitInsts() const {
-    return Has16BitInsts;
+  bool hasMovrel() const {
+    return HasMovrel;
+  }
+
+  bool hasVGPRIndexMode() const {
+    return HasVGPRIndexMode;
   }
 
   bool hasScalarCompareEq64() const {
     return getGeneration() >= VOLCANIC_ISLANDS;
+  }
+
+  bool hasScalarStores() const {
+    return HasScalarStores;
+  }
+
+  bool hasInv2PiInlineImm() const {
+    return HasInv2PiInlineImm;
+  }
+
+  bool hasSDWA() const {
+    return HasSDWA;
+  }
+
+  bool hasDPP() const {
+    return HasDPP;
   }
 
   bool enableSIScheduler() const {
@@ -533,15 +624,27 @@ public:
     return SGPRInitBug;
   }
 
-  unsigned getKernArgSegmentSize(unsigned ExplictArgBytes) const;
+  bool has12DWordStoreHazard() const {
+    return getGeneration() != AMDGPUSubtarget::SOUTHERN_ISLANDS;
+  }
+
+  unsigned getKernArgSegmentSize(const MachineFunction &MF, unsigned ExplictArgBytes) const;
 
   /// Return the maximum number of waves per SIMD for kernels using \p SGPRs SGPRs
   unsigned getOccupancyWithNumSGPRs(unsigned SGPRs) const;
 
   /// Return the maximum number of waves per SIMD for kernels using \p VGPRs VGPRs
   unsigned getOccupancyWithNumVGPRs(unsigned VGPRs) const;
+
+  /// \returns True if waitcnt instruction is needed before barrier instruction,
+  /// false otherwise.
+  bool needWaitcntBeforeBarrier() const {
+    return true;
+  }
+
+  unsigned getMaxNumSGPRs() const;
 };
 
-} // End namespace llvm
+} // end namespace llvm
 
-#endif
+#endif // LLVM_LIB_TARGET_AMDGPU_AMDGPUSUBTARGET_H

@@ -455,17 +455,6 @@ bool FastISel::selectBinaryOp(const User *I, unsigned ISDOpcode) {
     return true;
   }
 
-  // Check if the second operand is a constant float.
-  if (const auto *CF = dyn_cast<ConstantFP>(I->getOperand(1))) {
-    unsigned ResultReg = fastEmit_rf(VT.getSimpleVT(), VT.getSimpleVT(),
-                                     ISDOpcode, Op0, Op0IsKill, CF);
-    if (ResultReg) {
-      // We successfully emitted code for the given LLVM Instruction.
-      updateValueMap(I, ResultReg);
-      return true;
-    }
-  }
-
   unsigned Op1 = getRegForValue(I->getOperand(1));
   if (!Op1) // Unhandled operand. Halt "fast" selection and bail.
     return false;
@@ -499,7 +488,7 @@ bool FastISel::selectGetElementPtr(const User *I) {
   for (gep_type_iterator GTI = gep_type_begin(I), E = gep_type_end(I);
        GTI != E; ++GTI) {
     const Value *Idx = GTI.getOperand();
-    if (auto *StTy = dyn_cast<StructType>(*GTI)) {
+    if (StructType *StTy = GTI.getStructTypeOrNull()) {
       uint64_t Field = cast<ConstantInt>(Idx)->getZExtValue();
       if (Field) {
         // N = N + Offset
@@ -581,7 +570,7 @@ bool FastISel::addStackMapLiveVars(SmallVectorImpl<MachineOperand> &Ops,
       Ops.push_back(MachineOperand::CreateImm(StackMaps::ConstantOp));
       Ops.push_back(MachineOperand::CreateImm(0));
     } else if (auto *AI = dyn_cast<AllocaInst>(Val)) {
-      // Values coming from a stack location also require a sepcial encoding,
+      // Values coming from a stack location also require a special encoding,
       // but that is added later on by the target specific frame index
       // elimination implementation.
       auto SI = FuncInfo.StaticAllocaMap.find(AI);
@@ -657,7 +646,7 @@ bool FastISel::selectStackmap(const CallInst *I) {
   MachineInstrBuilder MIB = BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
                                     TII.get(TargetOpcode::STACKMAP));
   for (auto const &MO : Ops)
-    MIB.addOperand(MO);
+    MIB.add(MO);
 
   // Issue CALLSEQ_END
   unsigned AdjStackUp = TII.getCallFrameDestroyOpcode();
@@ -707,7 +696,7 @@ bool FastISel::lowerCallOperands(const CallInst *CI, unsigned ArgIdx,
 
 FastISel::CallLoweringInfo &FastISel::CallLoweringInfo::setCallee(
     const DataLayout &DL, MCContext &Ctx, CallingConv::ID CC, Type *ResultTy,
-    const char *Target, ArgListTy &&ArgsList, unsigned FixedArgs) {
+    StringRef Target, ArgListTy &&ArgsList, unsigned FixedArgs) {
   SmallString<32> MangledName;
   Mangler::getNameWithPrefix(MangledName, Target, DL);
   MCSymbol *Sym = Ctx.getOrCreateSymbol(MangledName);
@@ -837,7 +826,7 @@ bool FastISel::selectPatchpoint(const CallInst *I) {
                                     TII.get(TargetOpcode::PATCHPOINT));
 
   for (auto &MO : Ops)
-    MIB.addOperand(MO);
+    MIB.add(MO);
 
   MIB->setPhysRegsDeadExcept(CLI.InRegs, TRI);
 
@@ -1077,7 +1066,7 @@ bool FastISel::selectCall(const User *I) {
   }
 
   MachineModuleInfo &MMI = FuncInfo.MF->getMMI();
-  ComputeUsesVAFloatArgument(*Call, &MMI);
+  computeUsesVAFloatArgument(*Call, MMI);
 
   // Handle intrinsic function calls.
   if (const auto *II = dyn_cast<IntrinsicInst>(Call))
@@ -1160,7 +1149,7 @@ bool FastISel::selectIntrinsicCall(const IntrinsicInst *II) {
       } else
         BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
                 TII.get(TargetOpcode::DBG_VALUE))
-            .addOperand(*Op)
+            .add(*Op)
             .addImm(0)
             .addMetadata(DI->getVariable())
             .addMetadata(DI->getExpression());
@@ -1227,6 +1216,7 @@ bool FastISel::selectIntrinsicCall(const IntrinsicInst *II) {
     updateValueMap(II, ResultReg);
     return true;
   }
+  case Intrinsic::invariant_group_barrier:
   case Intrinsic::expect: {
     unsigned ResultReg = getRegForValue(II->getArgOperand(0));
     if (!ResultReg)
@@ -1326,15 +1316,6 @@ bool FastISel::selectBitCast(const User *I) {
   return true;
 }
 
-// Return true if we should copy from swift error to the final vreg as specified
-// by SwiftErrorWorklist.
-static bool shouldCopySwiftErrorsToFinalVRegs(const TargetLowering &TLI,
-                                              FunctionLoweringInfo &FuncInfo) {
-  if (!TLI.supportSwiftError())
-    return false;
-  return FuncInfo.SwiftErrorWorklist.count(FuncInfo.MBB);
-}
-
 // Remove local value instructions starting from the instruction after
 // SavedLastLocalValue to the current function insert point.
 void FastISel::removeDeadLocalValueCode(MachineInstr *SavedLastLocalValue)
@@ -1359,10 +1340,6 @@ bool FastISel::selectInstruction(const Instruction *I) {
   // Just before the terminator instruction, insert instructions to
   // feed PHI nodes in successor blocks.
   if (isa<TerminatorInst>(I)) {
-    // If we need to materialize any vreg from worklist, we bail out of
-    // FastISel.
-    if (shouldCopySwiftErrorsToFinalVRegs(TLI, FuncInfo))
-      return false;
     if (!handlePHINodesInSuccessorBlocks(I->getParent())) {
       // PHI node handling may have generated local value instructions,
       // even though it failed to handle all PHI nodes.
@@ -1385,7 +1362,7 @@ bool FastISel::selectInstruction(const Instruction *I) {
 
   if (const auto *Call = dyn_cast<CallInst>(I)) {
     const Function *F = Call->getCalledFunction();
-    LibFunc::Func Func;
+    LibFunc Func;
 
     // As a special case, don't handle calls to builtin library functions that
     // may be translated directly to target instructions.
@@ -1722,18 +1699,6 @@ unsigned FastISel::fastEmit_f(MVT, MVT, unsigned,
 
 unsigned FastISel::fastEmit_ri(MVT, MVT, unsigned, unsigned /*Op0*/,
                                bool /*Op0IsKill*/, uint64_t /*Imm*/) {
-  return 0;
-}
-
-unsigned FastISel::fastEmit_rf(MVT, MVT, unsigned, unsigned /*Op0*/,
-                               bool /*Op0IsKill*/,
-                               const ConstantFP * /*FPImm*/) {
-  return 0;
-}
-
-unsigned FastISel::fastEmit_rri(MVT, MVT, unsigned, unsigned /*Op0*/,
-                                bool /*Op0IsKill*/, unsigned /*Op1*/,
-                                bool /*Op1IsKill*/, uint64_t /*Imm*/) {
   return 0;
 }
 

@@ -39,15 +39,27 @@
 #include "AMDGPUSubtarget.h"
 #include "SIInstrInfo.h"
 #include "SIRegisterInfo.h"
-#include "llvm/CodeGen/LiveIntervalAnalysis.h"
-#include "llvm/CodeGen/LiveVariables.h"
+#include "Utils/AMDGPUBaseInfo.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/IR/DebugLoc.h"
+#include "llvm/Pass.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
+#include <cassert>
+#include <iterator>
+#include <utility>
 
 using namespace llvm;
 
@@ -57,10 +69,10 @@ namespace {
 
 class SILoadStoreOptimizer : public MachineFunctionPass {
 private:
-  const SIInstrInfo *TII;
-  const SIRegisterInfo *TRI;
-  MachineRegisterInfo *MRI;
-  AliasAnalysis *AA;
+  const SIInstrInfo *TII = nullptr;
+  const SIRegisterInfo *TRI = nullptr;
+  MachineRegisterInfo *MRI = nullptr;
+  AliasAnalysis *AA = nullptr;
 
   static bool offsetsCanBeCombined(unsigned Offset0,
                                    unsigned Offset1,
@@ -86,9 +98,7 @@ private:
 public:
   static char ID;
 
-  SILoadStoreOptimizer()
-      : MachineFunctionPass(ID), TII(nullptr), TRI(nullptr), MRI(nullptr),
-        AA(nullptr) {}
+  SILoadStoreOptimizer() : MachineFunctionPass(ID) {}
 
   SILoadStoreOptimizer(const TargetMachine &TM_) : MachineFunctionPass(ID) {
     initializeSILoadStoreOptimizerPass(*PassRegistry::getPassRegistry());
@@ -98,9 +108,7 @@ public:
 
   bool runOnMachineFunction(MachineFunction &MF) override;
 
-  const char *getPassName() const override {
-    return "SI Load / Store Optimizer";
-  }
+  StringRef getPassName() const override { return "SI Load / Store Optimizer"; }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.setPreservesCFG();
@@ -110,7 +118,7 @@ public:
   }
 };
 
-} // End anonymous namespace.
+} // end anonymous namespace.
 
 INITIALIZE_PASS_BEGIN(SILoadStoreOptimizer, DEBUG_TYPE,
                       "SI Load / Store Optimizer", false, false)
@@ -143,19 +151,50 @@ static void addDefsToList(const MachineInstr &MI,
   }
 }
 
+static bool memAccessesCanBeReordered(MachineBasicBlock::iterator A,
+                                      MachineBasicBlock::iterator B,
+                                      const SIInstrInfo *TII,
+                                      AliasAnalysis * AA) {
+  return (TII->areMemAccessesTriviallyDisjoint(*A, *B, AA) ||
+    // RAW or WAR - cannot reorder
+    // WAW - cannot reorder
+    // RAR - safe to reorder
+    !(A->mayStore() || B->mayStore()));
+}
+
+// Add MI and its defs to the lists if MI reads one of the defs that are
+// already in the list. Returns true in that case.
+static bool
+addToListsIfDependent(MachineInstr &MI,
+                      SmallVectorImpl<const MachineOperand *> &Defs,
+                      SmallVectorImpl<MachineInstr*> &Insts) {
+  for (const MachineOperand *Def : Defs) {
+    bool ReadDef = MI.readsVirtualRegister(Def->getReg());
+    // If ReadDef is true, then there is a use of Def between I
+    // and the instruction that I will potentially be merged with. We
+    // will need to move this instruction after the merged instructions.
+    if (ReadDef) {
+      Insts.push_back(&MI);
+      addDefsToList(MI, Defs);
+      return true;
+    }
+  }
+
+  return false;
+}
+
 static bool
 canMoveInstsAcrossMemOp(MachineInstr &MemOp,
                         ArrayRef<MachineInstr*> InstsToMove,
                         const SIInstrInfo *TII,
                         AliasAnalysis *AA) {
-
   assert(MemOp.mayLoadOrStore());
 
   for (MachineInstr *InstToMove : InstsToMove) {
     if (!InstToMove->mayLoadOrStore())
       continue;
-    if (!TII->areMemAccessesTriviallyDisjoint(MemOp, *InstToMove, AA))
-      return false;
+    if (!memAccessesCanBeReordered(MemOp, *InstToMove, TII, AA))
+        return false;
   }
   return true;
 }
@@ -199,7 +238,6 @@ SILoadStoreOptimizer::findMatchingDSInst(MachineBasicBlock::iterator I,
   addDefsToList(*I, DefsToMove);
 
   for ( ; MBBI != E; ++MBBI) {
-
     if (MBBI->getOpcode() != I->getOpcode()) {
 
       // This is not a matching DS instruction, but we can keep looking as
@@ -214,7 +252,7 @@ SILoadStoreOptimizer::findMatchingDSInst(MachineBasicBlock::iterator I,
         return E;
 
       if (MBBI->mayLoadOrStore() &&
-          !TII->areMemAccessesTriviallyDisjoint(*I, *MBBI, AA)) {
+        !memAccessesCanBeReordered(*I, *MBBI, TII, AA)) {
         // We fail condition #1, but we may still be able to satisfy condition
         // #2.  Add this instruction to the move list and then we will check
         // if condition #2 holds once we have selected the matching instruction.
@@ -226,23 +264,22 @@ SILoadStoreOptimizer::findMatchingDSInst(MachineBasicBlock::iterator I,
       // When we match I with another DS instruction we will be moving I down
       // to the location of the matched instruction any uses of I will need to
       // be moved down as well.
-      for (const MachineOperand *Def : DefsToMove) {
-        bool ReadDef = MBBI->readsVirtualRegister(Def->getReg());
-        // If ReadDef is true, then there is a use of Def between I
-        // and the instruction that I will potentially be merged with. We
-        // will need to move this instruction after the merged instructions.
-        if (ReadDef) {
-          InstsToMove.push_back(&*MBBI);
-          addDefsToList(*MBBI, DefsToMove);
-          break;
-        }
-      }
+      addToListsIfDependent(*MBBI, DefsToMove, InstsToMove);
       continue;
     }
 
     // Don't merge volatiles.
     if (MBBI->hasOrderedMemoryRef())
       return E;
+
+    // Handle a case like
+    //   DS_WRITE_B32 addr, v, idx0
+    //   w = DS_READ_B32 addr, idx0
+    //   DS_WRITE_B32 addr, f(w), idx1
+    // where the DS_READ_B32 ends up in InstsToMove and therefore prevents
+    // merging of the two writes.
+    if (addToListsIfDependent(*MBBI, DefsToMove, InstsToMove))
+      continue;
 
     int AddrIdx = AMDGPU::getNamedOperandIdx(I->getOpcode(), AMDGPU::OpName::addr);
     const MachineOperand &AddrReg0 = I->getOperand(AddrIdx);
@@ -270,8 +307,10 @@ SILoadStoreOptimizer::findMatchingDSInst(MachineBasicBlock::iterator I,
     // We could potentially keep looking, but we'd need to make sure that
     // it was safe to move I and also all the instruction in InstsToMove
     // down past this instruction.
-    // FIXME: This is too conservative.
-    break;
+    if (!memAccessesCanBeReordered(*I, *MBBI, TII, AA) ||   // check if we can move I across MBBI
+      !canMoveInstsAcrossMemOp(*MBBI, InstsToMove, TII, AA) // check if we can move all I's users
+     )
+      break;
   }
   return E;
 }
@@ -328,25 +367,24 @@ MachineBasicBlock::iterator  SILoadStoreOptimizer::mergeRead2Pair(
   unsigned DestReg = MRI->createVirtualRegister(SuperRC);
 
   DebugLoc DL = I->getDebugLoc();
-  MachineInstrBuilder Read2
-    = BuildMI(*MBB, Paired, DL, Read2Desc, DestReg)
-    .addOperand(*AddrReg) // addr
-    .addImm(NewOffset0) // offset0
-    .addImm(NewOffset1) // offset1
-    .addImm(0) // gds
-    .addMemOperand(*I->memoperands_begin())
-    .addMemOperand(*Paired->memoperands_begin());
+  MachineInstrBuilder Read2 = BuildMI(*MBB, Paired, DL, Read2Desc, DestReg)
+                                  .add(*AddrReg)      // addr
+                                  .addImm(NewOffset0) // offset0
+                                  .addImm(NewOffset1) // offset1
+                                  .addImm(0)          // gds
+                                  .addMemOperand(*I->memoperands_begin())
+                                  .addMemOperand(*Paired->memoperands_begin());
   (void)Read2;
 
   const MCInstrDesc &CopyDesc = TII->get(TargetOpcode::COPY);
 
   // Copy to the old destination registers.
   BuildMI(*MBB, Paired, DL, CopyDesc)
-    .addOperand(*Dest0) // Copy to same destination including flags and sub reg.
-    .addReg(DestReg, 0, SubRegIdx0);
+      .add(*Dest0) // Copy to same destination including flags and sub reg.
+      .addReg(DestReg, 0, SubRegIdx0);
   MachineInstr *Copy1 = BuildMI(*MBB, Paired, DL, CopyDesc)
-    .addOperand(*Dest1)
-    .addReg(DestReg, RegState::Kill, SubRegIdx1);
+                            .add(*Dest1)
+                            .addReg(DestReg, RegState::Kill, SubRegIdx1);
 
   moveInstsAfter(Copy1, InstsToMove);
 
@@ -404,16 +442,15 @@ MachineBasicBlock::iterator SILoadStoreOptimizer::mergeWrite2Pair(
   const MCInstrDesc &Write2Desc = TII->get(Opc);
   DebugLoc DL = I->getDebugLoc();
 
-  MachineInstrBuilder Write2
-    = BuildMI(*MBB, Paired, DL, Write2Desc)
-    .addOperand(*Addr) // addr
-    .addOperand(*Data0) // data0
-    .addOperand(*Data1) // data1
-    .addImm(NewOffset0) // offset0
-    .addImm(NewOffset1) // offset1
-    .addImm(0) // gds
-    .addMemOperand(*I->memoperands_begin())
-    .addMemOperand(*Paired->memoperands_begin());
+  MachineInstrBuilder Write2 = BuildMI(*MBB, Paired, DL, Write2Desc)
+                                   .add(*Addr)         // addr
+                                   .add(*Data0)        // data0
+                                   .add(*Data1)        // data1
+                                   .addImm(NewOffset0) // offset0
+                                   .addImm(NewOffset1) // offset1
+                                   .addImm(0)          // gds
+                                   .addMemOperand(*I->memoperands_begin())
+                                   .addMemOperand(*Paired->memoperands_begin());
 
   moveInstsAfter(Write2, InstsToMove);
 

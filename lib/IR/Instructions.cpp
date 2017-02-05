@@ -2236,11 +2236,10 @@ const Value *BinaryOperator::getNotArgument(const Value *BinOp) {
 }
 
 
-// swapOperands - Exchange the two operands to this instruction.  This
-// instruction is safe to use on any binary instruction and does not
-// modify the semantics of the instruction.  If the instruction is
-// order dependent (SetLT f.e.) the opcode is changed.
-//
+// Exchange the two operands to this instruction. This instruction is safe to
+// use on any binary instruction and does not modify the semantics of the
+// instruction. If the instruction is order-dependent (SetLT f.e.), the opcode
+// is changed.
 bool BinaryOperator::swapOperands() {
   if (!isCommutative())
     return true; // Can't commute operands
@@ -2253,9 +2252,6 @@ bool BinaryOperator::swapOperands() {
 //                             FPMathOperator Class
 //===----------------------------------------------------------------------===//
 
-/// getFPAccuracy - Get the maximum error permitted by this operation in ULPs.
-/// An accuracy of 0.0 means that the operation should be performed with the
-/// default precision.
 float FPMathOperator::getFPAccuracy() const {
   const MDNode *MD =
       cast<Instruction>(this)->getMetadata(LLVMContext::MD_fpmath);
@@ -2550,7 +2546,8 @@ unsigned CastInst::isEliminableCastPair(
     case 14:
       // bitcast, addrspacecast -> addrspacecast if the element type of
       // bitcast's source is the same as that of addrspacecast's destination.
-      if (SrcTy->getPointerElementType() == DstTy->getPointerElementType())
+      if (SrcTy->getScalarType()->getPointerElementType() ==
+          DstTy->getScalarType()->getPointerElementType())
         return Instruction::AddrSpaceCast;
       return 0;
 
@@ -3470,69 +3467,6 @@ ICmpInst::Predicate ICmpInst::getUnsignedPredicate(Predicate pred) {
     case ICMP_SGE: return ICMP_UGE;
     case ICMP_SLE: return ICMP_ULE;
   }
-}
-
-/// Initialize a set of values that all satisfy the condition with C.
-///
-ConstantRange 
-ICmpInst::makeConstantRange(Predicate pred, const APInt &C) {
-  APInt Lower(C);
-  APInt Upper(C);
-  uint32_t BitWidth = C.getBitWidth();
-  switch (pred) {
-  default: llvm_unreachable("Invalid ICmp opcode to ConstantRange ctor!");
-  case ICmpInst::ICMP_EQ: ++Upper; break;
-  case ICmpInst::ICMP_NE: ++Lower; break;
-  case ICmpInst::ICMP_ULT:
-    Lower = APInt::getMinValue(BitWidth);
-    // Check for an empty-set condition.
-    if (Lower == Upper)
-      return ConstantRange(BitWidth, /*isFullSet=*/false);
-    break;
-  case ICmpInst::ICMP_SLT:
-    Lower = APInt::getSignedMinValue(BitWidth);
-    // Check for an empty-set condition.
-    if (Lower == Upper)
-      return ConstantRange(BitWidth, /*isFullSet=*/false);
-    break;
-  case ICmpInst::ICMP_UGT: 
-    ++Lower; Upper = APInt::getMinValue(BitWidth);        // Min = Next(Max)
-    // Check for an empty-set condition.
-    if (Lower == Upper)
-      return ConstantRange(BitWidth, /*isFullSet=*/false);
-    break;
-  case ICmpInst::ICMP_SGT:
-    ++Lower; Upper = APInt::getSignedMinValue(BitWidth);  // Min = Next(Max)
-    // Check for an empty-set condition.
-    if (Lower == Upper)
-      return ConstantRange(BitWidth, /*isFullSet=*/false);
-    break;
-  case ICmpInst::ICMP_ULE: 
-    Lower = APInt::getMinValue(BitWidth); ++Upper; 
-    // Check for a full-set condition.
-    if (Lower == Upper)
-      return ConstantRange(BitWidth, /*isFullSet=*/true);
-    break;
-  case ICmpInst::ICMP_SLE: 
-    Lower = APInt::getSignedMinValue(BitWidth); ++Upper; 
-    // Check for a full-set condition.
-    if (Lower == Upper)
-      return ConstantRange(BitWidth, /*isFullSet=*/true);
-    break;
-  case ICmpInst::ICMP_UGE:
-    Upper = APInt::getMinValue(BitWidth);        // Min = Next(Max)
-    // Check for a full-set condition.
-    if (Lower == Upper)
-      return ConstantRange(BitWidth, /*isFullSet=*/true);
-    break;
-  case ICmpInst::ICMP_SGE:
-    Upper = APInt::getSignedMinValue(BitWidth);  // Min = Next(Max)
-    // Check for a full-set condition.
-    if (Lower == Upper)
-      return ConstantRange(BitWidth, /*isFullSet=*/true);
-    break;
-  }
-  return ConstantRange(Lower, Upper);
 }
 
 CmpInst::Predicate CmpInst::getSwappedPredicate(Predicate pred) {

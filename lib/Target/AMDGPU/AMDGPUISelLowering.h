@@ -25,6 +25,13 @@ class AMDGPUSubtarget;
 class MachineRegisterInfo;
 
 class AMDGPUTargetLowering : public TargetLowering {
+private:
+  /// \returns AMDGPUISD::FFBH_U32 node if the incoming \p Op may have been
+  /// legalized from a smaller type VT. Need to match pre-legalized type because
+  /// the generic legalization inserts the add/sub between the select and
+  /// compare.
+  SDValue getFFBH_U32(SelectionDAG &DAG, SDValue Op, const SDLoc &DL) const;
+
 protected:
   const AMDGPUSubtarget *Subtarget;
 
@@ -53,6 +60,7 @@ protected:
   SDValue LowerSINT_TO_FP(SDValue Op, SelectionDAG &DAG) const;
 
   SDValue LowerFP64_TO_INT(SDValue Op, SelectionDAG &DAG, bool Signed) const;
+  SDValue LowerFP_TO_FP16(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerFP_TO_UINT(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerFP_TO_SINT(SDValue Op, SelectionDAG &DAG) const;
 
@@ -76,6 +84,8 @@ protected:
   SDValue performCtlzCombine(const SDLoc &SL, SDValue Cond, SDValue LHS,
                              SDValue RHS, DAGCombinerInfo &DCI) const;
   SDValue performSelectCombine(SDNode *N, DAGCombinerInfo &DCI) const;
+  SDValue performFNegCombine(SDNode *N, DAGCombinerInfo &DCI) const;
+  SDValue performFAbsCombine(SDNode *N, DAGCombinerInfo &DCI) const;
 
   static EVT getEquivalentMemType(LLVMContext &Context, EVT VT);
 
@@ -109,6 +119,16 @@ protected:
 
 public:
   AMDGPUTargetLowering(const TargetMachine &TM, const AMDGPUSubtarget &STI);
+
+  bool mayIgnoreSignedZero(SDValue Op) const {
+    if (getTargetMachine().Options.NoSignedZerosFPMath)
+      return true;
+
+    if (const auto *BO = dyn_cast<BinaryWithFlagsSDNode>(Op))
+      return BO->Flags.hasNoSignedZeros();
+
+    return false;
+  }
 
   bool isFAbsFree(EVT VT) const override;
   bool isFNegFree(EVT VT) const override;
@@ -155,7 +175,7 @@ public:
                           SmallVectorImpl<SDValue> &Results,
                           SelectionDAG &DAG) const override;
 
-  SDValue CombineFMinMaxLegacy(const SDLoc &DL, EVT VT, SDValue LHS,
+  SDValue combineFMinMaxLegacy(const SDLoc &DL, EVT VT, SDValue LHS,
                                SDValue RHS, SDValue True, SDValue False,
                                SDValue CC, DAGCombinerInfo &DCI) const;
 
@@ -164,13 +184,11 @@ public:
   bool isFsqrtCheap(SDValue Operand, SelectionDAG &DAG) const override {
     return true;
   }
-  SDValue getRsqrtEstimate(SDValue Operand,
-                           DAGCombinerInfo &DCI,
-                           unsigned &RefinementSteps,
-                           bool &UseOneConstNR) const override;
-  SDValue getRecipEstimate(SDValue Operand,
-                           DAGCombinerInfo &DCI,
-                           unsigned &RefinementSteps) const override;
+  SDValue getSqrtEstimate(SDValue Operand, SelectionDAG &DAG, int Enabled,
+                           int &RefinementSteps, bool &UseOneConstNR,
+                           bool Reciprocal) const override;
+  SDValue getRecipEstimate(SDValue Operand, SelectionDAG &DAG, int Enabled,
+                           int &RefinementSteps) const override;
 
   virtual SDNode *PostISelFolding(MachineSDNode *N,
                                   SelectionDAG &DAG) const = 0;
@@ -224,6 +242,10 @@ enum NodeType : unsigned {
   // This is SETCC with the full mask result which is used for a compare with a
   // result bit per item in the wavefront.
   SETCC,
+  SETREG,
+  // FP ops with input and output chain.
+  FMA_W_CHAIN,
+  FMUL_W_CHAIN,
 
   // SIN_HW, COS_HW - f32 for SI, 1 ULP max error, valid from -100 pi to 100 pi.
   // Denormals handled on some parts.
@@ -274,7 +296,9 @@ enum NodeType : unsigned {
   MUL_LOHI_I24,
   MUL_LOHI_U24,
   TEXTURE_FETCH,
-  EXPORT,
+  EXPORT, // exp on SI+
+  EXPORT_DONE, // exp on SI+ with done bit set
+  R600_EXPORT,
   CONST_ADDRESS,
   REGISTER_LOAD,
   REGISTER_STORE,
@@ -301,11 +325,13 @@ enum NodeType : unsigned {
   /// Pointer to the start of the shader's constant data.
   CONST_DATA_PTR,
   SENDMSG,
+  SENDMSGHALT,
   INTERP_MOV,
   INTERP_P1,
   INTERP_P2,
   PC_ADD_REL_OFFSET,
   KILL,
+  DUMMY_CHAIN,
   FIRST_MEM_OPCODE_NUMBER = ISD::FIRST_TARGET_MEMORY_OPCODE,
   STORE_MSKOR,
   LOAD_CONSTANT,
@@ -313,6 +339,8 @@ enum NodeType : unsigned {
   ATOMIC_CMP_SWAP,
   ATOMIC_INC,
   ATOMIC_DEC,
+  BUFFER_LOAD,
+  BUFFER_LOAD_FORMAT,
   LAST_AMDGPU_ISD_NUMBER
 };
 

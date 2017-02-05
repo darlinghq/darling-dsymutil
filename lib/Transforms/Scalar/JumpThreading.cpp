@@ -149,10 +149,6 @@ PreservedAnalyses JumpThreadingPass::run(Function &F,
   bool Changed =
       runImpl(F, &TLI, &LVI, HasProfileData, std::move(BFI), std::move(BPI));
 
-  // FIXME: We need to invalidate LVI to avoid PR28400. Is there a better
-  // solution?
-  AM.invalidate<LazyValueAnalysis>(F);
-
   if (!Changed)
     return PreservedAnalyses::all();
   PreservedAnalyses PA;
@@ -226,26 +222,13 @@ bool JumpThreadingPass::runImpl(Function &F, TargetLibraryInfo *TLI_,
           BB != &BB->getParent()->getEntryBlock() &&
           // If the terminator is the only non-phi instruction, try to nuke it.
           BB->getFirstNonPHIOrDbg()->isTerminator() && !LoopHeaders.count(BB)) {
-        // Since TryToSimplifyUncondBranchFromEmptyBlock may delete the
-        // block, we have to make sure it isn't in the LoopHeaders set.  We
-        // reinsert afterward if needed.
-        bool ErasedFromLoopHeaders = LoopHeaders.erase(BB);
-        BasicBlock *Succ = BI->getSuccessor(0);
-
         // FIXME: It is always conservatively correct to drop the info
         // for a block even if it doesn't get erased.  This isn't totally
         // awesome, but it allows us to use AssertingVH to prevent nasty
         // dangling pointer issues within LazyValueInfo.
         LVI->eraseBlock(BB);
-        if (TryToSimplifyUncondBranchFromEmptyBlock(BB)) {
+        if (TryToSimplifyUncondBranchFromEmptyBlock(BB))
           Changed = true;
-          // If we deleted BB and BB was the header of a loop, then the
-          // successor is now the header of the loop.
-          BB = Succ;
-        }
-
-        if (ErasedFromLoopHeaders)
-          LoopHeaders.insert(BB);
       }
     }
     EverChanged |= Changed;
@@ -999,10 +982,25 @@ bool JumpThreadingPass::SimplifyPartiallyRedundantLoad(LoadInst *LI) {
 
     // Scan the predecessor to see if the value is available in the pred.
     BBIt = PredBB->end();
-    Value *PredAvailable = FindAvailableLoadedValue(LI, PredBB, BBIt,
-                                                    DefMaxInstsToScan,
-                                                    nullptr,
-                                                    &IsLoadCSE);
+    unsigned NumScanedInst = 0;
+    Value *PredAvailable =
+        FindAvailableLoadedValue(LI, PredBB, BBIt, DefMaxInstsToScan, nullptr,
+                                 &IsLoadCSE, &NumScanedInst);
+
+    // If PredBB has a single predecessor, continue scanning through the single
+    // precessor.
+    BasicBlock *SinglePredBB = PredBB;
+    while (!PredAvailable && SinglePredBB && BBIt == SinglePredBB->begin() &&
+           NumScanedInst < DefMaxInstsToScan) {
+      SinglePredBB = SinglePredBB->getSinglePredecessor();
+      if (SinglePredBB) {
+        BBIt = SinglePredBB->end();
+        PredAvailable = FindAvailableLoadedValue(
+            LI, SinglePredBB, BBIt, (DefMaxInstsToScan - NumScanedInst),
+            nullptr, &IsLoadCSE, &NumScanedInst);
+      }
+    }
+
     if (!PredAvailable) {
       OneUnavailablePred = PredBB;
       continue;
@@ -1331,6 +1329,10 @@ bool JumpThreadingPass::ProcessBranchOnXOR(BinaryOperator *BO) {
   if (!isa<PHINode>(BB->front()))
     return false;
 
+  // If this BB is a landing pad, we won't be able to split the edge into it.
+  if (BB->isEHPad())
+    return false;
+
   // If we have a xor as the branch input to this block, and we know that the
   // LHS or RHS of the xor in any predecessor is true/false, then we can clone
   // the condition into the predecessor and fix that value to true, saving some
@@ -1599,7 +1601,7 @@ bool JumpThreadingPass::ThreadEdge(BasicBlock *BB,
 }
 
 /// Create a new basic block that will be the predecessor of BB and successor of
-/// all blocks in Preds. When profile data is availble, update the frequency of
+/// all blocks in Preds. When profile data is available, update the frequency of
 /// this new block.
 BasicBlock *JumpThreadingPass::SplitBlockPreds(BasicBlock *BB,
                                                ArrayRef<BasicBlock *> Preds,

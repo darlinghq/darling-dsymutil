@@ -16,6 +16,7 @@
 #define LLVM_CODEGEN_GLOBALISEL_CALLLOWERING_H
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/CodeGen/CallingConvLower.h"
 #include "llvm/CodeGen/ValueTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/Target/TargetCallingConv.h"
@@ -29,7 +30,66 @@ class Value;
 
 class CallLowering {
   const TargetLowering *TLI;
- protected:
+public:
+  struct ArgInfo {
+    unsigned Reg;
+    Type *Ty;
+    ISD::ArgFlagsTy Flags;
+    bool IsFixed;
+
+    ArgInfo(unsigned Reg, Type *Ty, ISD::ArgFlagsTy Flags = ISD::ArgFlagsTy{},
+            bool IsFixed = true)
+        : Reg(Reg), Ty(Ty), Flags(Flags), IsFixed(IsFixed) {}
+  };
+
+  /// Argument handling is mostly uniform between the four places that
+  /// make these decisions: function formal arguments, call
+  /// instruction args, call instruction returns and function
+  /// returns. However, once a decision has been made on where an
+  /// arugment should go, exactly what happens can vary slightly. This
+  /// class abstracts the differences.
+  struct ValueHandler {
+    /// Materialize a VReg containing the address of the specified
+    /// stack-based object. This is either based on a FrameIndex or
+    /// direct SP manipulation, depending on the context. \p MPO
+    /// should be initialized to an appropriate description of the
+    /// address created.
+    virtual unsigned getStackAddress(uint64_t Size, int64_t Offset,
+                                     MachinePointerInfo &MPO) = 0;
+
+    /// The specified value has been assigned to a physical register,
+    /// handle the appropriate COPY (either to or from) and mark any
+    /// relevant uses/defines as needed.
+    virtual void assignValueToReg(unsigned ValVReg, unsigned PhysReg,
+                                  CCValAssign &VA) = 0;
+
+    /// The specified value has been assigned to a stack
+    /// location. Load or store it there, with appropriate extension
+    /// if necessary.
+    virtual void assignValueToAddress(unsigned ValVReg, unsigned Addr,
+                                      uint64_t Size, MachinePointerInfo &MPO,
+                                      CCValAssign &VA) = 0;
+
+    unsigned extendRegister(unsigned ValReg, CCValAssign &VA);
+
+    virtual bool assignArg(unsigned ValNo, MVT ValVT, MVT LocVT,
+                           CCValAssign::LocInfo LocInfo, const ArgInfo &Info,
+                           CCState &State) {
+      return AssignFn(ValNo, ValVT, LocVT, LocInfo, Info.Flags, State);
+    }
+
+    ValueHandler(MachineIRBuilder &MIRBuilder, MachineRegisterInfo &MRI,
+                 CCAssignFn *AssignFn)
+      : MIRBuilder(MIRBuilder), MRI(MRI), AssignFn(AssignFn) {}
+
+    virtual ~ValueHandler() {}
+
+    MachineIRBuilder &MIRBuilder;
+    MachineRegisterInfo &MRI;
+    CCAssignFn *AssignFn;
+  };
+
+protected:
   /// Getter for generic TargetLowering class.
   const TargetLowering *getTLI() const {
     return TLI;
@@ -41,18 +101,17 @@ class CallLowering {
     return static_cast<const XXXTargetLowering *>(TLI);
   }
 
-  struct ArgInfo {
-    unsigned Reg;
-    Type *Ty;
-    ISD::ArgFlagsTy Flags;
-
-    ArgInfo(unsigned Reg, Type *Ty, ISD::ArgFlagsTy Flags = ISD::ArgFlagsTy{})
-        : Reg(Reg), Ty(Ty), Flags(Flags) {}
-  };
 
   template <typename FuncInfoTy>
   void setArgFlags(ArgInfo &Arg, unsigned OpNum, const DataLayout &DL,
                    const FuncInfoTy &FuncInfo) const;
+
+  /// Invoke Handler::assignArg on each of the given \p Args and then use
+  /// \p Callback to move them to the assigned locations.
+  ///
+  /// \return True if everything has succeeded, false otherwise.
+  bool handleAssignments(MachineIRBuilder &MIRBuilder, ArrayRef<ArgInfo> Args,
+                         ValueHandler &Callback) const;
 
 public:
   CallLowering(const TargetLowering *TLI) : TLI(TLI) {}
@@ -110,6 +169,9 @@ public:
   /// This hook must be implemented to lower the given call instruction,
   /// including argument and return value marshalling.
   ///
+  /// \p CI is either a CallInst or InvokeInst reference (other instantiations
+  /// will fail at link time).
+  ///
   /// \p ResReg is a register where the call's return value should be stored (or
   /// 0 if there is no return value).
   ///
@@ -122,9 +184,10 @@ public:
   /// range of an immediate jump.
   ///
   /// \return true if the lowering succeeded, false otherwise.
-  virtual bool lowerCall(MachineIRBuilder &MIRBuilder, const CallInst &CI,
-                         unsigned ResReg, ArrayRef<unsigned> ArgRegs,
-                         std::function<unsigned()> GetCalleeReg) const;
+  template <typename CallInstTy>
+  bool lowerCall(MachineIRBuilder &MIRBuilder, const CallInstTy &CI,
+                 unsigned ResReg, ArrayRef<unsigned> ArgRegs,
+                 std::function<unsigned()> GetCalleeReg) const;
 };
 } // End namespace llvm.
 

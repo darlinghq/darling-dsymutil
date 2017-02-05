@@ -1,11 +1,12 @@
-; RUN: llc %s -o - -enable-shrink-wrap=true -ifcvt-fn-start=1 -ifcvt-fn-stop=0 -mtriple=thumb-macho \
+; RUN: llc %s -o - -enable-shrink-wrap=true -ifcvt-fn-start=1 -ifcvt-fn-stop=0 -tail-dup-placement=0 -mtriple=thumb-macho \
 ; RUN:      | FileCheck %s --check-prefix=CHECK --check-prefix=ENABLE --check-prefix=ENABLE-V4T
-; RUN: llc %s -o - -enable-shrink-wrap=true -ifcvt-fn-start=1 -ifcvt-fn-stop=0 -mtriple=thumbv5-macho \
+; RUN: llc %s -o - -enable-shrink-wrap=true -ifcvt-fn-start=1 -ifcvt-fn-stop=0 -tail-dup-placement=0 -mtriple=thumbv5-macho \
 ; RUN:      | FileCheck %s --check-prefix=CHECK --check-prefix=ENABLE --check-prefix=ENABLE-V5T
-; RUN: llc %s -o - -enable-shrink-wrap=false -ifcvt-fn-start=1 -ifcvt-fn-stop=0 -mtriple=thumb-macho \
+; RUN: llc %s -o - -enable-shrink-wrap=false -ifcvt-fn-start=1 -ifcvt-fn-stop=0 -tail-dup-placement=0 -mtriple=thumb-macho \
 ; RUN:      | FileCheck %s --check-prefix=CHECK --check-prefix=DISABLE --check-prefix=DISABLE-V4T
-; RUN: llc %s -o - -enable-shrink-wrap=false -ifcvt-fn-start=1 -ifcvt-fn-stop=0 -mtriple=thumbv5-macho \
+; RUN: llc %s -o - -enable-shrink-wrap=false -ifcvt-fn-start=1 -ifcvt-fn-stop=0 -tail-dup-placement=0 -mtriple=thumbv5-macho \
 ; RUN:      | FileCheck %s --check-prefix=CHECK --check-prefix=DISABLE --check-prefix=DISABLE-V5T
+
 ;
 ; Note: Lots of tests use inline asm instead of regular calls.
 ; This allows to have a better control on what the allocation will do.
@@ -15,6 +16,8 @@
 ; edges.
 ; Also disable the late if-converter as it makes harder to reason on
 ; the diffs.
+; Disable tail-duplication during placement, as v4t vs v5t get different
+; results due to branches not being analyzable under v5
 
 ; Initial motivating example: Simple diamond with a call just on one side.
 ; CHECK-LABEL: foo:
@@ -650,11 +653,14 @@ define i1 @beq_to_bx(i32* %y, i32 %head) {
 
 ; CHECK: tst r3, r4
 ; ENABLE-NEXT: pop {r4}
-; ENABLE-NEXT: pop {r3}
-; ENABLE-NEXT: mov lr, r3
+; ENABLE-NEXT: mov r12, r{{.*}}
+; ENABLE-NEXT: pop {r0}
+; ENABLE-NEXT: mov lr, r0
+; ENABLE-NEXT: mov r0, r12
 ; CHECK-NEXT: beq [[EXIT_LABEL]]
 
 ; CHECK: str r1, [r2]
+; CHECK: str r3, [r2]
 ; CHECK-NEXT: movs r0, #0
 ; CHECK-NEXT: [[EXIT_LABEL]]: @ %cleanup
 ; ENABLE-NEXT: bx lr
@@ -675,6 +681,7 @@ if.end:
 
 if.end4:
   store i32 %head, i32* %y, align 4
+  store volatile i32 %z, i32* %y, align 4
   br label %cleanup
 
 cleanup:

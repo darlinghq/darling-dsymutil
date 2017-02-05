@@ -20,8 +20,9 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/AliasSetTracker.h"
-#include "llvm/Analysis/LoopPassManager.h"
+#include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/ValueHandle.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
@@ -517,38 +518,6 @@ public:
   LoopAccessInfo(Loop *L, ScalarEvolution *SE, const TargetLibraryInfo *TLI,
                  AliasAnalysis *AA, DominatorTree *DT, LoopInfo *LI);
 
-  // FIXME:
-  // Hack for MSVC 2013 which sems like it can't synthesize this even 
-  // with default keyword:
-  // LoopAccessInfo(LoopAccessInfo &&LAI) = default;
-  LoopAccessInfo(LoopAccessInfo &&LAI)
-      : PSE(std::move(LAI.PSE)), PtrRtChecking(std::move(LAI.PtrRtChecking)),
-        DepChecker(std::move(LAI.DepChecker)), TheLoop(LAI.TheLoop),
-        NumLoads(LAI.NumLoads), NumStores(LAI.NumStores),
-        MaxSafeDepDistBytes(LAI.MaxSafeDepDistBytes), CanVecMem(LAI.CanVecMem),
-        StoreToLoopInvariantAddress(LAI.StoreToLoopInvariantAddress),
-        Report(std::move(LAI.Report)),
-        SymbolicStrides(std::move(LAI.SymbolicStrides)),
-        StrideSet(std::move(LAI.StrideSet)) {}
-  // LoopAccessInfo &operator=(LoopAccessInfo &&LAI) = default;
-  LoopAccessInfo &operator=(LoopAccessInfo &&LAI) {
-    assert(this != &LAI);
-
-    PSE = std::move(LAI.PSE);
-    PtrRtChecking = std::move(LAI.PtrRtChecking);
-    DepChecker = std::move(LAI.DepChecker);
-    TheLoop = LAI.TheLoop;
-    NumLoads = LAI.NumLoads;
-    NumStores = LAI.NumStores;
-    MaxSafeDepDistBytes = LAI.MaxSafeDepDistBytes;
-    CanVecMem = LAI.CanVecMem;
-    StoreToLoopInvariantAddress = LAI.StoreToLoopInvariantAddress;
-    Report = std::move(LAI.Report);
-    SymbolicStrides = std::move(LAI.SymbolicStrides);
-    StrideSet = std::move(LAI.StrideSet);
-    return *this;
-  }
-
   /// Return true we can analyze the memory accesses in the loop and there are
   /// no memory dependence cycles.
   bool canVectorizeMemory() const { return CanVecMem; }
@@ -595,7 +564,7 @@ public:
 
   /// \brief The diagnostics report generated for the analysis.  E.g. why we
   /// couldn't analyze the loop.
-  const Optional<LoopAccessReport> &getReport() const { return Report; }
+  const OptimizationRemarkAnalysis *getReport() const { return Report.get(); }
 
   /// \brief the Memory Dependence Checker which can determine the
   /// loop-independent and loop-carried dependences between memory accesses.
@@ -641,7 +610,13 @@ private:
   /// pass.
   bool canAnalyzeLoop();
 
-  void emitAnalysis(LoopAccessReport &Message);
+  /// \brief Save the analysis remark.
+  ///
+  /// LAA does not directly emits the remarks.  Instead it stores it which the
+  /// client can retrieve and presents as its own analysis
+  /// (e.g. -Rpass-analysis=loop-vectorize).
+  OptimizationRemarkAnalysis &recordAnalysis(StringRef RemarkName,
+                                             Instruction *Instr = nullptr);
 
   /// \brief Collect memory access with loop invariant strides.
   ///
@@ -675,7 +650,7 @@ private:
 
   /// \brief The diagnostics report generated for the analysis.  E.g. why we
   /// couldn't analyze the loop.
-  Optional<LoopAccessReport> Report;
+  std::unique_ptr<OptimizationRemarkAnalysis> Report;
 
   /// \brief If an access has a symbolic strides, this maps the pointer value to
   /// the stride symbol.
@@ -714,6 +689,16 @@ const SCEV *replaceSymbolicStrideSCEV(PredicatedScalarEvolution &PSE,
 int64_t getPtrStride(PredicatedScalarEvolution &PSE, Value *Ptr, const Loop *Lp,
                      const ValueToValueMap &StridesMap = ValueToValueMap(),
                      bool Assume = false, bool ShouldCheckWrap = true);
+
+/// \brief Try to sort an array of loads / stores.
+///
+/// An array of loads / stores can only be sorted if all pointer operands
+/// refer to the same object, and the differences between these pointers 
+/// are known to be constant. If that is the case, this returns true, and the
+/// sorted array is returned in \p Sorted. Otherwise, this returns false, and
+/// \p Sorted is invalid.
+bool sortMemAccesses(ArrayRef<Value *> VL, const DataLayout &DL,
+                     ScalarEvolution &SE, SmallVectorImpl<Value *> &Sorted);
 
 /// \brief Returns true if the memory operations \p A and \p B are consecutive.
 /// This is a simple API that does not depend on the analysis pass. 
@@ -774,22 +759,12 @@ private:
 class LoopAccessAnalysis
     : public AnalysisInfoMixin<LoopAccessAnalysis> {
   friend AnalysisInfoMixin<LoopAccessAnalysis>;
-  static char PassID;
+  static AnalysisKey Key;
 
 public:
   typedef LoopAccessInfo Result;
-  Result run(Loop &, LoopAnalysisManager &);
-  static StringRef name() { return "LoopAccessAnalysis"; }
-};
 
-/// \brief Printer pass for the \c LoopAccessInfo results.
-class LoopAccessInfoPrinterPass
-    : public PassInfoMixin<LoopAccessInfoPrinterPass> {
-  raw_ostream &OS;
-
-public:
-  explicit LoopAccessInfoPrinterPass(raw_ostream &OS) : OS(OS) {}
-  PreservedAnalyses run(Loop &L, LoopAnalysisManager &AM);
+  Result run(Loop &L, LoopAnalysisManager &AM, LoopStandardAnalysisResults &AR);
 };
 
 inline Instruction *MemoryDepChecker::Dependence::getSource(

@@ -42,6 +42,7 @@ class AMDGPUShaderInst <dag outs, dag ins, string asm = "",
   field bits<32> Inst = 0xffffffff;
 }
 
+def FP16Denormals : Predicate<"Subtarget.hasFP16Denormals()">;
 def FP32Denormals : Predicate<"Subtarget.hasFP32Denormals()">;
 def FP64Denormals : Predicate<"Subtarget.hasFP64Denormals()">;
 def UnsafeFPMath : Predicate<"TM.Options.UnsafeFPMath">;
@@ -362,34 +363,54 @@ multiclass AtomicCmpSwapLocal <SDNode cmp_swap_node> {
 
 defm atomic_cmp_swap : AtomicCmpSwapLocal <atomic_cmp_swap>;
 
-def mskor_flat : PatFrag<(ops node:$val, node:$ptr),
-                            (AMDGPUstore_mskor node:$val, node:$ptr), [{
-  return cast<MemSDNode>(N)->getAddressSpace() == AMDGPUAS::FLAT_ADDRESS;
-}]>;
+multiclass global_binary_atomic_op<SDNode atomic_op> {
+  def "" : PatFrag<
+        (ops node:$ptr, node:$value),
+        (atomic_op node:$ptr, node:$value),
+        [{return cast<MemSDNode>(N)->getAddressSpace() == AMDGPUAS::GLOBAL_ADDRESS;}]>;
 
-class global_binary_atomic_op<SDNode atomic_op> : PatFrag<
-  (ops node:$ptr, node:$value),
-  (atomic_op node:$ptr, node:$value),
-  [{return cast<MemSDNode>(N)->getAddressSpace() == AMDGPUAS::GLOBAL_ADDRESS;}]
->;
+  def _noret : PatFrag<
+        (ops node:$ptr, node:$value),
+        (atomic_op node:$ptr, node:$value),
+        [{return cast<MemSDNode>(N)->getAddressSpace() == AMDGPUAS::GLOBAL_ADDRESS && (SDValue(N, 0).use_empty());}]>;
 
-def atomic_swap_global : global_binary_atomic_op<atomic_swap>;
-def atomic_add_global : global_binary_atomic_op<atomic_load_add>;
-def atomic_and_global : global_binary_atomic_op<atomic_load_and>;
-def atomic_max_global : global_binary_atomic_op<atomic_load_max>;
-def atomic_min_global : global_binary_atomic_op<atomic_load_min>;
-def atomic_or_global : global_binary_atomic_op<atomic_load_or>;
-def atomic_sub_global : global_binary_atomic_op<atomic_load_sub>;
-def atomic_umax_global : global_binary_atomic_op<atomic_load_umax>;
-def atomic_umin_global : global_binary_atomic_op<atomic_load_umin>;
-def atomic_xor_global : global_binary_atomic_op<atomic_load_xor>;
+  def _ret : PatFrag<
+        (ops node:$ptr, node:$value),
+        (atomic_op node:$ptr, node:$value),
+        [{return cast<MemSDNode>(N)->getAddressSpace() == AMDGPUAS::GLOBAL_ADDRESS && (!SDValue(N, 0).use_empty());}]>;
+}
 
-def atomic_cmp_swap_global : global_binary_atomic_op<AMDGPUatomic_cmp_swap>;
-def atomic_cmp_swap_global_nortn : PatFrag<
-  (ops node:$ptr, node:$value),
-  (atomic_cmp_swap_global node:$ptr, node:$value),
-  [{ return SDValue(N, 0).use_empty(); }]
->;
+defm atomic_swap_global : global_binary_atomic_op<atomic_swap>;
+defm atomic_add_global : global_binary_atomic_op<atomic_load_add>;
+defm atomic_and_global : global_binary_atomic_op<atomic_load_and>;
+defm atomic_max_global : global_binary_atomic_op<atomic_load_max>;
+defm atomic_min_global : global_binary_atomic_op<atomic_load_min>;
+defm atomic_or_global : global_binary_atomic_op<atomic_load_or>;
+defm atomic_sub_global : global_binary_atomic_op<atomic_load_sub>;
+defm atomic_umax_global : global_binary_atomic_op<atomic_load_umax>;
+defm atomic_umin_global : global_binary_atomic_op<atomic_load_umin>;
+defm atomic_xor_global : global_binary_atomic_op<atomic_load_xor>;
+
+//legacy
+def AMDGPUatomic_cmp_swap_global : PatFrag<
+        (ops node:$ptr, node:$value),
+        (AMDGPUatomic_cmp_swap node:$ptr, node:$value),
+        [{return cast<MemSDNode>(N)->getAddressSpace() == AMDGPUAS::GLOBAL_ADDRESS;}]>;
+
+def atomic_cmp_swap_global : PatFrag<
+      (ops node:$ptr, node:$cmp, node:$value),
+      (atomic_cmp_swap node:$ptr, node:$cmp, node:$value),
+      [{return cast<MemSDNode>(N)->getAddressSpace() == AMDGPUAS::GLOBAL_ADDRESS;}]>;
+
+def atomic_cmp_swap_global_noret : PatFrag<
+      (ops node:$ptr, node:$cmp, node:$value),
+      (atomic_cmp_swap node:$ptr, node:$cmp, node:$value),
+      [{return cast<MemSDNode>(N)->getAddressSpace() == AMDGPUAS::GLOBAL_ADDRESS && (SDValue(N, 0).use_empty());}]>;
+
+def atomic_cmp_swap_global_ret : PatFrag<
+      (ops node:$ptr, node:$cmp, node:$value),
+      (atomic_cmp_swap node:$ptr, node:$cmp, node:$value),
+      [{return cast<MemSDNode>(N)->getAddressSpace() == AMDGPUAS::GLOBAL_ADDRESS && (!SDValue(N, 0).use_empty());}]>;
 
 //===----------------------------------------------------------------------===//
 // Misc Pattern Fragments
@@ -400,6 +421,7 @@ int TWO_PI = 0x40c90fdb;
 int PI = 0x40490fdb;
 int TWO_PI_INV = 0x3e22f983;
 int FP_UINT_MAX_PLUS_1 = 0x4f800000;    // 1 << 32 in floating point encoding
+int FP16_ONE = 0x3C00;
 int FP32_ONE = 0x3f800000;
 int FP32_NEG_ONE = 0xbf800000;
 int FP64_ONE = 0x3ff0000000000000;
@@ -539,16 +561,31 @@ multiclass BFIPatterns <Instruction BFI_INT,
 
   def : Pat <
     (fcopysign f32:$src0, f32:$src1),
-    (BFI_INT (LoadImm32 0x7fffffff), $src0, $src1)
+    (BFI_INT (LoadImm32 (i32 0x7fffffff)), $src0, $src1)
+  >;
+
+  def : Pat <
+    (f32 (fcopysign f32:$src0, f64:$src1)),
+    (BFI_INT (LoadImm32 (i32 0x7fffffff)), $src0,
+             (i32 (EXTRACT_SUBREG $src1, sub1)))
   >;
 
   def : Pat <
     (f64 (fcopysign f64:$src0, f64:$src1)),
     (REG_SEQUENCE RC64,
       (i32 (EXTRACT_SUBREG $src0, sub0)), sub0,
-      (BFI_INT (LoadImm32 0x7fffffff),
+      (BFI_INT (LoadImm32 (i32 0x7fffffff)),
                (i32 (EXTRACT_SUBREG $src0, sub1)),
                (i32 (EXTRACT_SUBREG $src1, sub1))), sub1)
+  >;
+
+  def : Pat <
+    (f64 (fcopysign f64:$src0, f32:$src1)),
+    (REG_SEQUENCE RC64,
+      (i32 (EXTRACT_SUBREG $src0, sub0)), sub0,
+      (BFI_INT (LoadImm32 (i32 0x7fffffff)),
+               (i32 (EXTRACT_SUBREG $src0, sub1)),
+               $src1), sub1)
   >;
 }
 
@@ -598,13 +635,16 @@ def smax_oneuse : HasOneUseBinOp<smax>;
 def smin_oneuse : HasOneUseBinOp<smin>;
 def umax_oneuse : HasOneUseBinOp<umax>;
 def umin_oneuse : HasOneUseBinOp<umin>;
-def sub_oneuse : HasOneUseBinOp<sub>;
+def fminnum_oneuse : HasOneUseBinOp<fminnum>;
+def fmaxnum_oneuse : HasOneUseBinOp<fmaxnum>;
+def and_oneuse : HasOneUseBinOp<and>;
+def or_oneuse : HasOneUseBinOp<or>;
+def xor_oneuse : HasOneUseBinOp<xor>;
 } // Properties = [SDNPCommutative, SDNPAssociative]
 
-def select_oneuse : HasOneUseTernaryOp<select>;
+def sub_oneuse : HasOneUseBinOp<sub>;
 
-// 24-bit arithmetic patterns
-def umul24 : PatFrag <(ops node:$x, node:$y), (mul node:$x, node:$y)>;
+def select_oneuse : HasOneUseTernaryOp<select>;
 
 // Special conversion patterns
 

@@ -54,30 +54,63 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Scalar/LoopStrengthReduce.h"
+#include "llvm/ADT/APInt.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Hashing.h"
+#include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallBitVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/IVUsers.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopPass.h"
-#include "llvm/Analysis/LoopPassManager.h"
+#include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpander.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/ScalarEvolutionNormalization.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constant.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/GlobalValue.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/OperandTraits.h"
+#include "llvm/IR/Operator.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Value.h"
 #include "llvm/IR/ValueHandle.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/LoopPassManager.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <iterator>
+#include <map>
+#include <tuple>
+#include <utility>
+
 using namespace llvm;
 
 #define DEBUG_TYPE "loop-reduce"
@@ -125,8 +158,9 @@ struct MemAccessTy {
 
   bool operator!=(MemAccessTy Other) const { return !(*this == Other); }
 
-  static MemAccessTy getUnknown(LLVMContext &Ctx) {
-    return MemAccessTy(Type::getVoidTy(Ctx), UnknownAddressSpace);
+  static MemAccessTy getUnknown(LLVMContext &Ctx,
+                                unsigned AS = UnknownAddressSpace) {
+    return MemAccessTy(Type::getVoidTy(Ctx), AS);
   }
 };
 
@@ -141,16 +175,17 @@ public:
   void dump() const;
 };
 
-}
+} // end anonymous namespace
 
 void RegSortData::print(raw_ostream &OS) const {
   OS << "[NumUses=" << UsedByIndices.count() << ']';
 }
 
-LLVM_DUMP_METHOD
-void RegSortData::dump() const {
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+LLVM_DUMP_METHOD void RegSortData::dump() const {
   print(errs()); errs() << '\n';
 }
+#endif
 
 namespace {
 
@@ -180,7 +215,7 @@ public:
   const_iterator end() const   { return RegSequence.end(); }
 };
 
-}
+} // end anonymous namespace
 
 void
 RegUseTracker::countRegister(const SCEV *Reg, size_t LUIdx) {
@@ -212,7 +247,7 @@ RegUseTracker::swapAndDropUse(size_t LUIdx, size_t LastLUIdx) {
     SmallBitVector &UsedByIndices = Pair.second.UsedByIndices;
     if (LUIdx < UsedByIndices.size())
       UsedByIndices[LUIdx] =
-        LastLUIdx < UsedByIndices.size() ? UsedByIndices[LastLUIdx] : 0;
+        LastLUIdx < UsedByIndices.size() ? UsedByIndices[LastLUIdx] : false;
     UsedByIndices.resize(std::min(UsedByIndices.size(), LastLUIdx));
   }
 }
@@ -303,7 +338,7 @@ struct Formula {
   void dump() const;
 };
 
-}
+} // end anonymous namespace
 
 /// Recursion helper for initialMatch.
 static void DoInitialMatch(const SCEV *S, Loop *L,
@@ -325,7 +360,7 @@ static void DoInitialMatch(const SCEV *S, Loop *L,
 
   // Look at addrec operands.
   if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(S))
-    if (!AR->getStart()->isZero()) {
+    if (!AR->getStart()->isZero() && AR->isAffine()) {
       DoInitialMatch(AR->getStart(), L, Good, Bad, SE);
       DoInitialMatch(SE.getAddRecExpr(SE.getConstant(AR->getType(), 0),
                                       AR->getStepRecurrence(SE),
@@ -500,10 +535,11 @@ void Formula::print(raw_ostream &OS) const {
   }
 }
 
-LLVM_DUMP_METHOD
-void Formula::dump() const {
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+LLVM_DUMP_METHOD void Formula::dump() const {
   print(errs()); errs() << '\n';
 }
+#endif
 
 /// Return true if the given addrec can be sign-extended without changing its
 /// value.
@@ -568,7 +604,7 @@ static const SCEV *getExactSDiv(const SCEV *LHS, const SCEV *RHS,
 
   // Distribute the sdiv over addrec operands, if the addrec doesn't overflow.
   if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(LHS)) {
-    if (IgnoreSignificantBits || isAddRecSExtable(AR, SE)) {
+    if ((IgnoreSignificantBits || isAddRecSExtable(AR, SE)) && AR->isAffine()) {
       const SCEV *Step = getExactSDiv(AR->getStepRecurrence(SE), RHS, SE,
                                       IgnoreSignificantBits);
       if (!Step) return nullptr;
@@ -823,8 +859,10 @@ DeleteTriviallyDeadInstructions(SmallVectorImpl<WeakVH> &DeadInsts) {
 }
 
 namespace {
+
 class LSRUse;
-}
+
+} // end anonymous namespace
 
 /// \brief Check if the addressing mode defined by \p F is completely
 /// folded in \p LU at isel time.
@@ -930,7 +968,6 @@ struct LSRFixup {
   void print(raw_ostream &OS) const;
   void dump() const;
 };
-
 
 /// A DenseMapInfo implementation for holding DenseMaps and DenseSets of sorted
 /// SmallVectors of const SCEV*.
@@ -1040,7 +1077,7 @@ public:
   void dump() const;
 };
 
-}
+} // end anonymous namespace
 
 /// Tally up interesting quantities from the given register.
 void Cost::RateRegister(const SCEV *Reg,
@@ -1204,10 +1241,11 @@ void Cost::print(raw_ostream &OS) const {
     OS << ", plus " << SetupCost << " setup cost";
 }
 
-LLVM_DUMP_METHOD
-void Cost::dump() const {
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+LLVM_DUMP_METHOD void Cost::dump() const {
   print(errs()); errs() << '\n';
 }
+#endif
 
 LSRFixup::LSRFixup()
   : UserInst(nullptr), OperandValToReplace(nullptr),
@@ -1250,10 +1288,11 @@ void LSRFixup::print(raw_ostream &OS) const {
     OS << ", Offset=" << Offset;
 }
 
-LLVM_DUMP_METHOD
-void LSRFixup::dump() const {
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+LLVM_DUMP_METHOD void LSRFixup::dump() const {
   print(errs()); errs() << '\n';
 }
+#endif
 
 /// Test whether this use as a formula which has the same registers as the given
 /// formula.
@@ -1356,10 +1395,11 @@ void LSRUse::print(raw_ostream &OS) const {
     OS << ", widest fixup type: " << *WidestFixupType;
 }
 
-LLVM_DUMP_METHOD
-void LSRUse::dump() const {
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+LLVM_DUMP_METHOD void LSRUse::dump() const {
   print(errs()); errs() << '\n';
 }
+#endif
 
 static bool isAMCompletelyFolded(const TargetTransformInfo &TTI,
                                  LSRUse::KindType Kind, MemAccessTy AccessTy,
@@ -1646,7 +1686,12 @@ class LSRInstance {
   Instruction *IVIncInsertPos;
 
   /// Interesting factors between use strides.
-  SmallSetVector<int64_t, 8> Factors;
+  ///
+  /// We explicitly use a SetVector which contains a SmallSet, instead of the
+  /// default, a SmallDenseSet, because we need to use the full range of
+  /// int64_ts, and there's currently no good way of doing that with
+  /// SmallDenseSet.
+  SetVector<int64_t, SmallVector<int64_t, 8>, SmallSet<int64_t, 8>> Factors;
 
   /// Interesting use types, to facilitate truncation reuse.
   SmallSetVector<Type *, 4> Types;
@@ -1780,7 +1825,7 @@ public:
   void dump() const;
 };
 
-}
+} // end anonymous namespace
 
 /// If IV is used in a int-to-float cast inside the loop then try to eliminate
 /// the cast operation.
@@ -2240,8 +2285,10 @@ bool LSRInstance::reconcileNewOffset(LSRUse &LU, int64_t NewOffset,
   // TODO: Be less conservative when the type is similar and can use the same
   // addressing modes.
   if (Kind == LSRUse::Address) {
-    if (AccessTy != LU.AccessTy)
-      NewAccessTy = MemAccessTy::getUnknown(AccessTy.MemTy->getContext());
+    if (AccessTy.MemTy != LU.AccessTy.MemTy) {
+      NewAccessTy = MemAccessTy::getUnknown(AccessTy.MemTy->getContext(),
+                                            AccessTy.AddrSpace);
+    }
   }
 
   // Conservatively assume HasBaseReg is true for now.
@@ -2513,7 +2560,7 @@ bool IVChain::isProfitableIncrement(const SCEV *OperExpr,
   if (!isa<SCEVConstant>(IncExpr)) {
     const SCEV *HeadExpr = SE.getSCEV(getWideOperand(Incs[0].IVOperand));
     if (isa<SCEVConstant>(SE.getMinusSCEV(OperExpr, HeadExpr)))
-      return 0;
+      return false;
   }
 
   SmallPtrSet<const SCEV*, 8> Processed;
@@ -2810,7 +2857,7 @@ void LSRInstance::FinalizeChain(IVChain &Chain) {
   DEBUG(dbgs() << "Final Chain: " << *Chain.Incs[0].UserInst << "\n");
 
   for (const IVInc &Inc : Chain) {
-    DEBUG(dbgs() << "        Inc: " << Inc.UserInst << "\n");
+    DEBUG(dbgs() << "        Inc: " << *Inc.UserInst << "\n");
     auto UseI = find(Inc.UserInst->operands(), Inc.IVOperand);
     assert(UseI != Inc.UserInst->op_end() && "cannot find IV operand");
     IVIncSet.insert(UseI);
@@ -2947,8 +2994,10 @@ void LSRInstance::CollectFixupsAndInitialFormulae() {
     User::op_iterator UseI =
         find(UserInst->operands(), U.getOperandValToReplace());
     assert(UseI != UserInst->op_end() && "cannot find IV operand");
-    if (IVIncSet.count(UseI))
+    if (IVIncSet.count(UseI)) {
+      DEBUG(dbgs() << "Use is in profitable chain: " << **UseI << '\n');
       continue;
+    }
 
     LSRUse::KindType Kind = LSRUse::Basic;
     MemAccessTy AccessTy;
@@ -3124,6 +3173,9 @@ LSRInstance::CollectLoopInvariantFixupsAndFormulae() {
         // Don't bother if the instruction is in a BB which ends in an EHPad.
         if (UseBB->getTerminator()->isEHPad())
           continue;
+        // Don't bother rewriting PHIs in catchswitch blocks.
+        if (isa<CatchSwitchInst>(UserInst->getParent()->getTerminator()))
+          continue;
         // Ignore uses which are part of other SCEV expressions, to avoid
         // analyzing them multiple times.
         if (SE.isSCEVable(UserInst->getType())) {
@@ -3191,7 +3243,7 @@ static const SCEV *CollectSubexprs(const SCEV *S, const SCEVConstant *C,
     return nullptr;
   } else if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(S)) {
     // Split a non-zero base out of an addrec.
-    if (AR->getStart()->isZero())
+    if (AR->getStart()->isZero() || !AR->isAffine())
       return S;
 
     const SCEV *Remainder = CollectSubexprs(AR->getStart(),
@@ -3645,17 +3697,18 @@ struct WorkItem {
   void dump() const;
 };
 
-}
+} // end anonymous namespace
 
 void WorkItem::print(raw_ostream &OS) const {
   OS << "in formulae referencing " << *OrigReg << " in use " << LUIdx
      << " , add offset " << Imm;
 }
 
-LLVM_DUMP_METHOD
-void WorkItem::dump() const {
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+LLVM_DUMP_METHOD void WorkItem::dump() const {
   print(errs()); errs() << '\n';
 }
+#endif
 
 /// Look for registers which are a constant distance apart and try to form reuse
 /// opportunities between them.
@@ -4139,9 +4192,10 @@ void LSRInstance::NarrowSearchSpaceByPickingWinnerRegs() {
     for (const SCEV *Reg : RegUses) {
       if (Taken.count(Reg))
         continue;
-      if (!Best)
+      if (!Best) {
         Best = Reg;
-      else {
+        BestNum = RegUses.getUsedByIndices(Reg).count();
+      } else {
         unsigned Count = RegUses.getUsedByIndices(Reg).count();
         if (Count > BestNum) {
           Best = Reg;
@@ -4313,7 +4367,7 @@ LSRInstance::HoistInsertPosition(BasicBlock::iterator IP,
                                  const SmallVectorImpl<Instruction *> &Inputs)
                                                                          const {
   Instruction *Tentative = &*IP;
-  for (;;) {
+  while (true) {
     bool AllDominate = true;
     Instruction *BetterPos = nullptr;
     // Don't bother attempting to insert before a catchswitch, their basic block
@@ -4632,7 +4686,8 @@ void LSRInstance::RewriteForPHI(PHINode *PN,
       // is the canonical backedge for this loop, which complicates post-inc
       // users.
       if (e != 1 && BB->getTerminator()->getNumSuccessors() > 1 &&
-          !isa<IndirectBrInst>(BB->getTerminator())) {
+          !isa<IndirectBrInst>(BB->getTerminator()) &&
+          !isa<CatchSwitchInst>(BB->getTerminator())) {
         BasicBlock *Parent = PN->getParent();
         Loop *PNLoop = LI.getLoopFor(Parent);
         if (!PNLoop || Parent != PNLoop->getHeader()) {
@@ -4928,37 +4983,26 @@ void LSRInstance::print(raw_ostream &OS) const {
   print_uses(OS);
 }
 
-LLVM_DUMP_METHOD
-void LSRInstance::dump() const {
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+LLVM_DUMP_METHOD void LSRInstance::dump() const {
   print(errs()); errs() << '\n';
 }
+#endif
 
 namespace {
 
 class LoopStrengthReduce : public LoopPass {
 public:
   static char ID; // Pass ID, replacement for typeid
+
   LoopStrengthReduce();
 
 private:
   bool runOnLoop(Loop *L, LPPassManager &LPM) override;
   void getAnalysisUsage(AnalysisUsage &AU) const override;
 };
-}
 
-char LoopStrengthReduce::ID = 0;
-INITIALIZE_PASS_BEGIN(LoopStrengthReduce, "loop-reduce",
-                      "Loop Strength Reduction", false, false)
-INITIALIZE_PASS_DEPENDENCY(TargetTransformInfoWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(IVUsersWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(LoopSimplify)
-INITIALIZE_PASS_END(LoopStrengthReduce, "loop-reduce",
-                    "Loop Strength Reduction", false, false)
-
-Pass *llvm::createLoopStrengthReducePass() { return new LoopStrengthReduce(); }
+} // end anonymous namespace
 
 LoopStrengthReduce::LoopStrengthReduce() : LoopPass(ID) {
   initializeLoopStrengthReducePass(*PassRegistry::getPassRegistry());
@@ -5024,22 +5068,26 @@ bool LoopStrengthReduce::runOnLoop(Loop *L, LPPassManager & /*LPM*/) {
   return ReduceLoopStrength(L, IU, SE, DT, LI, TTI);
 }
 
-PreservedAnalyses LoopStrengthReducePass::run(Loop &L,
-                                              LoopAnalysisManager &AM) {
-  const auto &FAM =
-      AM.getResult<FunctionAnalysisManagerLoopProxy>(L).getManager();
-  Function *F = L.getHeader()->getParent();
-
-  auto &IU = AM.getResult<IVUsersAnalysis>(L);
-  auto *SE = FAM.getCachedResult<ScalarEvolutionAnalysis>(*F);
-  auto *DT = FAM.getCachedResult<DominatorTreeAnalysis>(*F);
-  auto *LI = FAM.getCachedResult<LoopAnalysis>(*F);
-  auto *TTI = FAM.getCachedResult<TargetIRAnalysis>(*F);
-  assert((SE && DT && LI && TTI) &&
-         "Analyses for Loop Strength Reduce not available");
-
-  if (!ReduceLoopStrength(&L, IU, *SE, *DT, *LI, *TTI))
+PreservedAnalyses LoopStrengthReducePass::run(Loop &L, LoopAnalysisManager &AM,
+                                              LoopStandardAnalysisResults &AR,
+                                              LPMUpdater &) {
+  if (!ReduceLoopStrength(&L, AM.getResult<IVUsersAnalysis>(L, AR), AR.SE,
+                          AR.DT, AR.LI, AR.TTI))
     return PreservedAnalyses::all();
 
   return getLoopPassPreservedAnalyses();
 }
+
+char LoopStrengthReduce::ID = 0;
+INITIALIZE_PASS_BEGIN(LoopStrengthReduce, "loop-reduce",
+                      "Loop Strength Reduction", false, false)
+INITIALIZE_PASS_DEPENDENCY(TargetTransformInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(IVUsersWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(LoopSimplify)
+INITIALIZE_PASS_END(LoopStrengthReduce, "loop-reduce",
+                    "Loop Strength Reduction", false, false)
+
+Pass *llvm::createLoopStrengthReducePass() { return new LoopStrengthReduce(); }

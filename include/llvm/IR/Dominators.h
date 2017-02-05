@@ -102,12 +102,9 @@ public:
     recalculate(F);
   }
 
-  DominatorTree(DominatorTree &&Arg)
-      : Base(std::move(static_cast<Base &>(Arg))) {}
-  DominatorTree &operator=(DominatorTree &&RHS) {
-    Base::operator=(std::move(static_cast<Base &>(RHS)));
-    return *this;
-  }
+  /// Handle invalidation explicitly.
+  bool invalidate(Function &F, const PreservedAnalyses &PA,
+                  FunctionAnalysisManager::Invalidator &);
 
   /// \brief Returns *false* if the other dominator tree matches this dominator
   /// tree.
@@ -157,7 +154,7 @@ public:
 template <class Node, class ChildIterator> struct DomTreeGraphTraitsBase {
   typedef Node *NodeRef;
   typedef ChildIterator ChildIteratorType;
-  typedef df_iterator<Node *, SmallPtrSet<NodeRef, 8>> nodes_iterator;
+  typedef df_iterator<Node *, df_iterator_default_set<Node*>> nodes_iterator;
 
   static NodeRef getEntryNode(NodeRef N) { return N; }
   static ChildIteratorType child_begin(NodeRef N) { return N->begin(); }
@@ -195,7 +192,7 @@ template <> struct GraphTraits<DominatorTree*>
 /// \brief Analysis pass which computes a \c DominatorTree.
 class DominatorTreeAnalysis : public AnalysisInfoMixin<DominatorTreeAnalysis> {
   friend AnalysisInfoMixin<DominatorTreeAnalysis>;
-  static char PassID;
+  static AnalysisKey Key;
 
 public:
   /// \brief Provide the result typedef for this analysis pass.

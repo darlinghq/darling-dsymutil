@@ -40,21 +40,29 @@ class DbgDeclareInst;
 class MemIntrinsic;
 class MemSetInst;
 
-/// \brief Assign a complexity or rank value to LLVM Values.
+/// Assign a complexity or rank value to LLVM Values. This is used to reduce
+/// the amount of pattern matching needed for compares and commutative
+/// instructions. For example, if we have:
+///   icmp ugt X, Constant
+/// or
+///   xor (add X, Constant), cast Z
+///
+/// We do not have to consider the commuted variants of these patterns because
+/// canonicalization based on complexity guarantees the above ordering.
 ///
 /// This routine maps IR values to various complexity ranks:
 ///   0 -> undef
 ///   1 -> Constants
 ///   2 -> Other non-instructions
 ///   3 -> Arguments
-///   3 -> Unary operations
-///   4 -> Other instructions
+///   4 -> Cast and (f)neg/not instructions
+///   5 -> Other instructions
 static inline unsigned getComplexity(Value *V) {
   if (isa<Instruction>(V)) {
-    if (BinaryOperator::isNeg(V) || BinaryOperator::isFNeg(V) ||
-        BinaryOperator::isNot(V))
-      return 3;
-    return 4;
+    if (isa<CastInst>(V) || BinaryOperator::isNeg(V) ||
+        BinaryOperator::isFNeg(V) || BinaryOperator::isNot(V))
+      return 4;
+    return 5;
   }
   if (isa<Argument>(V))
     return 3;
@@ -83,6 +91,24 @@ static inline bool IsFreeToInvert(Value *V, bool WillInvertAllUses) {
   // Constants can be considered to be not'ed values.
   if (isa<ConstantInt>(V))
     return true;
+
+  // A vector of constant integers can be inverted easily.
+  Constant *CV;
+  if (V->getType()->isVectorTy() && match(V, PatternMatch::m_Constant(CV))) {
+    unsigned NumElts = V->getType()->getVectorNumElements();
+    for (unsigned i = 0; i != NumElts; ++i) {
+      Constant *Elt = CV->getAggregateElement(i);
+      if (!Elt)
+        return false;
+
+      if (isa<UndefValue>(Elt))
+        continue;
+
+      if (!isa<ConstantInt>(Elt))
+        return false;
+    }
+    return true;
+  }
 
   // Compares can be inverted if all of their uses are being modified to use the
   // ~V.
@@ -138,8 +164,7 @@ IntrinsicIDToOverflowCheckFlavor(unsigned ID) {
 /// \brief The core instruction combiner logic.
 ///
 /// This class provides both the logic to recursively visit instructions and
-/// combine them, as well as the pass infrastructure for running this as part
-/// of the LLVM pass pipeline.
+/// combine them.
 class LLVM_LIBRARY_VISIBILITY InstCombiner
     : public InstVisitor<InstCombiner, Instruction *> {
   // FIXME: These members shouldn't be public.
@@ -258,14 +283,8 @@ public:
   Instruction *visitIntToPtr(IntToPtrInst &CI);
   Instruction *visitBitCast(BitCastInst &CI);
   Instruction *visitAddrSpaceCast(AddrSpaceCastInst &CI);
-  Instruction *FoldSelectOpOp(SelectInst &SI, Instruction *TI, Instruction *FI);
-  Instruction *FoldSelectIntoOp(SelectInst &SI, Value *, Value *);
-  Instruction *FoldSPFofSPF(Instruction *Inner, SelectPatternFlavor SPF1,
-                            Value *A, Value *B, Instruction &Outer,
-                            SelectPatternFlavor SPF2, Value *C);
   Instruction *FoldItoFPtoI(Instruction &FI);
   Instruction *visitSelectInst(SelectInst &SI);
-  Instruction *visitSelectInstWithICmp(SelectInst &SI, ICmpInst *ICI);
   Instruction *visitCallInst(CallInst &CI);
   Instruction *visitInvokeInst(InvokeInst &II);
 
@@ -278,6 +297,7 @@ public:
   Instruction *visitLoadInst(LoadInst &LI);
   Instruction *visitStoreInst(StoreInst &SI);
   Instruction *visitBranchInst(BranchInst &BI);
+  Instruction *visitFenceInst(FenceInst &FI);
   Instruction *visitSwitchInst(SwitchInst &SI);
   Instruction *visitReturnInst(ReturnInst &RI);
   Instruction *visitInsertValueInst(InsertValueInst &IV);
@@ -303,13 +323,12 @@ public:
                                  const unsigned SIOpd);
 
 private:
-  bool ShouldChangeType(unsigned FromBitWidth, unsigned ToBitWidth) const;
-  bool ShouldChangeType(Type *From, Type *To) const;
+  bool shouldChangeType(unsigned FromBitWidth, unsigned ToBitWidth) const;
+  bool shouldChangeType(Type *From, Type *To) const;
   Value *dyn_castNegVal(Value *V) const;
   Value *dyn_castFNegVal(Value *V, bool NoSignedZero = false) const;
   Type *FindElementAtOffset(PointerType *PtrTy, int64_t Offset,
                             SmallVectorImpl<Value *> &NewIndices);
-  Instruction *FoldOpIntoSelect(Instruction &Op, SelectInst *SI);
 
   /// Classify whether a cast is worth optimizing.
   ///
@@ -368,6 +387,8 @@ private:
   Instruction *scalarizePHI(ExtractElementInst &EI, PHINode *PN);
   Value *EvaluateInDifferentElementOrder(Value *V, ArrayRef<int> Mask);
   Instruction *foldCastedBitwiseLogic(BinaryOperator &I);
+  Instruction *shrinkBitwiseLogic(TruncInst &Trunc);
+  Instruction *optimizeBitCastFromPhi(CastInst &CI, PHINode *PN);
 
   /// Determine if a pair of casts can be replaced by a single cast.
   ///
@@ -524,12 +545,20 @@ private:
   Value *SimplifyVectorOp(BinaryOperator &Inst);
   Value *SimplifyBSwap(BinaryOperator &Inst);
 
-  // FoldOpIntoPhi - Given a binary operator, cast instruction, or select
-  // which has a PHI node as operand #0, see if we can fold the instruction
-  // into the PHI (which is only possible if all operands to the PHI are
-  // constants).
-  //
+
+  /// Given a binary operator, cast instruction, or select which has a PHI node
+  /// as operand #0, see if we can fold the instruction into the PHI (which is
+  /// only possible if all operands to the PHI are constants).
   Instruction *FoldOpIntoPhi(Instruction &I);
+
+  /// Given an instruction with a select as one operand and a constant as the
+  /// other operand, try to fold the binary operator into the select arguments.
+  /// This also works for Cast instructions, which obviously do not have a
+  /// second operand.
+  Instruction *FoldOpIntoSelect(Instruction &Op, SelectInst *SI);
+
+  /// This is a convenience wrapper function for the above two functions.
+  Instruction *foldOpWithConstantIntoOperand(Instruction &I);
 
   /// \brief Try to rotate an operation below a PHI node, using PHI nodes for
   /// its operands.
@@ -538,6 +567,10 @@ private:
   Instruction *FoldPHIArgGEPIntoPHI(PHINode &PN);
   Instruction *FoldPHIArgLoadIntoPHI(PHINode &PN);
   Instruction *FoldPHIArgZextsIntoPHI(PHINode &PN);
+
+  /// Helper function for FoldPHIArgXIntoPHI() to get debug location for the
+  /// folded operation.
+  DebugLoc PHIArgMergedDebugLoc(PHINode &PN);
 
   Instruction *foldGEPICmp(GEPOperator *GEPLHS, Value *RHS,
                            ICmpInst::Predicate Cond, Instruction &I);
@@ -594,6 +627,15 @@ private:
                                                  BinaryOperator *BO,
                                                  const APInt *C);
   Instruction *foldICmpIntrinsicWithConstant(ICmpInst &ICI, const APInt *C);
+
+  // Helpers of visitSelectInst().
+  Instruction *foldSelectExtConst(SelectInst &Sel);
+  Instruction *foldSelectOpOp(SelectInst &SI, Instruction *TI, Instruction *FI);
+  Instruction *foldSelectIntoOp(SelectInst &SI, Value *, Value *);
+  Instruction *foldSPFofSPF(Instruction *Inner, SelectPatternFlavor SPF1,
+                            Value *A, Value *B, Instruction &Outer,
+                            SelectPatternFlavor SPF2, Value *C);
+  Instruction *foldSelectInstWithICmp(SelectInst &SI, ICmpInst *ICI);
 
   Instruction *OptAndOp(Instruction *Op, ConstantInt *OpRHS,
                         ConstantInt *AndRHS, BinaryOperator &TheAnd);

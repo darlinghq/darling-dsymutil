@@ -1,5 +1,5 @@
 ; RUN: llc < %s -march=amdgcn -mcpu=verde -verify-machineinstrs | FileCheck --check-prefix=SI --check-prefix=FUNC %s
-; RUN: llc < %s -march=amdgcn -mcpu=tonga -verify-machineinstrs | FileCheck --check-prefix=SI --check-prefix=FUNC %s
+; RUN: llc < %s -march=amdgcn -mcpu=tonga -mattr=-flat-for-global -verify-machineinstrs | FileCheck --check-prefix=SI --check-prefix=FUNC %s
 
 ; FUNC-LABEL: {{^}}break_inserted_outside_of_loop:
 
@@ -30,7 +30,7 @@ ENDIF:
 ; FIXME: This could be folded into the s_or_b64 instruction
 ; SI: s_mov_b64 [[ZERO:s\[[0-9]+:[0-9]+\]]], 0
 ; SI: [[LOOP_LABEL:[A-Z0-9]+]]
-; SI: v_cmp_ne_i32_e32 vcc, 0, v{{[0-9]+}}
+; SI: v_cmp_ne_u32_e32 vcc, 0, v{{[0-9]+}}
 
 ; SI_IF_BREAK instruction:
 ; SI: s_or_b64 [[BREAK:s\[[0-9]+:[0-9]+\]]], vcc, [[ZERO]]

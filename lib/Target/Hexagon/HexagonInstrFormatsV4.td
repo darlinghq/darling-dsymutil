@@ -17,11 +17,11 @@
 //                        *** Must match BaseInfo.h ***
 //----------------------------------------------------------------------------//
 
-def TypeMEMOP    : IType<9>;
+def TypeV4LDST   : IType<9>;
 def TypeNV       : IType<10>;
 def TypeDUPLEX   : IType<11>;
-def TypeCOMPOUND : IType<12>;
-def TypePREFIX   : IType<30>;
+def TypeCJ       : IType<12>;
+def TypeEXTENDER   : IType<30>;
 
 //                      Duplex Instruction Class Declaration
 //===----------------------------------------------------------------------===//
@@ -132,7 +132,7 @@ class NCJInst<dag outs, dag ins, string asmstr, list<dag> pattern = [],
 let mayLoad = 1, mayStore = 1 in
 class MEMInst<dag outs, dag ins, string asmstr, list<dag> pattern = [],
               string cstr = "", InstrItinClass itin = V4LDST_tc_st_SLOT0>
-  : InstHexagon<outs, ins, asmstr, pattern, cstr, itin, TypeMEMOP>,
+  : InstHexagon<outs, ins, asmstr, pattern, cstr, itin, TypeV4LDST>,
     OpcodeHexagon;
 
 class MEMInst_V4<dag outs, dag ins, string asmstr, list<dag> pattern = [],
@@ -141,7 +141,7 @@ class MEMInst_V4<dag outs, dag ins, string asmstr, list<dag> pattern = [],
 
 class EXTENDERInst<dag outs, dag ins, string asmstr, list<dag> pattern = []>
   : InstHexagon<outs, ins, asmstr, pattern, "", EXTENDER_tc_1_SLOT0123,
-                TypePREFIX>, OpcodeHexagon;
+                TypeEXTENDER>, OpcodeHexagon;
 
 class SUBInst<dag outs, dag ins, string asmstr, list<dag> pattern = [],
               string cstr = "">
@@ -150,11 +150,11 @@ class SUBInst<dag outs, dag ins, string asmstr, list<dag> pattern = [],
 
 class CJInst<dag outs, dag ins, string asmstr, list<dag> pattern = [],
               string cstr = "">
-  : InstHexagon<outs, ins, asmstr, pattern, cstr, COMPOUND_CJ_ARCHDEPSLOT, TypeCOMPOUND>,
+  : InstHexagon<outs, ins, asmstr, pattern, cstr, COMPOUND_CJ_ARCHDEPSLOT, TypeCJ>,
     OpcodeHexagon;
 
 class CJInst_JMPSET<dag outs, dag ins, string asmstr, list<dag> pattern = [],
               string cstr = "">
-  : InstHexagon<outs, ins, asmstr, pattern, cstr, COMPOUND, TypeCOMPOUND>,
+  : InstHexagon<outs, ins, asmstr, pattern, cstr, COMPOUND, TypeCJ>,
     OpcodeHexagon;
 

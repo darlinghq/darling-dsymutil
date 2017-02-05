@@ -35,7 +35,8 @@ static unsigned getMaxWaves(unsigned SGPRs, unsigned VGPRs,
   unsigned MinRegOccupancy = std::min(ST.getOccupancyWithNumSGPRs(SGPRs),
                                       ST.getOccupancyWithNumVGPRs(VGPRs));
   return std::min(MinRegOccupancy,
-                  ST.getOccupancyWithLocalMemSize(MFI->getLDSSize()));
+                  ST.getOccupancyWithLocalMemSize(MFI->getLDSSize(),
+                                                  *MF.getFunction()));
 }
 
 void GCNMaxOccupancySchedStrategy::initCandidate(SchedCandidate &Cand, SUnit *SU,
@@ -65,7 +66,7 @@ void GCNMaxOccupancySchedStrategy::initCandidate(SchedCandidate &Cand, SUnit *SU
     // and can be retrieved by DAG->getPressureDif(SU).
     TempTracker.getUpwardPressure(SU->getInstr(), Pressure, MaxPressure);
   }
- 
+
   int NewSGPRPressure = Pressure[SRI->getSGPRPressureSet()];
   int NewVGPRPressure = Pressure[SRI->getVGPRPressureSet()];
 
@@ -103,7 +104,7 @@ void GCNMaxOccupancySchedStrategy::initCandidate(SchedCandidate &Cand, SUnit *SU
 
   if (ShouldTrackSGPRs && NewSGPRPressure >= SGPRExcessLimit) {
     Cand.RPDelta.Excess = PressureChange(SRI->getSGPRPressureSet());
-    Cand.RPDelta.Excess.setUnitInc(NewSGPRPressure = SGPRExcessLimit);
+    Cand.RPDelta.Excess.setUnitInc(NewSGPRPressure - SGPRExcessLimit);
   }
 
   // Register pressure is considered 'CRITICAL' if it is approaching a value
@@ -144,7 +145,7 @@ void GCNMaxOccupancySchedStrategy::pickNodeFromQueue(SchedBoundary &Zone,
   unsigned VGPRExcessLimit =
       Context->RegClassInfo->getNumAllocatableRegs(&AMDGPU::VGPR_32RegClass);
   unsigned MaxWaves = getMaxWaves(SGPRPressure, VGPRPressure, DAG->MF);
-  unsigned SGPRCriticalLimit = SRI->getMaxNumSGPRs(ST, MaxWaves);
+  unsigned SGPRCriticalLimit = SRI->getMaxNumSGPRs(ST, MaxWaves, true);
   unsigned VGPRCriticalLimit = SRI->getMaxNumVGPRs(MaxWaves);
 
   ReadyQueue &Q = Zone.Available;
@@ -235,7 +236,7 @@ SUnit *GCNMaxOccupancySchedStrategy::pickNodeBidirectional(bool &IsTopNode) {
     TopCand.Reason = NoCand;
     GenericScheduler::tryCandidate(Cand, TopCand, nullptr);
     if (TopCand.Reason != NoCand) {
-      Cand.setBest(TopCand); 
+      Cand.setBest(TopCand);
     } else {
       TopCand.Reason = TopReason;
     }

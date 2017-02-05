@@ -58,8 +58,10 @@
 #include "llvm/Analysis/BranchProbabilityInfo.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/IndirectCallSiteVisitor.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/CallSite.h"
 #include "llvm/IR/DiagnosticInfo.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
@@ -71,7 +73,9 @@
 #include "llvm/ProfileData/InstrProfReader.h"
 #include "llvm/ProfileData/ProfileCommon.h"
 #include "llvm/Support/BranchProbability.h"
+#include "llvm/Support/DOTGraphTraits.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/GraphWriter.h"
 #include "llvm/Support/JamCRC.h"
 #include "llvm/Transforms/Instrumentation.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
@@ -119,24 +123,59 @@ static cl::opt<unsigned> MaxNumAnnotations(
 // Command line option to control appending FunctionHash to the name of a COMDAT
 // function. This is to avoid the hash mismatch caused by the preinliner.
 static cl::opt<bool> DoComdatRenaming(
-    "do-comdat-renaming", cl::init(true), cl::Hidden,
+    "do-comdat-renaming", cl::init(false), cl::Hidden,
     cl::desc("Append function hash to the name of COMDAT function to avoid "
              "function hash mismatch due to the preinliner"));
 
 // Command line option to enable/disable the warning about missing profile
 // information.
-static cl::opt<bool> PGOWarnMissing("pgo-warn-missing-function",
-                                     cl::init(false),
-                                     cl::Hidden);
+static cl::opt<bool>
+    PGOWarnMissing("pgo-warn-missing-function", cl::init(false), cl::Hidden,
+                   cl::desc("Use this option to turn on/off "
+                            "warnings about missing profile data for "
+                            "functions."));
 
 // Command line option to enable/disable the warning about a hash mismatch in
 // the profile data.
-static cl::opt<bool> NoPGOWarnMismatch("no-pgo-warn-mismatch", cl::init(false),
-                                       cl::Hidden);
+static cl::opt<bool>
+    NoPGOWarnMismatch("no-pgo-warn-mismatch", cl::init(false), cl::Hidden,
+                      cl::desc("Use this option to turn off/on "
+                               "warnings about profile cfg mismatch."));
+
+// Command line option to enable/disable the warning about a hash mismatch in
+// the profile data for Comdat functions, which often turns out to be false
+// positive due to the pre-instrumentation inline.
+static cl::opt<bool>
+    NoPGOWarnMismatchComdat("no-pgo-warn-mismatch-comdat", cl::init(true),
+                            cl::Hidden,
+                            cl::desc("The option is used to turn on/off "
+                                     "warnings about hash mismatch for comdat "
+                                     "functions."));
 
 // Command line option to enable/disable select instruction instrumentation.
-static cl::opt<bool> PGOInstrSelect("pgo-instr-select", cl::init(true),
-                                    cl::Hidden);
+static cl::opt<bool>
+    PGOInstrSelect("pgo-instr-select", cl::init(true), cl::Hidden,
+                   cl::desc("Use this option to turn on/off SELECT "
+                            "instruction instrumentation. "));
+
+// Command line option to turn on CFG dot dump of raw profile counts
+static cl::opt<bool>
+    PGOViewRawCounts("pgo-view-raw-counts", cl::init(false), cl::Hidden,
+                     cl::desc("A boolean option to show CFG dag "
+                              "with raw profile counts from "
+                              "profile data. See also option "
+                              "-pgo-view-counts. To limit graph "
+                              "display to only one function, use "
+                              "filtering option -view-bfi-func-name."));
+
+// Command line option to turn on CFG dot dump after profile annotation.
+// Defined in Analysis/BlockFrequencyInfo.cpp:  -pgo-view-counts
+extern cl::opt<bool> PGOViewCounts;
+
+// Command line option to specify the name of the function for CFG dump
+// Defined in Analysis/BlockFrequencyInfo.cpp:  -view-bfi-func-name=
+extern cl::opt<std::string> ViewBlockFreqFuncName;
+
 namespace {
 
 /// The select instruction visitor plays three roles specified
@@ -202,9 +241,7 @@ public:
         *PassRegistry::getPassRegistry());
   }
 
-  const char *getPassName() const override {
-    return "PGOInstrumentationGenPass";
-  }
+  StringRef getPassName() const override { return "PGOInstrumentationGenPass"; }
 
 private:
   bool runOnModule(Module &M) override;
@@ -227,9 +264,7 @@ public:
         *PassRegistry::getPassRegistry());
   }
 
-  const char *getPassName() const override {
-    return "PGOInstrumentationUsePass";
-  }
+  StringRef getPassName() const override { return "PGOInstrumentationUsePass"; }
 
 private:
   std::string ProfileFileName;
@@ -331,6 +366,9 @@ public:
   // Return the auxiliary BB information.
   BBInfo &getBBInfo(const BasicBlock *BB) const { return MST.getBBInfo(BB); }
 
+  // Return the auxiliary BB information if available.
+  BBInfo *findBBInfo(const BasicBlock *BB) const { return MST.findBBInfo(BB); }
+
   // Dump edges and BB information.
   void dumpInfo(std::string Str = "") const {
     MST.dumpEdges(dbgs(), Twine("Dump Function ") + FuncName + " Hash: " +
@@ -390,7 +428,10 @@ void FuncPGOInstrumentation<Edge, BBInfo>::computeCFGHash() {
     const TerminatorInst *TI = BB.getTerminator();
     for (unsigned I = 0, E = TI->getNumSuccessors(); I != E; ++I) {
       BasicBlock *Succ = TI->getSuccessor(I);
-      uint32_t Index = getBBInfo(Succ).Index;
+      auto BI = findBBInfo(Succ);
+      if (BI == nullptr)
+        continue;
+      uint32_t Index = BI->Index;
       for (int J = 0; J < 4; J++)
         Indexes.push_back((char)(Index >> (J * 8)));
     }
@@ -405,20 +446,8 @@ void FuncPGOInstrumentation<Edge, BBInfo>::computeCFGHash() {
 static bool canRenameComdat(
     Function &F,
     std::unordered_multimap<Comdat *, GlobalValue *> &ComdatMembers) {
-  if (F.getName().empty())
+  if (!DoComdatRenaming || !canRenameComdatFunc(F, true))
     return false;
-  if (!needsComdatForCounter(F, *(F.getParent())))
-    return false;
-  // Only safe to do if this function may be discarded if it is not used
-  // in the compilation unit.
-  if (!GlobalValue::isDiscardableIfUnused(F.getLinkage()))
-    return false;
-
-  // For AvailableExternallyLinkage functions.
-  if (!F.hasComdat()) {
-    assert(F.getLinkage() == GlobalValue::AvailableExternallyLinkage);
-    return true;
-  }
 
   // FIXME: Current only handle those Comdat groups that only containing one
   // function and function aliases.
@@ -443,9 +472,11 @@ template <class Edge, class BBInfo>
 void FuncPGOInstrumentation<Edge, BBInfo>::renameComdatFunction() {
   if (!canRenameComdat(F, ComdatMembers))
     return;
+  std::string OrigName = F.getName().str();
   std::string NewFuncName =
       Twine(F.getName() + "." + Twine(FunctionHash)).str();
   F.setName(Twine(NewFuncName));
+  GlobalAlias::create(GlobalValue::WeakAnyLinkage, OrigName, &F);
   FuncName = Twine(FuncName + "." + Twine(FunctionHash)).str();
   Comdat *NewComdat;
   Module *M = F.getParent();
@@ -471,7 +502,9 @@ void FuncPGOInstrumentation<Edge, BBInfo>::renameComdatFunction() {
     if (GlobalAlias *GA = dyn_cast<GlobalAlias>(CM.second)) {
       // For aliases, change the name directly.
       assert(dyn_cast<Function>(GA->getAliasee()->stripPointerCasts()) == &F);
+      std::string OrigGAName = GA->getName().str();
       GA->setName(Twine(GA->getName() + "." + Twine(FunctionHash)));
+      GlobalAlias::create(GlobalValue::WeakAnyLinkage, OrigGAName, GA);
       continue;
     }
     // Must be a function.
@@ -642,7 +675,7 @@ public:
              BranchProbabilityInfo *BPI = nullptr,
              BlockFrequencyInfo *BFI = nullptr)
       : F(Func), M(Modu), FuncInfo(Func, ComdatMembers, false, BPI, BFI),
-        FreqAttr(FFA_Normal) {}
+        CountPosition(0), ProfileCountSize(0), FreqAttr(FFA_Normal) {}
 
   // Read counts for the instrumented BB from profile.
   bool readCounters(IndexedInstrProfReader *PGOReader);
@@ -672,6 +705,13 @@ public:
     return FuncInfo.getBBInfo(BB);
   }
 
+  // Return the auxiliary BB information if available.
+  UseBBInfo *findBBInfo(const BasicBlock *BB) const {
+    return FuncInfo.findBBInfo(BB);
+  }
+
+  Function &getFunc() const { return F; }
+
 private:
   Function &F;
   Module *M;
@@ -681,6 +721,12 @@ private:
   // The maximum count value in the profile. This is only used in PGO use
   // compilation.
   uint64_t ProgramMaxCount;
+
+  // Position of counter that remains to be read.
+  uint32_t CountPosition;
+
+  // Total size of the profile count for this function.
+  uint32_t ProfileCountSize;
 
   // ProfileRecord for this function.
   InstrProfRecord ProfileRecord;
@@ -750,9 +796,8 @@ void PGOUseFunc::setInstrumentedCounts(
     NewEdge1.InMST = true;
     getBBInfo(InstrBB).setBBInfoCount(CountValue);
   }
-  // Now annotate select instructions
-  FuncInfo.SIVisitor.annotateSelects(F, this, &I);
-  assert(I == CountFromProfile.size());
+  ProfileCountSize =  CountFromProfile.size();
+  CountPosition = I;
 }
 
 // Set the count value for the unknown edge. There should be one and only one
@@ -787,7 +832,11 @@ bool PGOUseFunc::readCounters(IndexedInstrProfReader *PGOReader) {
       } else if (Err == instrprof_error::hash_mismatch ||
                  Err == instrprof_error::malformed) {
         NumOfPGOMismatch++;
-        SkipWarning = NoPGOWarnMismatch;
+        SkipWarning =
+            NoPGOWarnMismatch ||
+            (NoPGOWarnMismatchComdat &&
+             (F.hasComdat() ||
+              F.getLinkage() == GlobalValue::AvailableExternallyLinkage));
       }
 
       if (SkipWarning)
@@ -852,27 +901,38 @@ void PGOUseFunc::populateCounters() {
     // For efficient traversal, it's better to start from the end as most
     // of the instrumented edges are at the end.
     for (auto &BB : reverse(F)) {
-      UseBBInfo &Count = getBBInfo(&BB);
-      if (!Count.CountValid) {
-        if (Count.UnknownCountOutEdge == 0) {
-          Count.CountValue = sumEdgeCount(Count.OutEdges);
-          Count.CountValid = true;
+      UseBBInfo *Count = findBBInfo(&BB);
+      if (Count == nullptr)
+        continue;
+      if (!Count->CountValid) {
+        if (Count->UnknownCountOutEdge == 0) {
+          Count->CountValue = sumEdgeCount(Count->OutEdges);
+          Count->CountValid = true;
           Changes = true;
-        } else if (Count.UnknownCountInEdge == 0) {
-          Count.CountValue = sumEdgeCount(Count.InEdges);
-          Count.CountValid = true;
+        } else if (Count->UnknownCountInEdge == 0) {
+          Count->CountValue = sumEdgeCount(Count->InEdges);
+          Count->CountValid = true;
           Changes = true;
         }
       }
-      if (Count.CountValid) {
-        if (Count.UnknownCountOutEdge == 1) {
-          uint64_t Total = Count.CountValue - sumEdgeCount(Count.OutEdges);
-          setEdgeCount(Count.OutEdges, Total);
+      if (Count->CountValid) {
+        if (Count->UnknownCountOutEdge == 1) {
+          uint64_t Total = 0;
+          uint64_t OutSum = sumEdgeCount(Count->OutEdges);
+          // If the one of the successor block can early terminate (no-return),
+          // we can end up with situation where out edge sum count is larger as
+          // the source BB's count is collected by a post-dominated block.
+          if (Count->CountValue > OutSum)
+            Total = Count->CountValue - OutSum;
+          setEdgeCount(Count->OutEdges, Total);
           Changes = true;
         }
-        if (Count.UnknownCountInEdge == 1) {
-          uint64_t Total = Count.CountValue - sumEdgeCount(Count.InEdges);
-          setEdgeCount(Count.InEdges, Total);
+        if (Count->UnknownCountInEdge == 1) {
+          uint64_t Total = 0;
+          uint64_t InSum = sumEdgeCount(Count->InEdges);
+          if (Count->CountValue > InSum)
+            Total = Count->CountValue - InSum;
+          setEdgeCount(Count->InEdges, Total);
           Changes = true;
         }
       }
@@ -882,15 +942,27 @@ void PGOUseFunc::populateCounters() {
   DEBUG(dbgs() << "Populate counts in " << NumPasses << " passes.\n");
 #ifndef NDEBUG
   // Assert every BB has a valid counter.
-  for (auto &BB : F)
-    assert(getBBInfo(&BB).CountValid && "BB count is not valid");
+  for (auto &BB : F) {
+    auto BI = findBBInfo(&BB);
+    if (BI == nullptr)
+      continue;
+    assert(BI->CountValid && "BB count is not valid");
+  }
 #endif
   uint64_t FuncEntryCount = getBBInfo(&*F.begin()).CountValue;
   F.setEntryCount(FuncEntryCount);
   uint64_t FuncMaxCount = FuncEntryCount;
-  for (auto &BB : F)
-    FuncMaxCount = std::max(FuncMaxCount, getBBInfo(&BB).CountValue);
+  for (auto &BB : F) {
+    auto BI = findBBInfo(&BB);
+    if (BI == nullptr)
+      continue;
+    FuncMaxCount = std::max(FuncMaxCount, BI->CountValue);
+  }
   markFunctionAttributes(FuncEntryCount, FuncMaxCount);
+
+  // Now annotate select instructions
+  FuncInfo.SIVisitor.annotateSelects(F, this, &CountPosition);
+  assert(CountPosition == ProfileCountSize);
 
   DEBUG(FuncInfo.dumpInfo("after reading profile."));
 }
@@ -965,7 +1037,10 @@ void SelectInstVisitor::annotateOneSelectInst(SelectInst &SI) {
   uint64_t SCounts[2];
   SCounts[0] = CountFromProfile[*CurCtrIdx]; // True count
   ++(*CurCtrIdx);
-  uint64_t TotalCount = UseFunc->getBBInfo(SI.getParent()).CountValue;
+  uint64_t TotalCount = 0;
+  auto BI = UseFunc->findBBInfo(SI.getParent());
+  if (BI != nullptr)
+    TotalCount = BI->CountValue;
   // False Count
   SCounts[1] = (TotalCount > SCounts[0] ? TotalCount - SCounts[0] : 0);
   uint64_t MaxCount = std::max(SCounts[0], SCounts[1]);
@@ -1162,6 +1237,23 @@ static bool annotateAllFunctions(
       ColdFunctions.push_back(&F);
     else if (FreqAttr == PGOUseFunc::FFA_Hot)
       HotFunctions.push_back(&F);
+    if (PGOViewCounts && (ViewBlockFreqFuncName.empty() ||
+                          F.getName().equals(ViewBlockFreqFuncName))) {
+      LoopInfo LI{DominatorTree(F)};
+      std::unique_ptr<BranchProbabilityInfo> NewBPI =
+          llvm::make_unique<BranchProbabilityInfo>(F, LI);
+      std::unique_ptr<BlockFrequencyInfo> NewBFI =
+          llvm::make_unique<BlockFrequencyInfo>(F, *NewBPI, LI);
+
+      NewBFI->view();
+    }
+    if (PGOViewRawCounts && (ViewBlockFreqFuncName.empty() ||
+                             F.getName().equals(ViewBlockFreqFuncName))) {
+      if (ViewBlockFreqFuncName.empty())
+        WriteGraph(&Func, Twine("PGORawCounts_") + Func.getFunc().getName());
+      else
+        ViewGraph(&Func, Twine("PGORawCounts_") + Func.getFunc().getName());
+    }
   }
   M.setProfileSummary(PGOReader->getSummary().getMD(M.getContext()));
   // Set function hotness attribute from the profile.
@@ -1216,4 +1308,76 @@ bool PGOInstrumentationUseLegacyPass::runOnModule(Module &M) {
   };
 
   return annotateAllFunctions(M, ProfileFileName, LookupBPI, LookupBFI);
+}
+
+namespace llvm {
+template <> struct GraphTraits<PGOUseFunc *> {
+  typedef const BasicBlock *NodeRef;
+  typedef succ_const_iterator ChildIteratorType;
+  typedef pointer_iterator<Function::const_iterator> nodes_iterator;
+
+  static NodeRef getEntryNode(const PGOUseFunc *G) {
+    return &G->getFunc().front();
+  }
+  static ChildIteratorType child_begin(const NodeRef N) {
+    return succ_begin(N);
+  }
+  static ChildIteratorType child_end(const NodeRef N) { return succ_end(N); }
+  static nodes_iterator nodes_begin(const PGOUseFunc *G) {
+    return nodes_iterator(G->getFunc().begin());
+  }
+  static nodes_iterator nodes_end(const PGOUseFunc *G) {
+    return nodes_iterator(G->getFunc().end());
+  }
+};
+
+static std::string getSimpleNodeName(const BasicBlock *Node) {
+  if (!Node->getName().empty())
+    return Node->getName();
+
+  std::string SimpleNodeName;
+  raw_string_ostream OS(SimpleNodeName);
+  Node->printAsOperand(OS, false);
+  return OS.str();
+}
+
+template <> struct DOTGraphTraits<PGOUseFunc *> : DefaultDOTGraphTraits {
+  explicit DOTGraphTraits(bool isSimple = false)
+      : DefaultDOTGraphTraits(isSimple) {}
+
+  static std::string getGraphName(const PGOUseFunc *G) {
+    return G->getFunc().getName();
+  }
+
+  std::string getNodeLabel(const BasicBlock *Node, const PGOUseFunc *Graph) {
+    std::string Result;
+    raw_string_ostream OS(Result);
+
+    OS << getSimpleNodeName(Node) << ":\\l";
+    UseBBInfo *BI = Graph->findBBInfo(Node);
+    OS << "Count : ";
+    if (BI && BI->CountValid)
+      OS << BI->CountValue << "\\l";
+    else
+      OS << "Unknown\\l";
+
+    if (!PGOInstrSelect)
+      return Result;
+
+    for (auto BI = Node->begin(); BI != Node->end(); ++BI) {
+      auto *I = &*BI;
+      if (!isa<SelectInst>(I))
+        continue;
+      // Display scaled counts for SELECT instruction:
+      OS << "SELECT : { T = ";
+      uint64_t TC, FC;
+      bool HasProf = I->extractProfMetadata(TC, FC);
+      if (!HasProf)
+        OS << "Unknown, F = Unknown }\\l";
+      else
+        OS << TC << ", F = " << FC << " }\\l";
+    }
+    return Result;
+  }
+};
 }

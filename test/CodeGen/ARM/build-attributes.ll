@@ -102,6 +102,10 @@
 ; RUN: llc < %s -mtriple=thumbv7em-linux-gnueabi -mcpu=cortex-m7 -mattr=+fp-only-sp  -enable-unsafe-fp-math -disable-fp-elim -enable-no-infs-fp-math -enable-no-nans-fp-math -fp-contract=fast | FileCheck %s --check-prefix=CORTEX-M7-FAST
 ; RUN: llc < %s -mtriple=thumbv7em-linux-gnueabi -mcpu=cortex-m7 | FileCheck %s --check-prefix=CORTEX-M7-DOUBLE
 ; RUN: llc < %s -mtriple=thumbv7em-linux-gnueabi -mcpu=cortex-m7 -enable-sign-dependent-rounding-fp-math | FileCheck %s --check-prefix=DYN-ROUNDING
+; RUN: llc < %s -mtriple=thumbv8-linux-gnueabi -mcpu=cortex-m23 | FileCheck %s --check-prefix=CORTEX-M23
+; RUN: llc < %s -mtriple=thumbv8-linux-gnueabi -mcpu=cortex-m33 | FileCheck %s --check-prefix=CORTEX-M33
+; RUN: llc < %s -mtriple=thumbv8-linux-gnueabi -mcpu=cortex-m33 -enable-unsafe-fp-math -disable-fp-elim -enable-no-infs-fp-math -enable-no-nans-fp-math -fp-contract=fast | FileCheck %s --check-prefix=CORTEX-M33-FAST
+; RUN: llc < %s -mtriple=thumbv8-linux-gnueabi -mcpu=cortex-m33 -enable-sign-dependent-rounding-fp-math | FileCheck %s --check-prefix=DYN-ROUNDING
 ; RUN: llc < %s -mtriple=armv7r-linux-gnueabi -mcpu=cortex-r4 | FileCheck %s --check-prefix=CORTEX-R4
 ; RUN: llc < %s -mtriple=armv7r-linux-gnueabi -mcpu=cortex-r4f | FileCheck %s --check-prefix=CORTEX-R4F
 ; RUN: llc < %s -mtriple=armv7r-linux-gnueabi -mcpu=cortex-r5 | FileCheck %s --check-prefix=CORTEX-R5
@@ -136,6 +140,9 @@
 ; RUN: llc < %s -mtriple=armv8-linux-gnueabi -mcpu=exynos-m2 | FileCheck %s --check-prefix=EXYNOS-M2
 ; RUN: llc < %s -mtriple=armv8-linux-gnueabi -mcpu=exynos-m2  -enable-unsafe-fp-math -disable-fp-elim -enable-no-infs-fp-math -enable-no-nans-fp-math -fp-contract=fast | FileCheck %s --check-prefix=EXYNOS-M1-FAST
 ; RUN: llc < %s -mtriple=armv8-linux-gnueabi -mcpu=exynos-m2 -enable-sign-dependent-rounding-fp-math | FileCheck %s --check-prefix=DYN-ROUNDING
+; RUN: llc < %s -mtriple=armv8-linux-gnueabi -mcpu=exynos-m3 | FileCheck %s --check-prefix=EXYNOS-M3
+; RUN: llc < %s -mtriple=armv8-linux-gnueabi -mcpu=exynos-m3  -enable-unsafe-fp-math -disable-fp-elim -enable-no-infs-fp-math -enable-no-nans-fp-math -fp-contract=fast | FileCheck %s --check-prefix=EXYNOS-M1-FAST
+; RUN: llc < %s -mtriple=armv8-linux-gnueabi -mcpu=exynos-m3 -enable-sign-dependent-rounding-fp-math | FileCheck %s --check-prefix=DYN-ROUNDING
 ; RUN: llc < %s -mtriple=armv8.1a-linux-gnueabi  -enable-unsafe-fp-math -disable-fp-elim -enable-no-infs-fp-math -enable-no-nans-fp-math -fp-contract=fast | FileCheck %s --check-prefix=GENERIC-ARMV8_1-A-FAST
 ; RUN: llc < %s -mtriple=armv8.1a-linux-gnueabi -enable-sign-dependent-rounding-fp-math | FileCheck %s --check-prefix=DYN-ROUNDING
 ; RUN: llc < %s -mtriple=armv7-none-linux-gnueabi -mcpu=cortex-a7 | FileCheck %s  --check-prefix=CORTEX-A7-CHECK
@@ -173,6 +180,8 @@
 ; RUN: llc < %s -mtriple=armv8-none-linux-gnueabi -mcpu=exynos-m1 -mattr=+strict-align | FileCheck %s --check-prefix=STRICT-ALIGN
 ; RUN: llc < %s -mtriple=armv8-none-linux-gnueabi -mcpu=exynos-m2 | FileCheck %s --check-prefix=NO-STRICT-ALIGN
 ; RUN: llc < %s -mtriple=armv8-none-linux-gnueabi -mcpu=exynos-m2 -mattr=+strict-align | FileCheck %s --check-prefix=STRICT-ALIGN
+; RUN: llc < %s -mtriple=armv8-none-linux-gnueabi -mcpu=exynos-m3 | FileCheck %s --check-prefix=NO-STRICT-ALIGN
+; RUN: llc < %s -mtriple=armv8-none-linux-gnueabi -mcpu=exynos-m3 -mattr=+strict-align | FileCheck %s --check-prefix=STRICT-ALIGN
 
 ; ARMv7a
 ; RUN: llc < %s -mtriple=armv7-none-linux-gnueabi -mcpu=cortex-a7 | FileCheck %s --check-prefix=NO-STRICT-ALIGN
@@ -199,6 +208,17 @@
 ; ARMv5
 ; RUN: llc < %s -mtriple=armv5-none-linux-gnueabi -mcpu=arm1022e | FileCheck %s --check-prefix=NO-STRICT-ALIGN
 ; RUN: llc < %s -mtriple=armv5-none-linux-gnueabi -mcpu=arm1022e -mattr=+strict-align | FileCheck %s --check-prefix=STRICT-ALIGN
+
+; ARMv8-R
+; RUN: llc < %s -mtriple=arm-none-none-eabi -mcpu=cortex-r52 -mattr=-vfp2,-fp16 | FileCheck %s --check-prefix=ARMv8R --check-prefix=ARMv8R-NOFPU
+; RUN: llc < %s -mtriple=arm-none-none-eabi -mcpu=cortex-r52 -mattr=-neon,+fp-only-sp,+d16 | FileCheck %s --check-prefix=ARMv8R --check-prefix=ARMv8R-SP
+; RUN: llc < %s -mtriple=arm-none-none-eabi -mcpu=cortex-r52 | FileCheck %s --check-prefix=ARMv8R --check-prefix=ARMv8R-NEON
+
+; ARMv8-M
+; RUN: llc < %s -mtriple=thumbv8-none-none-eabi -mcpu=cortex-m23 | FileCheck %s --check-prefix=NO-STRICT-ALIGN
+; RUN: llc < %s -mtriple=thumbv8-none-none-eabi -mcpu=cortex-m23 -mattr=+strict-align | FileCheck %s --check-prefix=STRICT-ALIGN
+; RUN: llc < %s -mtriple=thumbv8-none-none-eabi -mcpu=cortex-m33 | FileCheck %s --check-prefix=NO-STRICT-ALIGN
+; RUN: llc < %s -mtriple=thumbv8-none-none-eabi -mcpu=cortex-m33 -mattr=+strict-align | FileCheck %s --check-prefix=STRICT-ALIGN
 
 ; XSCALE:      .eabi_attribute 6, 5
 ; XSCALE:      .eabi_attribute 8, 1
@@ -1300,6 +1320,55 @@
 ; CORTEX-A32-FAST-NOT:  .eabi_attribute 22
 ; CORTEX-A32-FAST:  .eabi_attribute 23, 1
 
+; CORTEX-M23:  .cpu cortex-m23
+; CORTEX-M23:  .eabi_attribute 6, 16
+; CORTEX-M23:  .eabi_attribute 7, 77
+; CORTEX-M23:  .eabi_attribute 8, 0
+; CORTEX-M23:  .eabi_attribute 9, 3
+; CORTEX-M23:  .eabi_attribute 17, 1
+;; We default to IEEE 754 compliance
+; CORTEX-M23-NOT:   .eabi_attribute 19
+; CORTEX-M23:  .eabi_attribute 20, 1
+; CORTEX-M23:  .eabi_attribute 21, 1
+; CORTEX-M23:  .eabi_attribute 23, 3
+; CORTEX-M23:  .eabi_attribute 34, 1
+; CORTEX-M23:  .eabi_attribute 24, 1
+; CORTEX-M23-NOT:  .eabi_attribute 27
+; CORTEX-M23-NOT:  .eabi_attribute 28
+; CORTEX-M23:  .eabi_attribute 25, 1
+; CORTEX-M23:  .eabi_attribute 38, 1
+; CORTEX-M23:  .eabi_attribute 14, 0
+; CORTEX-M23-NOT:  .eabi_attribute 44
+
+; CORTEX-M33:  .cpu cortex-m33
+; CORTEX-M33:  .eabi_attribute 6, 17
+; CORTEX-M33:  .eabi_attribute 7, 77
+; CORTEX-M33:  .eabi_attribute 8, 0
+; CORTEX-M33:  .eabi_attribute 9, 3
+; CORTEX-M33:  .fpu fpv5-sp-d16
+; CORTEX-M33:  .eabi_attribute 17, 1
+;; We default to IEEE 754 compliance
+; CORTEX-M23-NOT:   .eabi_attribute 19
+; CORTEX-M33:  .eabi_attribute 20, 1
+; CORTEX-M33:  .eabi_attribute 21, 1
+; CORTEX-M33:  .eabi_attribute 23, 3
+; CORTEX-M33:  .eabi_attribute 34, 1
+; CORTEX-M33:  .eabi_attribute 24, 1
+; CORTEX-M33:  .eabi_attribute 25, 1
+; CORTEX-M33:  .eabi_attribute 27, 1
+; CORTEX-M33-NOT:  .eabi_attribute 28
+; CORTEX-M33:  .eabi_attribute 36, 1
+; CORTEX-M33:  .eabi_attribute 38, 1
+; CORTEX-M33:  .eabi_attribute 46, 1
+; CORTEX-M33-NOT:  .eabi_attribute 44
+; CORTEX-M33:  .eabi_attribute 14, 0
+
+; CORTEX-M33-FAST-NOT:   .eabi_attribute 19
+; CORTEX-M33-FAST:  .eabi_attribute 20, 2
+; CORTEX-M33-FAST-NOT:  .eabi_attribute 21
+; CORTEX-M33-FAST-NOT:  .eabi_attribute 22
+; CORTEX-M33-FAST:  .eabi_attribute 23, 1
+
 ; CORTEX-A35:  .cpu cortex-a35
 ; CORTEX-A35:  .eabi_attribute 6, 14
 ; CORTEX-A35:  .eabi_attribute 7, 65
@@ -1497,6 +1566,29 @@
 ; EXYNOS-M2-NOT:  .eabi_attribute 44
 ; EXYNOS-M2:  .eabi_attribute 68, 3
 
+; EXYNOS-M3:  .cpu exynos-m3
+; EXYNOS-M3:  .eabi_attribute 6, 14
+; EXYNOS-M3:  .eabi_attribute 7, 65
+; EXYNOS-M3:  .eabi_attribute 8, 1
+; EXYNOS-M3:  .eabi_attribute 9, 2
+; EXYNOS-M3:  .fpu crypto-neon-fp-armv8
+; EXYNOS-M3:  .eabi_attribute 12, 3
+; EXYNOS-M3-NOT:   .eabi_attribute 19
+;; We default to IEEE 754 compliance
+; EXYNOS-M3:  .eabi_attribute 20, 1
+; EXYNOS-M3:  .eabi_attribute 21, 1
+; EXYNOS-M3-NOT:  .eabi_attribute 22
+; EXYNOS-M3:  .eabi_attribute 23, 3
+; EXYNOS-M3:  .eabi_attribute 24, 1
+; EXYNOS-M3:  .eabi_attribute 25, 1
+; EXYNOS-M3-NOT:  .eabi_attribute 27
+; EXYNOS-M3-NOT:  .eabi_attribute 28
+; EXYNOS-M3:  .eabi_attribute 36, 1
+; EXYNOS-M3:  .eabi_attribute 38, 1
+; EXYNOS-M3:  .eabi_attribute 42, 1
+; EXYNOS-M3-NOT:  .eabi_attribute 44
+; EXYNOS-M3:  .eabi_attribute 68, 3
+
 ; GENERIC-FPU-VFPV3-FP16: .fpu vfpv3-fp16
 ; GENERIC-FPU-VFPV3-D16-FP16: .fpu vfpv3-d16-fp16
 ; GENERIC-FPU-VFPV3XD: .fpu vfpv3xd
@@ -1548,6 +1640,35 @@
 
 ; PCS-R9-USE:  .eabi_attribute 14, 0
 ; PCS-R9-RESERVE:  .eabi_attribute 14, 3
+
+; ARMv8R: .eabi_attribute 67, "2.09"      @ Tag_conformance
+; ARMv8R: .eabi_attribute 6, 15   @ Tag_CPU_arch
+; ARMv8R: .eabi_attribute 7, 82   @ Tag_CPU_arch_profile
+; ARMv8R: .eabi_attribute 8, 1    @ Tag_ARM_ISA_use
+; ARMv8R: .eabi_attribute 9, 2    @ Tag_THUMB_ISA_use
+; ARMv8R-NOFPU-NOT: .fpu
+; ARMv8R-NOFPU-NOT: .eabi_attribute 12
+; ARMv8R-SP: .fpu fpv5-sp-d16
+; ARMv8R-SP-NOT: .eabi_attribute 12
+; ARMv8R-NEON: .fpu    neon-fp-armv8
+; ARMv8R-NEON: .eabi_attribute 12, 3   @ Tag_Advanced_SIMD_arch
+; ARMv8R: .eabi_attribute 17, 1   @ Tag_ABI_PCS_GOT_use
+; ARMv8R: .eabi_attribute 20, 1   @ Tag_ABI_FP_denormal
+; ARMv8R: .eabi_attribute 21, 1   @ Tag_ABI_FP_exceptions
+; ARMv8R: .eabi_attribute 23, 3   @ Tag_ABI_FP_number_model
+; ARMv8R: .eabi_attribute 34, 1   @ Tag_CPU_unaligned_access
+; ARMv8R: .eabi_attribute 24, 1   @ Tag_ABI_align_needed
+; ARMv8R: .eabi_attribute 25, 1   @ Tag_ABI_align_preserved
+; ARMv8R-NOFPU-NOT: .eabi_attribute 27
+; ARMv8R-SP: .eabi_attribute 27, 1   @ Tag_ABI_HardFP_use
+; ARMv8R-NEON-NOT: .eabi_attribute 27
+; ARMv8R-NOFPU-NOT: .eabi_attribute 36
+; ARMv8R-SP: .eabi_attribute 36, 1   @ Tag_FP_HP_extension
+; ARMv8R-NEON: .eabi_attribute 36, 1   @ Tag_FP_HP_extension
+; ARMv8R: .eabi_attribute 38, 1   @ Tag_ABI_FP_16bit_format
+; ARMv8R: .eabi_attribute 42, 1   @ Tag_MPextension_use
+; ARMv8R: .eabi_attribute 14, 0   @ Tag_ABI_PCS_R9_use
+; ARMv8R: .eabi_attribute 68, 2   @ Tag_Virtualization_use
 
 define i32 @f(i64 %z) {
     ret i32 0

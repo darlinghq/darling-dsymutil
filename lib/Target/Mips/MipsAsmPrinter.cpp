@@ -60,10 +60,6 @@ MipsTargetStreamer &MipsAsmPrinter::getTargetStreamer() const {
 bool MipsAsmPrinter::runOnMachineFunction(MachineFunction &MF) {
   Subtarget = &MF.getSubtarget<MipsSubtarget>();
 
-  // Initialize TargetLoweringObjectFile.
-  const_cast<TargetLoweringObjectFile &>(getObjFileLowering())
-      .Initialize(OutContext, TM);
-
   MipsFI = MF.getInfo<MipsFunctionInfo>();
   if (Subtarget->inMips16Mode())
     for (std::map<
@@ -504,7 +500,7 @@ bool MipsAsmPrinter::PrintAsmOperand(const MachineInstr *MI, unsigned OpNum,
 
       unsigned RegOp = OpNum;
       if (!Subtarget->isGP64bit()){
-        // Endianess reverses which register holds the high or low value
+        // Endianness reverses which register holds the high or low value
         // between M and L.
         switch(ExtraCode[0]) {
         case 'M':
@@ -578,6 +574,8 @@ void MipsAsmPrinter::printOperand(const MachineInstr *MI, int opNum,
   case MipsII::MO_GOT:      O << "%got(";    break;
   case MipsII::MO_ABS_HI:   O << "%hi(";     break;
   case MipsII::MO_ABS_LO:   O << "%lo(";     break;
+  case MipsII::MO_HIGHER:   O << "%higher("; break;
+  case MipsII::MO_HIGHEST:  O << "%highest(("; break;
   case MipsII::MO_TLSGD:    O << "%tlsgd(";  break;
   case MipsII::MO_GOTTPREL: O << "%gottprel("; break;
   case MipsII::MO_TPREL_HI: O << "%tprel_hi("; break;
@@ -702,7 +700,7 @@ void MipsAsmPrinter::EmitStartOfAsmFile(Module &M) {
     //        Ideally it should test for properties of the ABI and not the ABI
     //        itself.
     //        For the moment, I'm only correcting enough to make MIPS-IV work.
-    if (!isPositionIndependent() && !ABI.IsN64())
+    if (!isPositionIndependent() && STI.hasSym32())
       TS.emitDirectiveOptionPic0();
   }
 
@@ -1041,6 +1039,22 @@ void MipsAsmPrinter::PrintDebugValueComment(const MachineInstr *MI,
   // TODO: implement
 }
 
+// Emit .dtprelword or .dtpreldword directive
+// and value for debug thread local expression.
+void MipsAsmPrinter::EmitDebugValue(const MCExpr *Value,
+                                          unsigned Size) const {
+  switch (Size) {
+  case 4:
+    OutStreamer->EmitDTPRel32Value(Value);
+    break;
+  case 8:
+    OutStreamer->EmitDTPRel64Value(Value);
+    break;
+  default:
+    llvm_unreachable("Unexpected size of expression value.");
+  }
+}
+
 // Align all targets of indirect branches on bundle size.  Used only if target
 // is NaCl.
 void MipsAsmPrinter::NaClAlignIndirectJumpTargets(MachineFunction &MF) {
@@ -1070,8 +1084,8 @@ bool MipsAsmPrinter::isLongBranchPseudo(int Opcode) const {
 
 // Force static initialization.
 extern "C" void LLVMInitializeMipsAsmPrinter() {
-  RegisterAsmPrinter<MipsAsmPrinter> X(TheMipsTarget);
-  RegisterAsmPrinter<MipsAsmPrinter> Y(TheMipselTarget);
-  RegisterAsmPrinter<MipsAsmPrinter> A(TheMips64Target);
-  RegisterAsmPrinter<MipsAsmPrinter> B(TheMips64elTarget);
+  RegisterAsmPrinter<MipsAsmPrinter> X(getTheMipsTarget());
+  RegisterAsmPrinter<MipsAsmPrinter> Y(getTheMipselTarget());
+  RegisterAsmPrinter<MipsAsmPrinter> A(getTheMips64Target());
+  RegisterAsmPrinter<MipsAsmPrinter> B(getTheMips64elTarget());
 }

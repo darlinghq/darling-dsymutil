@@ -1,4 +1,4 @@
-//===- MipsDisassembler.cpp - Disassembler for Mips -------------*- C++ -*-===//
+//===- MipsDisassembler.cpp - Disassembler for Mips -----------------------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -12,15 +12,21 @@
 //===----------------------------------------------------------------------===//
 
 #include "Mips.h"
-#include "MipsRegisterInfo.h"
-#include "MipsSubtarget.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCDisassembler/MCDisassembler.h"
 #include "llvm/MC/MCFixedLenDisassembler.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCSubtargetInfo.h"
+#include "llvm/MC/MCRegisterInfo.h"
+#include "llvm/Support/Compiler.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/TargetRegistry.h"
+#include <cassert>
+#include <cstdint>
 
 using namespace llvm;
 
@@ -33,6 +39,7 @@ namespace {
 class MipsDisassembler : public MCDisassembler {
   bool IsMicroMips;
   bool IsBigEndian;
+
 public:
   MipsDisassembler(const MCSubtargetInfo &STI, MCContext &Ctx, bool IsBigEndian)
       : MCDisassembler(STI, Ctx),
@@ -42,9 +49,11 @@ public:
   bool hasMips2() const { return STI.getFeatureBits()[Mips::FeatureMips2]; }
   bool hasMips3() const { return STI.getFeatureBits()[Mips::FeatureMips3]; }
   bool hasMips32() const { return STI.getFeatureBits()[Mips::FeatureMips32]; }
+
   bool hasMips32r6() const {
     return STI.getFeatureBits()[Mips::FeatureMips32r6];
   }
+
   bool isFP64() const { return STI.getFeatureBits()[Mips::FeatureFP64Bit]; }
 
   bool isGP64() const { return STI.getFeatureBits()[Mips::FeatureGP64Bit]; }
@@ -447,6 +456,14 @@ static DecodeStatus DecodeDAHIDATI(MCInst &MI, InsnType insn, uint64_t Address,
                                    const void *Decoder);
 
 template <typename InsnType>
+static DecodeStatus DecodeDAHIDATIMMR6(MCInst &MI, InsnType insn, uint64_t Address,
+                                   const void *Decoder);
+
+template <typename InsnType>
+static DecodeStatus DecodeDAHIDATI(MCInst &MI, InsnType insn, uint64_t Address,
+                                   const void *Decoder);
+
+template <typename InsnType>
 static DecodeStatus
 DecodeAddiGroupBranch(MCInst &MI, InsnType insn, uint64_t Address,
                       const void *Decoder);
@@ -519,9 +536,13 @@ static DecodeStatus DecodeMovePRegPair(MCInst &Inst, unsigned Insn,
                                        const void *Decoder);
 
 namespace llvm {
-extern Target TheMipselTarget, TheMipsTarget, TheMips64Target,
-              TheMips64elTarget;
-}
+
+Target &getTheMipselTarget();
+Target &getTheMipsTarget();
+Target &getTheMips64Target();
+Target &getTheMips64elTarget();
+
+} // end namespace llvm
 
 static MCDisassembler *createMipsDisassembler(
                        const Target &T,
@@ -539,13 +560,13 @@ static MCDisassembler *createMipselDisassembler(
 
 extern "C" void LLVMInitializeMipsDisassembler() {
   // Register the disassembler.
-  TargetRegistry::RegisterMCDisassembler(TheMipsTarget,
+  TargetRegistry::RegisterMCDisassembler(getTheMipsTarget(),
                                          createMipsDisassembler);
-  TargetRegistry::RegisterMCDisassembler(TheMipselTarget,
+  TargetRegistry::RegisterMCDisassembler(getTheMipselTarget(),
                                          createMipselDisassembler);
-  TargetRegistry::RegisterMCDisassembler(TheMips64Target,
+  TargetRegistry::RegisterMCDisassembler(getTheMips64Target(),
                                          createMipsDisassembler);
-  TargetRegistry::RegisterMCDisassembler(TheMips64elTarget,
+  TargetRegistry::RegisterMCDisassembler(getTheMips64elTarget(),
                                          createMipselDisassembler);
 }
 
@@ -606,12 +627,12 @@ static DecodeStatus DecodeINSVE_DF(MCInst &MI, InsnType insn, uint64_t Address,
 template <typename InsnType>
 static DecodeStatus DecodeDAHIDATIMMR6(MCInst &MI, InsnType insn, uint64_t Address,
                                const void *Decoder) {
-  InsnType Rt = fieldFromInstruction(insn, 16, 5);
+  InsnType Rs = fieldFromInstruction(insn, 16, 5);
   InsnType Imm = fieldFromInstruction(insn, 0, 16);
   MI.addOperand(MCOperand::createReg(getReg(Decoder, Mips::GPR64RegClassID,
-                                       Rt)));
+                                       Rs)));
   MI.addOperand(MCOperand::createReg(getReg(Decoder, Mips::GPR64RegClassID,
-                                       Rt)));
+                                       Rs)));
   MI.addOperand(MCOperand::createImm(Imm));
 
   return MCDisassembler::Success;
@@ -620,12 +641,12 @@ static DecodeStatus DecodeDAHIDATIMMR6(MCInst &MI, InsnType insn, uint64_t Addre
 template <typename InsnType>
 static DecodeStatus DecodeDAHIDATI(MCInst &MI, InsnType insn, uint64_t Address,
                                const void *Decoder) {
-  InsnType Rt = fieldFromInstruction(insn, 21, 5);
+  InsnType Rs = fieldFromInstruction(insn, 21, 5);
   InsnType Imm = fieldFromInstruction(insn, 0, 16);
   MI.addOperand(MCOperand::createReg(getReg(Decoder, Mips::GPR64RegClassID,
-                                       Rt)));
+                                       Rs)));
   MI.addOperand(MCOperand::createReg(getReg(Decoder, Mips::GPR64RegClassID,
-                                       Rt)));
+                                       Rs)));
   MI.addOperand(MCOperand::createImm(Imm));
 
   return MCDisassembler::Success;
@@ -1034,7 +1055,7 @@ static DecodeStatus DecodeBlezGroupBranch(MCInst &MI, InsnType insn,
 }
 
 /// Read two bytes from the ArrayRef and return 16 bit halfword sorted
-/// according to the given endianess.
+/// according to the given endianness.
 static DecodeStatus readInstruction16(ArrayRef<uint8_t> Bytes, uint64_t Address,
                                       uint64_t &Size, uint32_t &Insn,
                                       bool IsBigEndian) {
@@ -1054,7 +1075,7 @@ static DecodeStatus readInstruction16(ArrayRef<uint8_t> Bytes, uint64_t Address,
 }
 
 /// Read four bytes from the ArrayRef and return 32 bit word sorted
-/// according to the given endianess
+/// according to the given endianness.
 static DecodeStatus readInstruction32(ArrayRef<uint8_t> Bytes, uint64_t Address,
                                       uint64_t &Size, uint32_t &Insn,
                                       bool IsBigEndian, bool IsMicroMips) {
@@ -1257,16 +1278,13 @@ static DecodeStatus DecodeCPU16RegsRegisterClass(MCInst &Inst,
                                                  unsigned RegNo,
                                                  uint64_t Address,
                                                  const void *Decoder) {
-
   return MCDisassembler::Fail;
-
 }
 
 static DecodeStatus DecodeGPR64RegisterClass(MCInst &Inst,
                                              unsigned RegNo,
                                              uint64_t Address,
                                              const void *Decoder) {
-
   if (RegNo > 31)
     return MCDisassembler::Fail;
 
@@ -1610,7 +1628,7 @@ static DecodeStatus DecodeMSA128Mem(MCInst &Inst, unsigned Insn,
   switch(Inst.getOpcode())
   {
   default:
-    assert (0 && "Unexpected instruction");
+    assert(false && "Unexpected instruction");
     return MCDisassembler::Fail;
     break;
   case Mips::LD_B:
@@ -1970,7 +1988,6 @@ static DecodeStatus DecodeAFGR64RegisterClass(MCInst &Inst,
   if (RegNo > 30 || RegNo %2)
     return MCDisassembler::Fail;
 
-  ;
   unsigned Reg = getReg(Decoder, Mips::AFGR64RegClassID, RegNo /2);
   Inst.addOperand(MCOperand::createReg(Reg));
   return MCDisassembler::Success;
@@ -2118,7 +2135,6 @@ static DecodeStatus DecodeJumpTarget(MCInst &Inst,
                                      unsigned Insn,
                                      uint64_t Address,
                                      const void *Decoder) {
-
   unsigned JumpOffset = fieldFromInstruction(Insn, 0, 26) << 2;
   Inst.addOperand(MCOperand::createImm(JumpOffset));
   return MCDisassembler::Success;
@@ -2353,7 +2369,6 @@ static DecodeStatus DecodeRegListOperand16(MCInst &Inst, unsigned Insn,
 
 static DecodeStatus DecodeMovePRegPair(MCInst &Inst, unsigned Insn,
                                        uint64_t Address, const void *Decoder) {
-
   unsigned RegPair = fieldFromInstruction(Insn, 7, 3);
 
   switch (RegPair) {

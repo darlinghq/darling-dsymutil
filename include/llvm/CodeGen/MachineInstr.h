@@ -60,7 +60,7 @@ public:
   /// otherwise easily derivable from the IR text.
   ///
   enum CommentFlag {
-    ReloadReuse = 0x1
+    ReloadReuse = 0x1 // higher bits are reserved for target dep comments.
   };
 
   enum MIFlag {
@@ -143,8 +143,8 @@ public:
   }
 
   /// Set a flag for the AsmPrinter.
-  void setAsmPrinterFlag(CommentFlag Flag) {
-    AsmPrinterFlags |= (uint8_t)Flag;
+  void setAsmPrinterFlag(uint8_t Flag) {
+    AsmPrinterFlags |= Flag;
   }
 
   /// Clear specific AsmPrinter flags.
@@ -722,8 +722,10 @@ public:
   };
 
   /// Return true if this instruction is identical to \p Other.
-  /// Identical meaning same opcode and all operands reported as
-  /// isIdenticalOp()  (equal except for liveness flags).
+  /// Two instructions are identical if they have the same opcode and all their
+  /// operands are identical (with respect to MachineOperand::isIdenticalTo()).
+  /// Note that this means liveness related flags (dead, undef, kill) do not
+  /// affect the notion of identical.
   bool isIdenticalTo(const MachineInstr &Other,
                      MICheckType Check = CheckDefs) const;
 
@@ -1147,9 +1149,10 @@ public:
   //
   // Debugging support
   //
-  void print(raw_ostream &OS, bool SkipOpers = false) const;
-  void print(raw_ostream &OS, ModuleSlotTracker &MST,
-             bool SkipOpers = false) const;
+  void print(raw_ostream &OS, bool SkipOpers = false,
+             const TargetInstrInfo *TII = nullptr) const;
+  void print(raw_ostream &OS, ModuleSlotTracker &MST, bool SkipOpers = false,
+             const TargetInstrInfo *TII = nullptr) const;
   void dump() const;
 
   //===--------------------------------------------------------------------===//

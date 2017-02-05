@@ -481,9 +481,9 @@ private:
   bool processNode(DomTreeNode *Node);
 
   Value *getOrCreateResult(Value *Inst, Type *ExpectedType) const {
-    if (LoadInst *LI = dyn_cast<LoadInst>(Inst))
+    if (auto *LI = dyn_cast<LoadInst>(Inst))
       return LI;
-    else if (StoreInst *SI = dyn_cast<StoreInst>(Inst))
+    if (auto *SI = dyn_cast<StoreInst>(Inst))
       return SI->getValueOperand();
     assert(isa<IntrinsicInst>(Inst) && "Instruction not supported");
     return TTI.getOrCreateResultFromMemIntrinsic(cast<IntrinsicInst>(Inst),
@@ -496,17 +496,44 @@ private:
   void removeMSSA(Instruction *Inst) {
     if (!MSSA)
       return;
-    // FIXME: Removing a store here can leave MemorySSA in an unoptimized state
-    // by creating MemoryPhis that have identical arguments and by creating
-    // MemoryUses whose defining access is not an actual clobber.
-    if (MemoryAccess *MA = MSSA->getMemoryAccess(Inst))
-      MSSA->removeMemoryAccess(MA);
+    // Removing a store here can leave MemorySSA in an unoptimized state by
+    // creating MemoryPhis that have identical arguments and by creating
+    // MemoryUses whose defining access is not an actual clobber.  We handle the
+    // phi case eagerly here.  The non-optimized MemoryUse case is lazily
+    // updated by MemorySSA getClobberingMemoryAccess.
+    if (MemoryAccess *MA = MSSA->getMemoryAccess(Inst)) {
+      // Optimize MemoryPhi nodes that may become redundant by having all the
+      // same input values once MA is removed.
+      SmallVector<MemoryPhi *, 4> PhisToCheck;
+      SmallVector<MemoryAccess *, 8> WorkQueue;
+      WorkQueue.push_back(MA);
+      // Process MemoryPhi nodes in FIFO order using a ever-growing vector since
+      // we shouldn't be processing that many phis and this will avoid an
+      // allocation in almost all cases.
+      for (unsigned I = 0; I < WorkQueue.size(); ++I) {
+        MemoryAccess *WI = WorkQueue[I];
+
+        for (auto *U : WI->users())
+          if (MemoryPhi *MP = dyn_cast<MemoryPhi>(U))
+            PhisToCheck.push_back(MP);
+
+        MSSA->removeMemoryAccess(WI);
+
+        for (MemoryPhi *MP : PhisToCheck) {
+          MemoryAccess *FirstIn = MP->getIncomingValue(0);
+          if (all_of(MP->incoming_values(),
+                     [=](Use &In) { return In == FirstIn; }))
+            WorkQueue.push_back(MP);
+        }
+        PhisToCheck.clear();
+      }
+    }
   }
 };
 }
 
-/// Determine if the memory referenced by LaterInst is from the same heap version
-/// as EarlierInst.
+/// Determine if the memory referenced by LaterInst is from the same heap
+/// version as EarlierInst.
 /// This is currently called in two scenarios:
 ///
 ///   load p
@@ -536,9 +563,6 @@ bool EarlyCSE::isSameMemGeneration(unsigned EarlierGeneration,
   // LaterInst, if LaterDef dominates EarlierInst then it can't occur between
   // EarlierInst and LaterInst and neither can any other write that potentially
   // clobbers LaterInst.
-  // FIXME: This is currently fairly expensive since it does an AA check even
-  // for MemoryUses that were already optimized by MemorySSA construction.
-  // Re-visit once MemorySSA optimized use tracking change has been committed.
   MemoryAccess *LaterDef =
       MSSA->getWalker()->getClobberingMemoryAccess(LaterInst);
   return MSSA->dominates(LaterDef, MSSA->getMemoryAccess(EarlierInst));
@@ -737,12 +761,13 @@ bool EarlyCSE::processNode(DomTreeNode *Node) {
       continue;
     }
 
-    // If this instruction may read from memory, forget LastStore.
-    // Load/store intrinsics will indicate both a read and a write to
-    // memory.  The target may override this (e.g. so that a store intrinsic
-    // does not read  from memory, and thus will be treated the same as a
-    // regular store for commoning purposes).
-    if (Inst->mayReadFromMemory() &&
+    // If this instruction may read from memory or throw (and potentially read
+    // from memory in the exception handler), forget LastStore.  Load/store
+    // intrinsics will indicate both a read and a write to memory.  The target
+    // may override this (e.g. so that a store intrinsic does not read from
+    // memory, and thus will be treated the same as a regular store for
+    // commoning purposes).
+    if ((Inst->mayReadFromMemory() || Inst->mayThrow()) &&
         !(MemInst.isValid() && !MemInst.mayReadFromMemory()))
       LastStore = nullptr;
 
@@ -943,10 +968,8 @@ PreservedAnalyses EarlyCSEPass::run(Function &F,
   if (!CSE.run())
     return PreservedAnalyses::all();
 
-  // CSE preserves the dominator tree because it doesn't mutate the CFG.
-  // FIXME: Bundle this with other CFG-preservation.
   PreservedAnalyses PA;
-  PA.preserve<DominatorTreeAnalysis>();
+  PA.preserveSet<CFGAnalyses>();
   PA.preserve<GlobalsAA>();
   if (UseMemorySSA)
     PA.preserve<MemorySSAAnalysis>();

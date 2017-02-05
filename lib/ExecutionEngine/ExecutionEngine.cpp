@@ -155,7 +155,7 @@ bool ExecutionEngine::removeModule(Module *M) {
   return false;
 }
 
-Function *ExecutionEngine::FindFunctionNamed(const char *FnName) {
+Function *ExecutionEngine::FindFunctionNamed(StringRef FnName) {
   for (unsigned i = 0, e = Modules.size(); i != e; ++i) {
     Function *F = Modules[i]->getFunction(FnName);
     if (F && !F->isDeclaration())
@@ -164,7 +164,7 @@ Function *ExecutionEngine::FindFunctionNamed(const char *FnName) {
   return nullptr;
 }
 
-GlobalVariable *ExecutionEngine::FindGlobalVariableNamed(const char *Name, bool AllowInternal) {
+GlobalVariable *ExecutionEngine::FindGlobalVariableNamed(StringRef Name, bool AllowInternal) {
   for (unsigned i = 0, e = Modules.size(); i != e; ++i) {
     GlobalVariable *GV = Modules[i]->getGlobalVariable(Name,AllowInternal);
     if (GV && !GV->isDeclaration())
@@ -370,7 +370,7 @@ void *ArgvArray::reset(LLVMContext &C, ExecutionEngine *EE,
 
 void ExecutionEngine::runStaticConstructorsDestructors(Module &module,
                                                        bool isDtors) {
-  const char *Name = isDtors ? "llvm.global_dtors" : "llvm.global_ctors";
+  StringRef Name(isDtors ? "llvm.global_dtors" : "llvm.global_ctors");
   GlobalVariable *GV = module.getNamedGlobal(Name);
 
   // If this global has internal linkage, or if it has a use, then it must be
@@ -692,7 +692,7 @@ GenericValue ExecutionEngine::getConstantValue(const Constant *C) {
       else if (CE->getType()->isDoubleTy())
         GV.DoubleVal = GV.IntVal.roundToDouble();
       else if (CE->getType()->isX86_FP80Ty()) {
-        APFloat apf = APFloat::getZero(APFloat::x87DoubleExtended);
+        APFloat apf = APFloat::getZero(APFloat::x87DoubleExtended());
         (void)apf.convertFromAPInt(GV.IntVal,
                                    false,
                                    APFloat::rmNearestTiesToEven);
@@ -707,7 +707,7 @@ GenericValue ExecutionEngine::getConstantValue(const Constant *C) {
       else if (CE->getType()->isDoubleTy())
         GV.DoubleVal = GV.IntVal.signedRoundToDouble();
       else if (CE->getType()->isX86_FP80Ty()) {
-        APFloat apf = APFloat::getZero(APFloat::x87DoubleExtended);
+        APFloat apf = APFloat::getZero(APFloat::x87DoubleExtended());
         (void)apf.convertFromAPInt(GV.IntVal,
                                    true,
                                    APFloat::rmNearestTiesToEven);
@@ -724,7 +724,7 @@ GenericValue ExecutionEngine::getConstantValue(const Constant *C) {
       else if (Op0->getType()->isDoubleTy())
         GV.IntVal = APIntOps::RoundDoubleToAPInt(GV.DoubleVal, BitWidth);
       else if (Op0->getType()->isX86_FP80Ty()) {
-        APFloat apf = APFloat(APFloat::x87DoubleExtended, GV.IntVal);
+        APFloat apf = APFloat(APFloat::x87DoubleExtended(), GV.IntVal);
         uint64_t v;
         bool ignored;
         (void)apf.convertToInteger(&v, BitWidth,

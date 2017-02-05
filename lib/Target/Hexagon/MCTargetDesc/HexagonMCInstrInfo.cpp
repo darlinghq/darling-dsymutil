@@ -131,12 +131,8 @@ MCInst HexagonMCInstrInfo::deriveExtender(MCInstrInfo const &MCII,
   assert(HexagonMCInstrInfo::isExtendable(MCII, Inst) ||
          HexagonMCInstrInfo::isExtended(MCII, Inst));
 
-  MCInstrDesc const &Desc = HexagonMCInstrInfo::getDesc(MCII, Inst);
   MCInst XMI;
-  XMI.setOpcode((Desc.isBranch() || Desc.isCall() ||
-                 HexagonMCInstrInfo::getType(MCII, Inst) == HexagonII::TypeCR)
-                    ? Hexagon::A4_ext_b
-                    : Hexagon::A4_ext);
+  XMI.setOpcode(Hexagon::A4_ext);
   if (MO.isImm())
     XMI.addOperand(MCOperand::createImm(MO.getImm() & (~0x3f)));
   else if (MO.isExpr())
@@ -306,7 +302,7 @@ int HexagonMCInstrInfo::getMinValue(MCInstrInfo const &MCII,
     return 0;
 }
 
-char const *HexagonMCInstrInfo::getName(MCInstrInfo const &MCII,
+StringRef HexagonMCInstrInfo::getName(MCInstrInfo const &MCII,
                                         MCInst const &MCI) {
   return MCII.getName(MCI.getOpcode());
 }
@@ -431,9 +427,14 @@ bool HexagonMCInstrInfo::isCanon(MCInstrInfo const &MCII, MCInst const &MCI) {
           HexagonMCInstrInfo::getType(MCII, MCI) != HexagonII::TypeENDLOOP);
 }
 
+bool HexagonMCInstrInfo::isCofMax1(MCInstrInfo const &MCII, MCInst const &MCI) {
+  const uint64_t F = HexagonMCInstrInfo::getDesc(MCII, MCI).TSFlags;
+  return ((F >> HexagonII::CofMax1Pos) & HexagonII::CofMax1Mask);
+}
+
 bool HexagonMCInstrInfo::isCompound(MCInstrInfo const &MCII,
                                     MCInst const &MCI) {
-  return (getType(MCII, MCI) == HexagonII::TypeCOMPOUND);
+  return getType(MCII, MCI) == HexagonII::TypeCJ;
 }
 
 bool HexagonMCInstrInfo::isDblRegForSubInst(unsigned Reg) {
@@ -465,7 +466,7 @@ bool HexagonMCInstrInfo::isConstExtended(MCInstrInfo const &MCII,
     return true;
   // Branch insns are handled as necessary by relaxation.
   if ((HexagonMCInstrInfo::getType(MCII, MCI) == HexagonII::TypeJ) ||
-      (HexagonMCInstrInfo::getType(MCII, MCI) == HexagonII::TypeCOMPOUND &&
+      (HexagonMCInstrInfo::getType(MCII, MCI) == HexagonII::TypeCJ &&
        HexagonMCInstrInfo::getDesc(MCII, MCI).isBranch()) ||
       (HexagonMCInstrInfo::getType(MCII, MCI) == HexagonII::TypeNV &&
        HexagonMCInstrInfo::getDesc(MCII, MCI).isBranch()))
@@ -505,9 +506,7 @@ bool HexagonMCInstrInfo::isFloat(MCInstrInfo const &MCII, MCInst const &MCI) {
 }
 
 bool HexagonMCInstrInfo::isImmext(MCInst const &MCI) {
-  auto Op = MCI.getOpcode();
-  return (Op == Hexagon::A4_ext_b || Op == Hexagon::A4_ext_c ||
-          Op == Hexagon::A4_ext_g || Op == Hexagon::A4_ext);
+  return MCI.getOpcode() == Hexagon::A4_ext;
 }
 
 bool HexagonMCInstrInfo::isInnerLoop(MCInst const &MCI) {
@@ -553,6 +552,10 @@ bool HexagonMCInstrInfo::isPredicated(MCInstrInfo const &MCII,
   return ((F >> HexagonII::PredicatedPos) & HexagonII::PredicatedMask);
 }
 
+bool HexagonMCInstrInfo::isPrefix(MCInstrInfo const &MCII, MCInst const &MCI) {
+  return HexagonII::TypeEXTENDER == HexagonMCInstrInfo::getType(MCII, MCI);
+}
+
 bool HexagonMCInstrInfo::isPredicateLate(MCInstrInfo const &MCII,
                                          MCInst const &MCI) {
   const uint64_t F = HexagonMCInstrInfo::getDesc(MCII, MCI).TSFlags;
@@ -577,10 +580,6 @@ bool HexagonMCInstrInfo::isPredReg(unsigned Reg) {
   return (Reg >= Hexagon::P0 && Reg <= Hexagon::P3_0);
 }
 
-bool HexagonMCInstrInfo::isPrefix(MCInstrInfo const &MCII, MCInst const &MCI) {
-  return (HexagonMCInstrInfo::getType(MCII, MCI) == HexagonII::TypePREFIX);
-}
-
 bool HexagonMCInstrInfo::isSolo(MCInstrInfo const &MCII, MCInst const &MCI) {
   const uint64_t F = HexagonMCInstrInfo::getDesc(MCII, MCI).TSFlags;
   return ((F >> HexagonII::SoloPos) & HexagonII::SoloMask);
@@ -602,58 +601,58 @@ bool HexagonMCInstrInfo::isSubInstruction(MCInst const &MCI) {
   switch (MCI.getOpcode()) {
   default:
     return false;
-  case Hexagon::V4_SA1_addi:
-  case Hexagon::V4_SA1_addrx:
-  case Hexagon::V4_SA1_addsp:
-  case Hexagon::V4_SA1_and1:
-  case Hexagon::V4_SA1_clrf:
-  case Hexagon::V4_SA1_clrfnew:
-  case Hexagon::V4_SA1_clrt:
-  case Hexagon::V4_SA1_clrtnew:
-  case Hexagon::V4_SA1_cmpeqi:
-  case Hexagon::V4_SA1_combine0i:
-  case Hexagon::V4_SA1_combine1i:
-  case Hexagon::V4_SA1_combine2i:
-  case Hexagon::V4_SA1_combine3i:
-  case Hexagon::V4_SA1_combinerz:
-  case Hexagon::V4_SA1_combinezr:
-  case Hexagon::V4_SA1_dec:
-  case Hexagon::V4_SA1_inc:
-  case Hexagon::V4_SA1_seti:
-  case Hexagon::V4_SA1_setin1:
-  case Hexagon::V4_SA1_sxtb:
-  case Hexagon::V4_SA1_sxth:
-  case Hexagon::V4_SA1_tfr:
-  case Hexagon::V4_SA1_zxtb:
-  case Hexagon::V4_SA1_zxth:
-  case Hexagon::V4_SL1_loadri_io:
-  case Hexagon::V4_SL1_loadrub_io:
-  case Hexagon::V4_SL2_deallocframe:
-  case Hexagon::V4_SL2_jumpr31:
-  case Hexagon::V4_SL2_jumpr31_f:
-  case Hexagon::V4_SL2_jumpr31_fnew:
-  case Hexagon::V4_SL2_jumpr31_t:
-  case Hexagon::V4_SL2_jumpr31_tnew:
-  case Hexagon::V4_SL2_loadrb_io:
-  case Hexagon::V4_SL2_loadrd_sp:
-  case Hexagon::V4_SL2_loadrh_io:
-  case Hexagon::V4_SL2_loadri_sp:
-  case Hexagon::V4_SL2_loadruh_io:
-  case Hexagon::V4_SL2_return:
-  case Hexagon::V4_SL2_return_f:
-  case Hexagon::V4_SL2_return_fnew:
-  case Hexagon::V4_SL2_return_t:
-  case Hexagon::V4_SL2_return_tnew:
-  case Hexagon::V4_SS1_storeb_io:
-  case Hexagon::V4_SS1_storew_io:
-  case Hexagon::V4_SS2_allocframe:
-  case Hexagon::V4_SS2_storebi0:
-  case Hexagon::V4_SS2_storebi1:
-  case Hexagon::V4_SS2_stored_sp:
-  case Hexagon::V4_SS2_storeh_io:
-  case Hexagon::V4_SS2_storew_sp:
-  case Hexagon::V4_SS2_storewi0:
-  case Hexagon::V4_SS2_storewi1:
+  case Hexagon::SA1_addi:
+  case Hexagon::SA1_addrx:
+  case Hexagon::SA1_addsp:
+  case Hexagon::SA1_and1:
+  case Hexagon::SA1_clrf:
+  case Hexagon::SA1_clrfnew:
+  case Hexagon::SA1_clrt:
+  case Hexagon::SA1_clrtnew:
+  case Hexagon::SA1_cmpeqi:
+  case Hexagon::SA1_combine0i:
+  case Hexagon::SA1_combine1i:
+  case Hexagon::SA1_combine2i:
+  case Hexagon::SA1_combine3i:
+  case Hexagon::SA1_combinerz:
+  case Hexagon::SA1_combinezr:
+  case Hexagon::SA1_dec:
+  case Hexagon::SA1_inc:
+  case Hexagon::SA1_seti:
+  case Hexagon::SA1_setin1:
+  case Hexagon::SA1_sxtb:
+  case Hexagon::SA1_sxth:
+  case Hexagon::SA1_tfr:
+  case Hexagon::SA1_zxtb:
+  case Hexagon::SA1_zxth:
+  case Hexagon::SL1_loadri_io:
+  case Hexagon::SL1_loadrub_io:
+  case Hexagon::SL2_deallocframe:
+  case Hexagon::SL2_jumpr31:
+  case Hexagon::SL2_jumpr31_f:
+  case Hexagon::SL2_jumpr31_fnew:
+  case Hexagon::SL2_jumpr31_t:
+  case Hexagon::SL2_jumpr31_tnew:
+  case Hexagon::SL2_loadrb_io:
+  case Hexagon::SL2_loadrd_sp:
+  case Hexagon::SL2_loadrh_io:
+  case Hexagon::SL2_loadri_sp:
+  case Hexagon::SL2_loadruh_io:
+  case Hexagon::SL2_return:
+  case Hexagon::SL2_return_f:
+  case Hexagon::SL2_return_fnew:
+  case Hexagon::SL2_return_t:
+  case Hexagon::SL2_return_tnew:
+  case Hexagon::SS1_storeb_io:
+  case Hexagon::SS1_storew_io:
+  case Hexagon::SS2_allocframe:
+  case Hexagon::SS2_storebi0:
+  case Hexagon::SS2_storebi1:
+  case Hexagon::SS2_stored_sp:
+  case Hexagon::SS2_storeh_io:
+  case Hexagon::SS2_storew_sp:
+  case Hexagon::SS2_storewi0:
+  case Hexagon::SS2_storewi1:
     return true;
   }
 }
@@ -707,6 +706,17 @@ void HexagonMCInstrInfo::setMustNotExtend(MCExpr const &Expr, bool Val) {
 bool HexagonMCInstrInfo::mustNotExtend(MCExpr const &Expr) {
   HexagonMCExpr const &HExpr = cast<HexagonMCExpr>(Expr);
   return HExpr.mustNotExtend();
+}
+void HexagonMCInstrInfo::setS23_2_reloc(MCExpr const &Expr, bool Val) {
+  HexagonMCExpr &HExpr =
+      const_cast<HexagonMCExpr &>(*llvm::cast<HexagonMCExpr>(&Expr));
+  HExpr.setS23_2_reloc(Val);
+}
+bool HexagonMCInstrInfo::s23_2_reloc(MCExpr const &Expr) {
+  HexagonMCExpr const *HExpr = llvm::dyn_cast<HexagonMCExpr>(&Expr);
+  if (!HExpr)
+    return false;
+  return HExpr->s23_2_reloc();
 }
 
 void HexagonMCInstrInfo::padEndloop(MCContext &Context, MCInst &MCB) {
@@ -772,15 +782,6 @@ void HexagonMCInstrInfo::setMemStoreReorderEnabled(MCInst &MCI) {
   MCOperand &Operand = MCI.getOperand(0);
   Operand.setImm(Operand.getImm() | memStoreReorderEnabledMask);
   assert(isMemStoreReorderEnabled(MCI));
-}
-void HexagonMCInstrInfo::setS23_2_reloc(MCExpr const &Expr, bool Val) {
-  HexagonMCExpr &HExpr =
-      const_cast<HexagonMCExpr &>(*llvm::cast<HexagonMCExpr>(&Expr));
-  HExpr.setS23_2_reloc(Val);
-}
-bool HexagonMCInstrInfo::s23_2_reloc(MCExpr const &Expr) {
-  HexagonMCExpr const &HExpr = *llvm::cast<HexagonMCExpr>(&Expr);
-  return HExpr.s23_2_reloc();
 }
 
 void HexagonMCInstrInfo::setOuterLoop(MCInst &MCI) {

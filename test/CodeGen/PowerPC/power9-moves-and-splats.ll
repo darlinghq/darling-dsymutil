@@ -7,6 +7,8 @@
 
 define <2 x i64> @test1(i64 %a, i64 %b) {
 entry:
+; The FIXME below is due to the lowering for BUILD_VECTOR needing a re-vamp
+; which will happen in a subsequent patch.
 ; CHECK-LABEL: test1
 ; CHECK: mtvsrdd 34, 4, 3
 ; CHECK-BE-LABEL: test1
@@ -148,6 +150,15 @@ entry:
 ; CHECK-BE-LABEL: test13
 ; CHECK-BE: xxspltib 34, 129
   ret <16 x i8> <i8 -127, i8 -127, i8 -127, i8 -127, i8 -127, i8 -127, i8 -127, i8 -127, i8 -127, i8 -127, i8 -127, i8 -127, i8 -127, i8 -127, i8 -127, i8 -127>
+}
+
+define <16 x i8> @test13E127() {
+entry:
+; CHECK-LABEL: test13E127
+; CHECK: xxspltib 34, 200
+; CHECK-BE-LABEL: test13E127
+; CHECK-BE: xxspltib 34, 200
+  ret <16 x i8> <i8 200, i8 200, i8 200, i8 200, i8 200, i8 200, i8 200, i8 200, i8 200, i8 200, i8 200, i8 200, i8 200, i8 200, i8 200, i8 200>
 }
 
 define <4 x i32> @test14(<4 x i32> %a, i32* nocapture readonly %b) {

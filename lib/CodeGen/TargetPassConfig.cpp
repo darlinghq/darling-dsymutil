@@ -38,8 +38,8 @@
 
 using namespace llvm;
 
-static cl::opt<bool> DisablePostRA("disable-post-ra", cl::Hidden,
-    cl::desc("Disable Post Regalloc"));
+static cl::opt<bool> DisablePostRASched("disable-post-ra", cl::Hidden,
+    cl::desc("Disable Post Regalloc Scheduler"));
 static cl::opt<bool> DisableBranchFold("disable-branch-fold", cl::Hidden,
     cl::desc("Disable branch folding"));
 static cl::opt<bool> DisableTailDuplicate("disable-tail-duplicate", cl::Hidden,
@@ -129,8 +129,7 @@ static cl::opt<CFLAAType> UseCFLAA(
                clEnumValN(CFLAAType::Andersen, "anders",
                           "Enable inclusion-based CFL-AA"),
                clEnumValN(CFLAAType::Both, "both", 
-                          "Enable both variants of CFL-AA"),
-               clEnumValEnd));
+                          "Enable both variants of CFL-AA")));
 
 /// Allow standard passes to be disabled by command line options. This supports
 /// simple binary flags that either suppress the pass or do nothing.
@@ -158,7 +157,7 @@ static IdentifyingPassPtr applyDisable(IdentifyingPassPtr PassID,
 static IdentifyingPassPtr overridePass(AnalysisID StandardID,
                                        IdentifyingPassPtr TargetID) {
   if (StandardID == &PostRASchedulerID)
-    return applyDisable(TargetID, DisablePostRA);
+    return applyDisable(TargetID, DisablePostRASched);
 
   if (StandardID == &BranchFolderPassID)
     return applyDisable(TargetID, DisableBranchFold);
@@ -260,8 +259,7 @@ TargetPassConfig::~TargetPassConfig() {
 // Out of line constructor provides default values for pass options and
 // registers all common codegen passes.
 TargetPassConfig::TargetPassConfig(TargetMachine *tm, PassManagerBase &pm)
-    : ImmutablePass(ID), PM(&pm), StartBefore(nullptr), StartAfter(nullptr),
-      StopAfter(nullptr), Started(true), Stopped(false),
+    : ImmutablePass(ID), PM(&pm), Started(true), Stopped(false),
       AddingMachinePasses(false), TM(tm), Impl(nullptr), Initialized(false),
       DisableVerify(false), EnableTailMerge(true) {
 
@@ -355,6 +353,8 @@ void TargetPassConfig::addPass(Pass *P, bool verifyAfter, bool printAfter) {
 
   if (StartBefore == PassID)
     Started = true;
+  if (StopBefore == PassID)
+    Stopped = true;
   if (Started && !Stopped) {
     std::string Banner;
     // Construct banner message before PM->add() as that may delete the pass.
@@ -570,9 +570,6 @@ void TargetPassConfig::addISelPrepare() {
 void TargetPassConfig::addMachinePasses() {
   AddingMachinePasses = true;
 
-  if (TM->Options.EnableIPRA)
-    addPass(createRegUsageInfoPropPass());
-
   // Insert a machine instr printer pass after the specified pass.
   if (!StringRef(PrintMachineInstrs.getValue()).equals("") &&
       !StringRef(PrintMachineInstrs.getValue()).equals("option-unspecified")) {
@@ -587,6 +584,9 @@ void TargetPassConfig::addMachinePasses() {
 
   // Print the instruction selected machine code...
   printAndVerify("After Instruction Selection");
+
+  if (TM->Options.EnableIPRA)
+    addPass(createRegUsageInfoPropPass());
 
   // Expand pseudo-instructions emitted by ISel.
   addPass(&ExpandISelPseudosID);
@@ -667,6 +667,9 @@ void TargetPassConfig::addMachinePasses() {
 
   addPass(&StackMapLivenessID, false);
   addPass(&LiveDebugValuesID, false);
+
+  // Insert before XRay Instrumentation.
+  addPass(&FEntryInserterID, false);
 
   addPass(&XRayInstrumentationID, false);
   addPass(&PatchableFunctionID, false);

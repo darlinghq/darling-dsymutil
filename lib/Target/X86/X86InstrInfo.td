@@ -318,6 +318,7 @@ let RenderMethod = "addMemOperands", SuperClasses = [X86MemAsmOperand] in {
   def X86Mem128_RC256XOperand : AsmOperandClass { let Name = "Mem128_RC256X"; }
   def X86Mem256_RC256XOperand : AsmOperandClass { let Name = "Mem256_RC256X"; }
   def X86Mem512_RC256XOperand : AsmOperandClass { let Name = "Mem512_RC256X"; }
+  def X86Mem256_RC512Operand  : AsmOperandClass { let Name = "Mem256_RC512"; }
   def X86Mem512_RC512Operand  : AsmOperandClass { let Name = "Mem512_RC512"; }
 }
 
@@ -374,9 +375,10 @@ def vy256mem : X86VMemOperand<VR256,  "printi256mem", X86Mem256_RC256Operand>;
 def vx64xmem  : X86VMemOperand<VR128X, "printi64mem",  X86Mem64_RC128XOperand>;
 def vx128xmem : X86VMemOperand<VR128X, "printi128mem", X86Mem128_RC128XOperand>;
 def vx256xmem : X86VMemOperand<VR128X, "printi256mem", X86Mem256_RC128XOperand>;
-def vy128xmem : X86VMemOperand<VR256,  "printi128mem", X86Mem128_RC256XOperand>;
+def vy128xmem : X86VMemOperand<VR256X, "printi128mem", X86Mem128_RC256XOperand>;
 def vy256xmem : X86VMemOperand<VR256X, "printi256mem", X86Mem256_RC256XOperand>;
 def vy512mem  : X86VMemOperand<VR256X, "printi512mem", X86Mem512_RC256XOperand>;
+def vz256xmem : X86VMemOperand<VR512,  "printi256mem", X86Mem256_RC512Operand>;
 def vz512mem  : X86VMemOperand<VR512,  "printi512mem", X86Mem512_RC512Operand>;
 
 // A version of i8mem for use on x86-64 and x32 that uses a NOREX GPR instead
@@ -765,6 +767,12 @@ def tls64baseaddr : ComplexPattern<i64, 5, "selectTLSADDRAddr",
 
 def vectoraddr : ComplexPattern<iPTR, 5, "selectVectorAddr", [],[SDNPWantParent]>;
 
+// A relocatable immediate is either an immediate operand or an operand that can
+// be relocated by the linker to an immediate, such as a regular symbol in
+// non-PIC code.
+def relocImm : ComplexPattern<iAny, 1, "selectRelocImm", [imm, X86Wrapper], [],
+                              0>;
+
 //===----------------------------------------------------------------------===//
 // X86 Instruction Predicate Definitions.
 def TruePredicate : Predicate<"true">;
@@ -877,8 +885,6 @@ def IsNaCl       : Predicate<"Subtarget->isTargetNaCl()">;
 def NotNaCl      : Predicate<"!Subtarget->isTargetNaCl()">;
 def SmallCode    : Predicate<"TM.getCodeModel() == CodeModel::Small">;
 def KernelCode   : Predicate<"TM.getCodeModel() == CodeModel::Kernel">;
-def FarData      : Predicate<"TM.getCodeModel() != CodeModel::Small &&"
-                             "TM.getCodeModel() != CodeModel::Kernel">;
 def NearData     : Predicate<"TM.getCodeModel() == CodeModel::Small ||"
                              "TM.getCodeModel() == CodeModel::Kernel">;
 def IsNotPIC     : Predicate<"!TM.isPositionIndependent()">;
@@ -890,6 +896,7 @@ def CallImmAddr  : Predicate<"Subtarget->isLegalToCallImmediateAddr()">;
 def FavorMemIndirectCall  : Predicate<"!Subtarget->callRegIndirect()">;
 def NotSlowIncDec : Predicate<"!Subtarget->slowIncDec()">;
 def HasFastMem32 : Predicate<"!Subtarget->isUnalignedMem32Slow()">;
+def HasFastLZCNT : Predicate<"Subtarget->hasFastLZCNT()">;
 def HasMFence    : Predicate<"Subtarget->hasMFence()">;
 
 //===----------------------------------------------------------------------===//
@@ -943,13 +950,13 @@ def i64immSExt32 : ImmLeaf<i64, [{ return isInt<32>(Imm); }]>;
 // Eventually, it would be nice to allow ConstantHoisting to merge constants
 // globally for potentially added savings.
 //
-def imm8_su : PatLeaf<(i8 imm), [{
+def imm8_su : PatLeaf<(i8 relocImm), [{
     return !shouldAvoidImmediateInstFormsForSize(N);
 }]>;
-def imm16_su : PatLeaf<(i16 imm), [{
+def imm16_su : PatLeaf<(i16 relocImm), [{
     return !shouldAvoidImmediateInstFormsForSize(N);
 }]>;
-def imm32_su : PatLeaf<(i32 imm), [{
+def imm32_su : PatLeaf<(i32 relocImm), [{
     return !shouldAvoidImmediateInstFormsForSize(N);
 }]>;
 def i64immSExt32_su : PatLeaf<(i64immSExt32), [{
@@ -1379,7 +1386,7 @@ def MOV16ri : Ii16<0xB8, AddRegFrm, (outs GR16:$dst), (ins i16imm:$src),
                    [(set GR16:$dst, imm:$src)], IIC_MOV>, OpSize16;
 def MOV32ri : Ii32<0xB8, AddRegFrm, (outs GR32:$dst), (ins i32imm:$src),
                    "mov{l}\t{$src, $dst|$dst, $src}",
-                   [(set GR32:$dst, imm:$src)], IIC_MOV>, OpSize32;
+                   [(set GR32:$dst, relocImm:$src)], IIC_MOV>, OpSize32;
 def MOV64ri32 : RIi32S<0xC7, MRM0r, (outs GR64:$dst), (ins i64i32imm:$src),
                        "mov{q}\t{$src, $dst|$dst, $src}",
                        [(set GR64:$dst, i64immSExt32:$src)], IIC_MOV>;
@@ -1387,7 +1394,7 @@ def MOV64ri32 : RIi32S<0xC7, MRM0r, (outs GR64:$dst), (ins i64i32imm:$src),
 let isReMaterializable = 1 in {
 def MOV64ri : RIi64<0xB8, AddRegFrm, (outs GR64:$dst), (ins i64imm:$src),
                     "movabs{q}\t{$src, $dst|$dst, $src}",
-                    [(set GR64:$dst, imm:$src)], IIC_MOV>;
+                    [(set GR64:$dst, relocImm:$src)], IIC_MOV>;
 }
 
 // Longer forms that use a ModR/M byte. Needed for disassembler
@@ -1960,7 +1967,12 @@ def REX64_PREFIX : I<0x48, RawFrm, (outs),  (ins), "rex64", []>,
                      Requires<[In64BitMode]>;
 
 // Data16 instruction prefix
-def DATA16_PREFIX : I<0x66, RawFrm, (outs),  (ins), "data16", []>;
+def DATA16_PREFIX : I<0x66, RawFrm, (outs),  (ins), "data16", []>, 
+                     Requires<[Not16BitMode]>;
+
+// Data instruction prefix
+def DATA32_PREFIX : I<0x66, RawFrm, (outs),  (ins), "data32", []>, 
+                     Requires<[In16BitMode]>;
 
 // Repeat string operation instruction prefixes
 // These uses the DF flag in the EFLAGS register to inc or dec ECX
@@ -2630,6 +2642,12 @@ def : MnemonicAlias<"ret", "retw", "att">, Requires<[In16BitMode]>;
 def : MnemonicAlias<"ret", "retl", "att">, Requires<[In32BitMode]>;
 def : MnemonicAlias<"ret", "retq", "att">, Requires<[In64BitMode]>;
 
+// Apply 'ret' behavior to 'retn'
+def : MnemonicAlias<"retn", "retw", "att">, Requires<[In16BitMode]>;
+def : MnemonicAlias<"retn", "retl", "att">, Requires<[In32BitMode]>;
+def : MnemonicAlias<"retn", "retq", "att">, Requires<[In64BitMode]>;
+def : MnemonicAlias<"retn", "ret", "intel">;
+
 def : MnemonicAlias<"sal", "shl", "intel">;
 def : MnemonicAlias<"salb", "shlb", "att">;
 def : MnemonicAlias<"salw", "shlw", "att">;
@@ -2966,7 +2984,7 @@ def : InstAlias<"mov\t{$mem, $seg|$seg, $mem}", (MOV32sm SEGMENT_REG:$seg, i32me
 def : InstAlias<"mov\t{$seg, $mem|$mem, $seg}", (MOV32ms i32mem:$mem, SEGMENT_REG:$seg), 0>;
 
 // Match 'movq <largeimm>, <reg>' as an alias for movabsq.
-def : InstAlias<"movq\t{$imm, $reg|$reg, $imm}", (MOV64ri GR64:$reg, i64imm:$imm), 0>;
+def : InstAlias<"mov{q}\t{$imm, $reg|$reg, $imm}", (MOV64ri GR64:$reg, i64imm:$imm), 0>;
 
 // Match 'movq GR64, MMX' as an alias for movd.
 def : InstAlias<"movq\t{$src, $dst|$dst, $src}",

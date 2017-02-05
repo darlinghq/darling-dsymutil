@@ -64,8 +64,9 @@ std::string tag(const std::string &Name, const std::string &Str,
 
 // Create an anchor to \p Link with the label \p Str.
 std::string a(const std::string &Link, const std::string &Str,
-              const std::string &TargetType = "href") {
-  return "<a " + TargetType + "='" + Link + "'>" + Str + "</a>";
+              const std::string &TargetName = "") {
+  std::string Name = TargetName.empty() ? "" : ("name='" + TargetName + "' ");
+  return "<a " + Name + "href='" + Link + "'>" + Str + "</a>";
 }
 
 const char *BeginHeader =
@@ -298,7 +299,7 @@ static void emitColumnLabelsForIndex(raw_ostream &OS) {
 void CoveragePrinterHTML::emitFileSummary(raw_ostream &OS, StringRef SF,
                                           const FileCoverageSummary &FCS,
                                           bool IsTotals) const {
-  SmallVector<std::string, 4> Columns;
+  SmallVector<std::string, 8> Columns;
 
   // Format a coverage triple and add the result to the list of columns.
   auto AddCoverageTripleToColumn = [&Columns](unsigned Hit, unsigned Total,
@@ -306,25 +307,29 @@ void CoveragePrinterHTML::emitFileSummary(raw_ostream &OS, StringRef SF,
     std::string S;
     {
       raw_string_ostream RSO{S};
-      RSO << format("%*.2f", 7, Pctg) << "% (" << Hit << '/' << Total << ')';
+      if (Total)
+        RSO << format("%*.2f", 7, Pctg) << "% ";
+      else
+        RSO << "- ";
+      RSO << '(' << Hit << '/' << Total << ')';
     }
     const char *CellClass = "column-entry-yellow";
-    if (Pctg < 80.0)
-      CellClass = "column-entry-red";
-    else if (Hit == Total)
+    if (Hit == Total)
       CellClass = "column-entry-green";
+    else if (Pctg < 80.0)
+      CellClass = "column-entry-red";
     Columns.emplace_back(tag("td", tag("pre", S), CellClass));
   };
 
   // Simplify the display file path, and wrap it in a link if requested.
   std::string Filename;
-  SmallString<128> LinkTextStr(sys::path::relative_path(FCS.Name));
-  sys::path::remove_dots(LinkTextStr, /*remove_dot_dots=*/true);
-  sys::path::native(LinkTextStr);
-  std::string LinkText = escape(LinkTextStr, Opts);
   if (IsTotals) {
-    Filename = LinkText;
+    Filename = "TOTALS";
   } else {
+    SmallString<128> LinkTextStr(sys::path::relative_path(FCS.Name));
+    sys::path::remove_dots(LinkTextStr, /*remove_dot_dots=*/true);
+    sys::path::native(LinkTextStr);
+    std::string LinkText = escape(LinkTextStr, Opts);
     std::string LinkTarget =
         escape(getOutputPath(SF, "html", /*InToplevel=*/false), Opts);
     Filename = a(LinkTarget, LinkText);
@@ -347,7 +352,7 @@ void CoveragePrinterHTML::emitFileSummary(raw_ostream &OS, StringRef SF,
 }
 
 Error CoveragePrinterHTML::createIndexFile(
-    ArrayRef<StringRef> SourceFiles,
+    ArrayRef<std::string> SourceFiles,
     const coverage::CoverageMapping &Coverage) {
   // Emit the default stylesheet.
   auto CSSOrErr = createOutputStream("style", "css", /*InToplevel=*/true);
@@ -406,11 +411,8 @@ void SourceCoverageViewHTML::renderViewFooter(raw_ostream &OS) {
 }
 
 void SourceCoverageViewHTML::renderSourceName(raw_ostream &OS, bool WholeFile) {
-  OS << BeginSourceNameDiv;
-  std::string ViewInfo = escape(
-      WholeFile ? getVerboseSourceName() : getSourceName(), getOptions());
-  OS << tag("pre", ViewInfo);
-  OS << EndSourceNameDiv;
+  OS << BeginSourceNameDiv << tag("pre", escape(getSourceName(), getOptions()))
+     << EndSourceNameDiv;
 }
 
 void SourceCoverageViewHTML::renderLinePrefix(raw_ostream &OS, unsigned) {
@@ -563,7 +565,8 @@ void SourceCoverageViewHTML::renderLineCoverageColumn(
 void SourceCoverageViewHTML::renderLineNumberColumn(raw_ostream &OS,
                                                     unsigned LineNo) {
   std::string LineNoStr = utostr(uint64_t(LineNo));
-  OS << tag("td", a("L" + LineNoStr, tag("pre", LineNoStr), "name"),
+  std::string TargetName = "L" + LineNoStr;
+  OS << tag("td", a("#" + TargetName, tag("pre", LineNoStr), TargetName),
             "line-number");
 }
 

@@ -47,7 +47,7 @@ struct NVPTXLowerAggrCopies : public FunctionPass {
 
   static const unsigned MaxAggrCopySize = 128;
 
-  const char *getPassName() const override {
+  StringRef getPassName() const override {
     return "Lower aggregate copies/intrinsics into loops";
   }
 };
@@ -204,8 +204,8 @@ void convertMemMoveToLoop(Instruction *ConvertedInst, Value *SrcAddr,
 
 // Lower memset to loop.
 void convertMemSetToLoop(Instruction *ConvertedInst, Value *DstAddr,
-                         Value *CopyLen, Value *SetValue, LLVMContext &Context,
-                         Function &F) {
+                         Value *CopyLen, Value *SetValue,
+                         bool IsVolatile, LLVMContext &Context, Function &F) {
   BasicBlock *OrigBB = ConvertedInst->getParent();
   BasicBlock *NewBB =
       ConvertedInst->getParent()->splitBasicBlock(ConvertedInst, "split");
@@ -226,7 +226,7 @@ void convertMemSetToLoop(Instruction *ConvertedInst, Value *DstAddr,
   LoopBuilder.CreateStore(
       SetValue,
       LoopBuilder.CreateInBoundsGEP(SetValue->getType(), DstAddr, LoopIndex),
-      false);
+      IsVolatile);
 
   Value *NewIndex =
       LoopBuilder.CreateAdd(LoopIndex, ConstantInt::get(CopyLen->getType(), 1));
@@ -325,6 +325,7 @@ bool NVPTXLowerAggrCopies::runOnFunction(Function &F) {
                           /* DstAddr */ Memset->getRawDest(),
                           /* CopyLen */ Memset->getLength(),
                           /* SetValue */ Memset->getValue(),
+                          /* IsVolatile */ Memset->isVolatile(),
                           /* Context */ Context,
                           /* Function F */ F);
     }

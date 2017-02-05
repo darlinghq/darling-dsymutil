@@ -41,10 +41,10 @@ namespace HexagonII {
     TypeST      = 6,
     TypeSYSTEM  = 7,
     TypeXTYPE   = 8,
-    TypeMEMOP   = 9,
+    TypeV4LDST  = 9,
     TypeNV      = 10,
     TypeDUPLEX  = 11,
-    TypeCOMPOUND = 12,
+    TypeCJ      = 12,
     TypeCVI_FIRST     = 13,
     TypeCVI_VA        = TypeCVI_FIRST,
     TypeCVI_VA_DV     = 14,
@@ -63,8 +63,8 @@ namespace HexagonII {
     TypeCVI_VM_STU    = 27,
     TypeCVI_HIST      = 28,
     TypeCVI_LAST      = TypeCVI_HIST,
-    TypePREFIX  = 30, // Such as extenders.
-    TypeENDLOOP = 31  // Such as end of a HW loop.
+    TypeEXTENDER      = 30,
+    TypeENDLOOP       = 31  // Such as end of a HW loop.
   };
 
   enum SubTarget {
@@ -92,7 +92,7 @@ namespace HexagonII {
 
   // MemAccessSize is represented as 1+log2(N) where N is size in bits.
   enum class MemAccessSize {
-    NoMemAccess = 0,            // Not a memory acces instruction.
+    NoMemAccess = 0,            // Not a memory access instruction.
     ByteAccess = 1,             // Byte access instruction (memb).
     HalfWordAccess = 2,         // Half word access instruction (memh).
     WordAccess = 3,             // Word access instruction (memw).
@@ -201,9 +201,12 @@ namespace HexagonII {
     AccumulatorPos = 54,
     AccumulatorMask = 0x1,
 
-    // Complex XU, prevent xu competition by prefering slot3
+    // Complex XU, prevent xu competition by preferring slot3
     PrefersSlot3Pos = 55,
     PrefersSlot3Mask = 0x1,
+
+    CofMax1Pos = 60,
+    CofMax1Mask = 0x1
   };
 
   // *** The code above must match HexagonInstrFormat*.td *** //

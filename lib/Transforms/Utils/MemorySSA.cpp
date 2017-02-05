@@ -105,6 +105,8 @@ public:
   MemoryLocOrCall() : IsCall(false) {}
   MemoryLocOrCall(MemoryUseOrDef *MUD)
       : MemoryLocOrCall(MUD->getMemoryInst()) {}
+  MemoryLocOrCall(const MemoryUseOrDef *MUD)
+      : MemoryLocOrCall(MUD->getMemoryInst()) {}
 
   MemoryLocOrCall(Instruction *Inst) {
     if (ImmutableCallSite(Inst)) {
@@ -142,10 +144,10 @@ public:
   }
 
 private:
-  // FIXME: MSVC 2013 does not properly implement C++11 union rules, once we
-  // require newer versions, this should be made an anonymous union again.
-  ImmutableCallSite CS;
-  MemoryLocation Loc;
+  union {
+    ImmutableCallSite CS;
+    MemoryLocation Loc;
+  };
 };
 }
 
@@ -169,44 +171,6 @@ template <> struct DenseMapInfo<MemoryLocOrCall> {
     return LHS == RHS;
   }
 };
-}
-
-namespace {
-struct UpwardsMemoryQuery {
-  // True if our original query started off as a call
-  bool IsCall;
-  // The pointer location we started the query with. This will be empty if
-  // IsCall is true.
-  MemoryLocation StartingLoc;
-  // This is the instruction we were querying about.
-  const Instruction *Inst;
-  // The MemoryAccess we actually got called with, used to test local domination
-  const MemoryAccess *OriginalAccess;
-
-  UpwardsMemoryQuery()
-      : IsCall(false), Inst(nullptr), OriginalAccess(nullptr) {}
-
-  UpwardsMemoryQuery(const Instruction *Inst, const MemoryAccess *Access)
-      : IsCall(ImmutableCallSite(Inst)), Inst(Inst), OriginalAccess(Access) {
-    if (!IsCall)
-      StartingLoc = MemoryLocation::get(Inst);
-  }
-};
-
-static bool lifetimeEndsAt(MemoryDef *MD, const MemoryLocation &Loc,
-                           AliasAnalysis &AA) {
-  Instruction *Inst = MD->getMemoryInst();
-  if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(Inst)) {
-    switch (II->getIntrinsicID()) {
-    case Intrinsic::lifetime_start:
-    case Intrinsic::lifetime_end:
-      return AA.isMustAlias(MemoryLocation(II->getArgOperand(1)), Loc);
-    default:
-      return false;
-    }
-  }
-  return false;
-}
 
 enum class Reorderability { Always, IfNoAlias, Never };
 
@@ -246,17 +210,6 @@ static Reorderability getLoadReorderability(const LoadInst *Use,
   if (SeqCstUse || MayClobberIsAcquire)
     return Reorderability::Never;
   return Result;
-}
-
-static bool isUseTriviallyOptimizableToLiveOnEntry(AliasAnalysis &AA,
-                                                   const Instruction *I) {
-  // If the memory can't be changed, then loads of the memory can't be
-  // clobbered.
-  //
-  // FIXME: We should handle invariant groups, as well. It's a bit harder,
-  // because we need to pay close attention to invariant group barriers.
-  return isa<LoadInst>(I) && (I->getMetadata(LLVMContext::MD_invariant_load) ||
-                              AA.pointsToConstantMemory(I));
 }
 
 static bool instructionClobbersQuery(MemoryDef *MD,
@@ -303,7 +256,7 @@ static bool instructionClobbersQuery(MemoryDef *MD,
   return AA.getModRefInfo(DefInst, UseLoc) & MRI_Mod;
 }
 
-static bool instructionClobbersQuery(MemoryDef *MD, MemoryUse *MU,
+static bool instructionClobbersQuery(MemoryDef *MD, const MemoryUseOrDef *MU,
                                      const MemoryLocOrCall &UseMLOC,
                                      AliasAnalysis &AA) {
   // FIXME: This is a temporary hack to allow a single instructionClobbersQuery
@@ -313,6 +266,61 @@ static bool instructionClobbersQuery(MemoryDef *MD, MemoryUse *MU,
                                     AA);
   return instructionClobbersQuery(MD, UseMLOC.getLoc(), MU->getMemoryInst(),
                                   AA);
+}
+
+// Return true when MD may alias MU, return false otherwise.
+bool defClobbersUseOrDef(MemoryDef *MD, const MemoryUseOrDef *MU,
+                         AliasAnalysis &AA) {
+  return instructionClobbersQuery(MD, MU, MemoryLocOrCall(MU), AA);
+}
+}
+
+namespace {
+struct UpwardsMemoryQuery {
+  // True if our original query started off as a call
+  bool IsCall;
+  // The pointer location we started the query with. This will be empty if
+  // IsCall is true.
+  MemoryLocation StartingLoc;
+  // This is the instruction we were querying about.
+  const Instruction *Inst;
+  // The MemoryAccess we actually got called with, used to test local domination
+  const MemoryAccess *OriginalAccess;
+
+  UpwardsMemoryQuery()
+      : IsCall(false), Inst(nullptr), OriginalAccess(nullptr) {}
+
+  UpwardsMemoryQuery(const Instruction *Inst, const MemoryAccess *Access)
+      : IsCall(ImmutableCallSite(Inst)), Inst(Inst), OriginalAccess(Access) {
+    if (!IsCall)
+      StartingLoc = MemoryLocation::get(Inst);
+  }
+};
+
+static bool lifetimeEndsAt(MemoryDef *MD, const MemoryLocation &Loc,
+                           AliasAnalysis &AA) {
+  Instruction *Inst = MD->getMemoryInst();
+  if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(Inst)) {
+    switch (II->getIntrinsicID()) {
+    case Intrinsic::lifetime_start:
+    case Intrinsic::lifetime_end:
+      return AA.isMustAlias(MemoryLocation(II->getArgOperand(1)), Loc);
+    default:
+      return false;
+    }
+  }
+  return false;
+}
+
+static bool isUseTriviallyOptimizableToLiveOnEntry(AliasAnalysis &AA,
+                                                   const Instruction *I) {
+  // If the memory can't be changed, then loads of the memory can't be
+  // clobbered.
+  //
+  // FIXME: We should handle invariant groups, as well. It's a bit harder,
+  // because we need to pay close attention to invariant group barriers.
+  return isa<LoadInst>(I) && (I->getMetadata(LLVMContext::MD_invariant_load) ||
+                              AA.pointsToConstantMemory(I));
 }
 
 /// Cache for our caching MemorySSA walker.
@@ -1089,7 +1097,7 @@ public:
   using MemorySSAWalker::getClobberingMemoryAccess;
   MemoryAccess *getClobberingMemoryAccess(MemoryAccess *) override;
   MemoryAccess *getClobberingMemoryAccess(MemoryAccess *,
-                                          MemoryLocation &) override;
+                                          const MemoryLocation &) override;
   void invalidateInfo(MemoryAccess *) override;
 
   /// Whether we call resetClobberWalker() after each time we *actually* walk to
@@ -1221,7 +1229,7 @@ void MemorySSA::markUnreachableAsLiveOnEntry(BasicBlock *BB) {
 
 MemorySSA::MemorySSA(Function &Func, AliasAnalysis *AA, DominatorTree *DT)
     : AA(AA), DT(DT), F(Func), LiveOnEntryDef(nullptr), Walker(nullptr),
-      NextID(0) {
+      NextID(INVALID_MEMORYACCESS_ID) {
   buildMemorySSA();
 }
 
@@ -1237,6 +1245,13 @@ MemorySSA::AccessList *MemorySSA::getOrCreateAccessList(const BasicBlock *BB) {
 
   if (Res.second)
     Res.first->second = make_unique<AccessList>();
+  return Res.first->second.get();
+}
+MemorySSA::DefsList *MemorySSA::getOrCreateDefsList(const BasicBlock *BB) {
+  auto Res = PerBlockDefs.insert(std::make_pair(BB, nullptr));
+
+  if (Res.second)
+    Res.first->second = make_unique<DefsList>();
   return Res.first->second.get();
 }
 
@@ -1324,7 +1339,7 @@ void MemorySSA::OptimizeUses::optimizeUsesInBlock(
     }
 
     if (isUseTriviallyOptimizableToLiveOnEntry(*AA, MU->getMemoryInst())) {
-      MU->setDefiningAccess(MSSA->getLiveOnEntryDef());
+      MU->setDefiningAccess(MSSA->getLiveOnEntryDef(), true);
       continue;
     }
 
@@ -1348,7 +1363,7 @@ void MemorySSA::OptimizeUses::optimizeUsesInBlock(
       // branch of the dominator tree first. This will guarantee this resets on
       // the smallest set of blocks.
       if (LocInfo.LowerBoundBlock && LocInfo.LowerBoundBlock != BB &&
-          !DT->dominates(LocInfo.LowerBoundBlock, BB)){
+          !DT->dominates(LocInfo.LowerBoundBlock, BB)) {
         // Reset the lower bound of things to check.
         // TODO: Some day we should be able to reset to last kill, rather than
         // 0.
@@ -1420,13 +1435,13 @@ void MemorySSA::OptimizeUses::optimizeUsesInBlock(
     // At the end of this loop, UpperBound is either a clobber, or lower bound
     // PHI walking may cause it to be < LowerBound, and in fact, < LastKill.
     if (FoundClobberResult || UpperBound < LocInfo.LastKill) {
-      MU->setDefiningAccess(VersionStack[UpperBound]);
+      MU->setDefiningAccess(VersionStack[UpperBound], true);
       // We were last killed now by where we got to
       LocInfo.LastKill = UpperBound;
     } else {
       // Otherwise, we checked all the new ones, and now we know we can get to
       // LastKill.
-      MU->setDefiningAccess(VersionStack[LocInfo.LastKill]);
+      MU->setDefiningAccess(VersionStack[LocInfo.LastKill], true);
     }
     LocInfo.LowerBound = VersionStack.size() - 1;
     LocInfo.LowerBoundBlock = BB;
@@ -1456,23 +1471,21 @@ void MemorySSA::OptimizeUses::optimizeUses() {
 
 void MemorySSA::placePHINodes(
     const SmallPtrSetImpl<BasicBlock *> &DefiningBlocks,
-    const SmallPtrSetImpl<BasicBlock *> &LiveInBlocks) {
+    const DenseMap<const BasicBlock *, unsigned int> &BBNumbers) {
   // Determine where our MemoryPhi's should go
   ForwardIDFCalculator IDFs(*DT);
   IDFs.setDefiningBlocks(DefiningBlocks);
-  IDFs.setLiveInBlocks(LiveInBlocks);
   SmallVector<BasicBlock *, 32> IDFBlocks;
   IDFs.calculate(IDFBlocks);
 
+  std::sort(IDFBlocks.begin(), IDFBlocks.end(),
+            [&BBNumbers](const BasicBlock *A, const BasicBlock *B) {
+              return BBNumbers.lookup(A) < BBNumbers.lookup(B);
+            });
+
   // Now place MemoryPhi nodes.
-  for (auto &BB : IDFBlocks) {
-    // Insert phi node
-    AccessList *Accesses = getOrCreateAccessList(BB);
-    MemoryPhi *Phi = new MemoryPhi(BB->getContext(), BB, NextID++);
-    ValueToMemoryAccess[BB] = Phi;
-    // Phi's always are placed at the front of the block.
-    Accesses->push_front(Phi);
-  }
+  for (auto &BB : IDFBlocks)
+    createMemoryPhi(BB);
 }
 
 void MemorySSA::buildMemorySSA() {
@@ -1485,6 +1498,8 @@ void MemorySSA::buildMemorySSA() {
   BasicBlock &StartingPoint = F.getEntryBlock();
   LiveOnEntryDef = make_unique<MemoryDef>(F.getContext(), nullptr, nullptr,
                                           &StartingPoint, NextID++);
+  DenseMap<const BasicBlock *, unsigned int> BBNumbers;
+  unsigned NextBBNum = 0;
 
   // We maintain lists of memory accesses per-block, trading memory for time. We
   // could just look up the memory access for every possible instruction in the
@@ -1494,57 +1509,31 @@ void MemorySSA::buildMemorySSA() {
   // Go through each block, figure out where defs occur, and chain together all
   // the accesses.
   for (BasicBlock &B : F) {
+    BBNumbers[&B] = NextBBNum++;
     bool InsertIntoDef = false;
     AccessList *Accesses = nullptr;
+    DefsList *Defs = nullptr;
     for (Instruction &I : B) {
       MemoryUseOrDef *MUD = createNewAccess(&I);
       if (!MUD)
         continue;
-      InsertIntoDef |= isa<MemoryDef>(MUD);
 
       if (!Accesses)
         Accesses = getOrCreateAccessList(&B);
       Accesses->push_back(MUD);
+      if (isa<MemoryDef>(MUD)) {
+        InsertIntoDef = true;
+        if (!Defs)
+          Defs = getOrCreateDefsList(&B);
+        Defs->push_back(*MUD);
+      }
     }
     if (InsertIntoDef)
       DefiningBlocks.insert(&B);
     if (Accesses)
       DefUseBlocks.insert(&B);
   }
-
-  // Compute live-in.
-  // Live in is normally defined as "all the blocks on the path from each def to
-  // each of it's uses".
-  // MemoryDef's are implicit uses of previous state, so they are also uses.
-  // This means we don't really have def-only instructions.  The only
-  // MemoryDef's that are not really uses are those that are of the LiveOnEntry
-  // variable (because LiveOnEntry can reach anywhere, and every def is a
-  // must-kill of LiveOnEntry).
-  // In theory, you could precisely compute live-in by using alias-analysis to
-  // disambiguate defs and uses to see which really pair up with which.
-  // In practice, this would be really expensive and difficult. So we simply
-  // assume all defs are also uses that need to be kept live.
-  // Because of this, the end result of this live-in computation will be "the
-  // entire set of basic blocks that reach any use".
-
-  SmallPtrSet<BasicBlock *, 32> LiveInBlocks;
-  SmallVector<BasicBlock *, 64> LiveInBlockWorklist(DefUseBlocks.begin(),
-                                                    DefUseBlocks.end());
-  // Now that we have a set of blocks where a value is live-in, recursively add
-  // predecessors until we find the full region the value is live.
-  while (!LiveInBlockWorklist.empty()) {
-    BasicBlock *BB = LiveInBlockWorklist.pop_back_val();
-
-    // The block really is live in here, insert it into the set.  If already in
-    // the set, then it has already been processed.
-    if (!LiveInBlocks.insert(BB).second)
-      continue;
-
-    // Since the value is live into BB, it is either defined in a predecessor or
-    // live into it to.
-    LiveInBlockWorklist.append(pred_begin(BB), pred_end(BB));
-  }
-  placePHINodes(DefiningBlocks, LiveInBlocks);
+  placePHINodes(DefiningBlocks, BBNumbers);
 
   // Now do regular SSA renaming on the MemoryDef/MemoryUse. Visited will get
   // filled in with all blocks.
@@ -1576,14 +1565,94 @@ MemorySSA::CachingWalker *MemorySSA::getWalkerImpl() {
   return Walker.get();
 }
 
+// This is a helper function used by the creation routines. It places NewAccess
+// into the access and defs lists for a given basic block, at the given
+// insertion point.
+void MemorySSA::insertIntoListsForBlock(MemoryAccess *NewAccess,
+                                        const BasicBlock *BB,
+                                        InsertionPlace Point) {
+  auto *Accesses = getOrCreateAccessList(BB);
+  if (Point == Beginning) {
+    // If it's a phi node, it goes first, otherwise, it goes after any phi
+    // nodes.
+    if (isa<MemoryPhi>(NewAccess)) {
+      Accesses->push_front(NewAccess);
+      auto *Defs = getOrCreateDefsList(BB);
+      Defs->push_front(*NewAccess);
+    } else {
+      auto AI = find_if_not(
+          *Accesses, [](const MemoryAccess &MA) { return isa<MemoryPhi>(MA); });
+      Accesses->insert(AI, NewAccess);
+      if (!isa<MemoryUse>(NewAccess)) {
+        auto *Defs = getOrCreateDefsList(BB);
+        auto DI = find_if_not(
+            *Defs, [](const MemoryAccess &MA) { return isa<MemoryPhi>(MA); });
+        Defs->insert(DI, *NewAccess);
+      }
+    }
+  } else {
+    Accesses->push_back(NewAccess);
+    if (!isa<MemoryUse>(NewAccess)) {
+      auto *Defs = getOrCreateDefsList(BB);
+      Defs->push_back(*NewAccess);
+    }
+  }
+  BlockNumberingValid.erase(BB);
+}
+
+void MemorySSA::insertIntoListsBefore(MemoryAccess *What, const BasicBlock *BB,
+                                      AccessList::iterator InsertPt) {
+  auto *Accesses = getWritableBlockAccesses(BB);
+  bool WasEnd = InsertPt == Accesses->end();
+  Accesses->insert(AccessList::iterator(InsertPt), What);
+  if (!isa<MemoryUse>(What)) {
+    auto *Defs = getOrCreateDefsList(BB);
+    // If we got asked to insert at the end, we have an easy job, just shove it
+    // at the end. If we got asked to insert before an existing def, we also get
+    // an terator. If we got asked to insert before a use, we have to hunt for
+    // the next def.
+    if (WasEnd) {
+      Defs->push_back(*What);
+    } else if (isa<MemoryDef>(InsertPt)) {
+      Defs->insert(InsertPt->getDefsIterator(), *What);
+    } else {
+      while (InsertPt != Accesses->end() && !isa<MemoryDef>(InsertPt))
+        ++InsertPt;
+      // Either we found a def, or we are inserting at the end
+      if (InsertPt == Accesses->end())
+        Defs->push_back(*What);
+      else
+        Defs->insert(InsertPt->getDefsIterator(), *What);
+    }
+  }
+  BlockNumberingValid.erase(BB);
+}
+
+// Move What before Where in the IR.  The end result is taht What will belong to
+// the right lists and have the right Block set, but will not otherwise be
+// correct. It will not have the right defining access, and if it is a def,
+// things below it will not properly be updated.
+void MemorySSA::moveTo(MemoryUseOrDef *What, BasicBlock *BB,
+                       AccessList::iterator Where) {
+  // Keep it in the lookup tables, remove from the lists
+  removeFromLists(What, false);
+  What->setBlock(BB);
+  insertIntoListsBefore(What, BB, Where);
+}
+
+void MemorySSA::moveTo(MemoryUseOrDef *What, BasicBlock *BB,
+                       InsertionPlace Point) {
+  removeFromLists(What, false);
+  What->setBlock(BB);
+  insertIntoListsForBlock(What, BB, Point);
+}
+
 MemoryPhi *MemorySSA::createMemoryPhi(BasicBlock *BB) {
   assert(!getMemoryAccess(BB) && "MemoryPhi already exists for this BB");
-  AccessList *Accesses = getOrCreateAccessList(BB);
   MemoryPhi *Phi = new MemoryPhi(BB->getContext(), BB, NextID++);
-  ValueToMemoryAccess[BB] = Phi;
   // Phi's always are placed at the front of the block.
-  Accesses->push_front(Phi);
-  BlockNumberingValid.erase(BB);
+  insertIntoListsForBlock(Phi, BB, Beginning);
+  ValueToMemoryAccess[BB] = Phi;
   return Phi;
 }
 
@@ -1603,40 +1672,29 @@ MemoryAccess *MemorySSA::createMemoryAccessInBB(Instruction *I,
                                                 const BasicBlock *BB,
                                                 InsertionPlace Point) {
   MemoryUseOrDef *NewAccess = createDefinedAccess(I, Definition);
-  auto *Accesses = getOrCreateAccessList(BB);
-  if (Point == Beginning) {
-    // It goes after any phi nodes
-    auto AI = find_if(
-        *Accesses, [](const MemoryAccess &MA) { return !isa<MemoryPhi>(MA); });
-
-    Accesses->insert(AI, NewAccess);
-  } else {
-    Accesses->push_back(NewAccess);
-  }
-  BlockNumberingValid.erase(BB);
-  return NewAccess;
-}
-MemoryAccess *MemorySSA::createMemoryAccessBefore(Instruction *I,
-                                                  MemoryAccess *Definition,
-                                                  MemoryAccess *InsertPt) {
-  assert(I->getParent() == InsertPt->getBlock() &&
-         "New and old access must be in the same block");
-  MemoryUseOrDef *NewAccess = createDefinedAccess(I, Definition);
-  auto *Accesses = getOrCreateAccessList(InsertPt->getBlock());
-  Accesses->insert(AccessList::iterator(InsertPt), NewAccess);
-  BlockNumberingValid.erase(InsertPt->getBlock());
+  insertIntoListsForBlock(NewAccess, BB, Point);
   return NewAccess;
 }
 
-MemoryAccess *MemorySSA::createMemoryAccessAfter(Instruction *I,
-                                                 MemoryAccess *Definition,
-                                                 MemoryAccess *InsertPt) {
+MemoryUseOrDef *MemorySSA::createMemoryAccessBefore(Instruction *I,
+                                                    MemoryAccess *Definition,
+                                                    MemoryUseOrDef *InsertPt) {
   assert(I->getParent() == InsertPt->getBlock() &&
          "New and old access must be in the same block");
   MemoryUseOrDef *NewAccess = createDefinedAccess(I, Definition);
-  auto *Accesses = getOrCreateAccessList(InsertPt->getBlock());
-  Accesses->insertAfter(AccessList::iterator(InsertPt), NewAccess);
-  BlockNumberingValid.erase(InsertPt->getBlock());
+  insertIntoListsBefore(NewAccess, InsertPt->getBlock(),
+                        InsertPt->getIterator());
+  return NewAccess;
+}
+
+MemoryUseOrDef *MemorySSA::createMemoryAccessAfter(Instruction *I,
+                                                   MemoryAccess *Definition,
+                                                   MemoryAccess *InsertPt) {
+  assert(I->getParent() == InsertPt->getBlock() &&
+         "New and old access must be in the same block");
+  MemoryUseOrDef *NewAccess = createDefinedAccess(I, Definition);
+  insertIntoListsBefore(NewAccess, InsertPt->getBlock(),
+                        ++(InsertPt->getIterator()));
   return NewAccess;
 }
 
@@ -1731,9 +1789,6 @@ static MemoryAccess *onlySingleValue(MemoryPhi *MP) {
 }
 
 /// \brief Properly remove \p MA from all of MemorySSA's lookup tables.
-///
-/// Because of the way the intrusive list and use lists work, it is important to
-/// do removal in the right order.
 void MemorySSA::removeFromLookups(MemoryAccess *MA) {
   assert(MA->use_empty() &&
          "Trying to remove memory access that still has uses");
@@ -1754,10 +1809,34 @@ void MemorySSA::removeFromLookups(MemoryAccess *MA) {
   auto VMA = ValueToMemoryAccess.find(MemoryInst);
   if (VMA->second == MA)
     ValueToMemoryAccess.erase(VMA);
+}
 
+/// \brief Properly remove \p MA from all of MemorySSA's lists.
+///
+/// Because of the way the intrusive list and use lists work, it is important to
+/// do removal in the right order.
+/// ShouldDelete defaults to true, and will cause the memory access to also be
+/// deleted, not just removed.
+void MemorySSA::removeFromLists(MemoryAccess *MA, bool ShouldDelete) {
+  // The access list owns the reference, so we erase it from the non-owning list
+  // first.
+  if (!isa<MemoryUse>(MA)) {
+    auto DefsIt = PerBlockDefs.find(MA->getBlock());
+    std::unique_ptr<DefsList> &Defs = DefsIt->second;
+    Defs->remove(*MA);
+    if (Defs->empty())
+      PerBlockDefs.erase(DefsIt);
+  }
+
+  // The erase call here will delete it. If we don't want it deleted, we call
+  // remove instead.
   auto AccessIt = PerBlockAccesses.find(MA->getBlock());
   std::unique_ptr<AccessList> &Accesses = AccessIt->second;
-  Accesses->erase(MA);
+  if (ShouldDelete)
+    Accesses->erase(MA);
+  else
+    Accesses->remove(MA);
+
   if (Accesses->empty())
     PerBlockAccesses.erase(AccessIt);
 }
@@ -1781,12 +1860,32 @@ void MemorySSA::removeMemoryAccess(MemoryAccess *MA) {
   }
 
   // Re-point the uses at our defining access
-  if (!MA->use_empty())
-    MA->replaceAllUsesWith(NewDefTarget);
+  if (!isa<MemoryUse>(MA) && !MA->use_empty()) {
+    // Reset optimized on users of this store, and reset the uses.
+    // A few notes:
+    // 1. This is a slightly modified version of RAUW to avoid walking the
+    // uses twice here.
+    // 2. If we wanted to be complete, we would have to reset the optimized
+    // flags on users of phi nodes if doing the below makes a phi node have all
+    // the same arguments. Instead, we prefer users to removeMemoryAccess those
+    // phi nodes, because doing it here would be N^3.
+    if (MA->hasValueHandle())
+      ValueHandleBase::ValueIsRAUWd(MA, NewDefTarget);
+    // Note: We assume MemorySSA is not used in metadata since it's not really
+    // part of the IR.
+
+    while (!MA->use_empty()) {
+      Use &U = *MA->use_begin();
+      if (MemoryUse *MU = dyn_cast<MemoryUse>(U.getUser()))
+        MU->resetOptimized();
+      U.set(NewDefTarget);
+    }
+  }
 
   // The call below to erase will destroy MA, so we can't change the order we
   // are doing things here
   removeFromLookups(MA);
+  removeFromLists(MA);
 }
 
 void MemorySSA::print(raw_ostream &OS) const {
@@ -1794,10 +1893,11 @@ void MemorySSA::print(raw_ostream &OS) const {
   F.print(OS, &Writer);
 }
 
-void MemorySSA::dump() const {
-  MemorySSAAnnotatedWriter Writer(this);
-  F.print(dbgs(), &Writer);
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+LLVM_DUMP_METHOD void MemorySSA::dump() const {
+  print(dbgs());
 }
+#endif
 
 void MemorySSA::verifyMemorySSA() const {
   verifyDefUses(F);
@@ -1813,26 +1913,41 @@ void MemorySSA::verifyOrdering(Function &F) const {
   // lists think, as well as the order in the blocks vs the order in the access
   // lists.
   SmallVector<MemoryAccess *, 32> ActualAccesses;
+  SmallVector<MemoryAccess *, 32> ActualDefs;
   for (BasicBlock &B : F) {
     const AccessList *AL = getBlockAccesses(&B);
+    const auto *DL = getBlockDefs(&B);
     MemoryAccess *Phi = getMemoryAccess(&B);
-    if (Phi)
+    if (Phi) {
       ActualAccesses.push_back(Phi);
+      ActualDefs.push_back(Phi);
+    }
+
     for (Instruction &I : B) {
       MemoryAccess *MA = getMemoryAccess(&I);
-      assert((!MA || AL) && "We have memory affecting instructions "
-                            "in this block but they are not in the "
-                            "access list");
-      if (MA)
+      assert((!MA || (AL && (isa<MemoryUse>(MA) || DL))) &&
+             "We have memory affecting instructions "
+             "in this block but they are not in the "
+             "access list or defs list");
+      if (MA) {
         ActualAccesses.push_back(MA);
+        if (isa<MemoryDef>(MA))
+          ActualDefs.push_back(MA);
+      }
     }
     // Either we hit the assert, really have no accesses, or we have both
-    // accesses and an access list
-    if (!AL)
+    // accesses and an access list.
+    // Same with defs.
+    if (!AL && !DL)
       continue;
     assert(AL->size() == ActualAccesses.size() &&
            "We don't have the same number of accesses in the block as on the "
            "access list");
+    assert((DL || ActualDefs.size() == 0) &&
+           "Either we should have a defs list, or we should have no defs");
+    assert((!DL || DL->size() == ActualDefs.size()) &&
+           "We don't have the same number of defs in the block as on the "
+           "def list");
     auto ALI = AL->begin();
     auto AAI = ActualAccesses.begin();
     while (ALI != AL->end() && AAI != ActualAccesses.end()) {
@@ -1841,6 +1956,16 @@ void MemorySSA::verifyOrdering(Function &F) const {
       ++AAI;
     }
     ActualAccesses.clear();
+    if (DL) {
+      auto DLI = DL->begin();
+      auto ADI = ActualDefs.begin();
+      while (DLI != DL->end() && ADI != ActualDefs.end()) {
+        assert(&*DLI == *ADI && "Not the same defs in the same order");
+        ++DLI;
+        ++ADI;
+      }
+    }
+    ActualDefs.clear();
   }
 }
 
@@ -1896,21 +2021,19 @@ void MemorySSA::verifyDefUses(Function &F) const {
     }
 
     for (Instruction &I : B) {
-      if (MemoryAccess *MA = getMemoryAccess(&I)) {
-        assert(isa<MemoryUseOrDef>(MA) &&
-               "Found a phi node not attached to a bb");
-        verifyUseInDefs(cast<MemoryUseOrDef>(MA)->getDefiningAccess(), MA);
+      if (MemoryUseOrDef *MA = getMemoryAccess(&I)) {
+        verifyUseInDefs(MA->getDefiningAccess(), MA);
       }
     }
   }
 }
 
-MemoryAccess *MemorySSA::getMemoryAccess(const Value *I) const {
-  return ValueToMemoryAccess.lookup(I);
+MemoryUseOrDef *MemorySSA::getMemoryAccess(const Instruction *I) const {
+  return cast_or_null<MemoryUseOrDef>(ValueToMemoryAccess.lookup(I));
 }
 
 MemoryPhi *MemorySSA::getMemoryAccess(const BasicBlock *BB) const {
-  return cast_or_null<MemoryPhi>(getMemoryAccess((const Value *)BB));
+  return cast_or_null<MemoryPhi>(ValueToMemoryAccess.lookup(cast<Value>(BB)));
 }
 
 /// Perform a local numbering on blocks so that instruction ordering can be
@@ -2043,8 +2166,11 @@ void MemoryUse::print(raw_ostream &OS) const {
 }
 
 void MemoryAccess::dump() const {
+  // Cannot completely remove virtual function even in release mode.
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
   print(dbgs());
   dbgs() << "\n";
+#endif
 }
 
 char MemorySSAPrinterLegacyPass::ID = 0;
@@ -2067,10 +2193,10 @@ bool MemorySSAPrinterLegacyPass::runOnFunction(Function &F) {
   return false;
 }
 
-char MemorySSAAnalysis::PassID;
+AnalysisKey MemorySSAAnalysis::Key;
 
-MemorySSAAnalysis::Result
-MemorySSAAnalysis::run(Function &F, FunctionAnalysisManager &AM) {
+MemorySSAAnalysis::Result MemorySSAAnalysis::run(Function &F,
+                                                 FunctionAnalysisManager &AM) {
   auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
   auto &AA = AM.getResult<AAManager>(F);
   return MemorySSAAnalysis::Result(make_unique<MemorySSA>(F, &AA, &DT));
@@ -2142,6 +2268,7 @@ void MemorySSA::CachingWalker::invalidateInfo(MemoryAccess *MA) {
   if (MemoryUse *MU = dyn_cast<MemoryUse>(MA)) {
     UpwardsMemoryQuery Q(MU->getMemoryInst(), MU);
     Cache.remove(MU, Q.StartingLoc, Q.IsCall);
+    MU->resetOptimized();
   } else {
     // If it is not a use, the best we can do right now is destroy the cache.
     Cache.clear();
@@ -2170,7 +2297,7 @@ MemoryAccess *MemorySSA::CachingWalker::getClobberingMemoryAccess(
 }
 
 MemoryAccess *MemorySSA::CachingWalker::getClobberingMemoryAccess(
-    MemoryAccess *StartingAccess, MemoryLocation &Loc) {
+    MemoryAccess *StartingAccess, const MemoryLocation &Loc) {
   if (isa<MemoryPhi>(StartingAccess))
     return StartingAccess;
 
@@ -2215,6 +2342,13 @@ MemorySSA::CachingWalker::getClobberingMemoryAccess(MemoryAccess *MA) {
   if (!StartingAccess)
     return MA;
 
+  // If this is an already optimized use or def, return the optimized result.
+  // Note: Currently, we do not store the optimized def result because we'd need
+  // a separate field, since we can't use it as the defining access.
+  if (MemoryUse *MU = dyn_cast<MemoryUse>(StartingAccess))
+    if (MU->isOptimized())
+      return MU->getDefiningAccess();
+
   const Instruction *I = StartingAccess->getMemoryInst();
   UpwardsMemoryQuery Q(I, StartingAccess);
   // We can't sanely do anything with a fences, they conservatively
@@ -2229,6 +2363,8 @@ MemorySSA::CachingWalker::getClobberingMemoryAccess(MemoryAccess *MA) {
   if (isUseTriviallyOptimizableToLiveOnEntry(*MSSA->AA, I)) {
     MemoryAccess *LiveOnEntry = MSSA->getLiveOnEntryDef();
     Cache.insert(StartingAccess, LiveOnEntry, Q.StartingLoc, Q.IsCall);
+    if (MemoryUse *MU = dyn_cast<MemoryUse>(StartingAccess))
+      MU->setDefiningAccess(LiveOnEntry, true);
     return LiveOnEntry;
   }
 
@@ -2245,6 +2381,8 @@ MemorySSA::CachingWalker::getClobberingMemoryAccess(MemoryAccess *MA) {
   DEBUG(dbgs() << *DefiningAccess << "\n");
   DEBUG(dbgs() << "Final Memory SSA clobber for " << *I << " is ");
   DEBUG(dbgs() << *Result << "\n");
+  if (MemoryUse *MU = dyn_cast<MemoryUse>(StartingAccess))
+    MU->setDefiningAccess(Result, true);
 
   return Result;
 }
@@ -2262,7 +2400,7 @@ DoNothingMemorySSAWalker::getClobberingMemoryAccess(MemoryAccess *MA) {
 }
 
 MemoryAccess *DoNothingMemorySSAWalker::getClobberingMemoryAccess(
-    MemoryAccess *StartingAccess, MemoryLocation &) {
+    MemoryAccess *StartingAccess, const MemoryLocation &) {
   if (auto *Use = dyn_cast<MemoryUseOrDef>(StartingAccess))
     return Use->getDefiningAccess();
   return StartingAccess;

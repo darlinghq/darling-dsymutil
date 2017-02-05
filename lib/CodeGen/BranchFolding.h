@@ -122,6 +122,8 @@ namespace llvm {
                                   const MachineBasicBlock *MBB) const;
       raw_ostream &printBlockFreq(raw_ostream &OS,
                                   const BlockFrequency Freq) const;
+      void view(bool isSimple = true);
+      uint64_t getEntryFreq() const;
 
     private:
       const MachineBlockFrequencyInfo &MBFI;
@@ -137,7 +139,6 @@ namespace llvm {
                        MachineBasicBlock* PredBB,
                        unsigned MinCommonTailLength);
     void setCommonTailEdgeWeights(MachineBasicBlock &TailMBB);
-    void computeLiveIns(MachineBasicBlock &MBB);
     void ReplaceTailWithBranchTo(MachineBasicBlock::iterator OldInst,
                                  MachineBasicBlock *NewDest);
     MachineBasicBlock *SplitMBBAt(MachineBasicBlock &CurMBB,
@@ -156,7 +157,6 @@ namespace llvm {
     bool OptimizeBranches(MachineFunction &MF);
     bool OptimizeBlock(MachineBasicBlock *MBB);
     void RemoveDeadBlock(MachineBasicBlock *MBB);
-    bool OptimizeImpDefsBlock(MachineBasicBlock *MBB);
 
     bool HoistCommonCode(MachineFunction &MF);
     bool HoistCommonCodeInSuccs(MachineBasicBlock *MBB);
